@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,17 +44,46 @@ pub(crate) struct RestartClose {
 #[derive(Debug)]
 pub(crate) struct PendingSubscription {
     cancel: CancellationToken,
+    committed: AtomicBool,
+    predecessor: Option<Arc<PendingSubscription>>,
 }
 
 impl PendingSubscription {
-    fn new() -> Self {
+    fn new(predecessor: Option<Arc<PendingSubscription>>) -> Self {
         Self {
             cancel: CancellationToken::new(),
+            committed: AtomicBool::new(false),
+            predecessor,
         }
     }
 
     pub(crate) fn cancel(&self) {
         self.cancel.cancel();
+    }
+
+    /// Cancel this request and every older same-ID request it superseded.
+    pub(crate) fn cancel_lineage(&self) {
+        let mut current = Some(self);
+        while let Some(request) = current {
+            request.cancel();
+            current = request.predecessor.as_deref();
+        }
+    }
+
+    /// Supersede older same-ID requests after this replacement commits.
+    pub(crate) fn commit(&self) {
+        self.committed.store(true, Ordering::Release);
+        if let Some(predecessor) = self.predecessor.as_ref() {
+            predecessor.cancel_lineage();
+        }
+    }
+
+    fn live_predecessor(&self) -> Option<Arc<PendingSubscription>> {
+        (!self.committed.load(Ordering::Acquire))
+            .then_some(self.predecessor.as_ref())
+            .flatten()
+            .filter(|predecessor| !predecessor.is_cancelled())
+            .cloned()
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -123,20 +152,16 @@ pub struct ConnectionState {
 
 impl ConnectionState {
     /// Install a pending REQ before its handler task starts. A repeated REQ
-    /// with the same subscription ID supersedes and cancels the older task.
+    /// with the same subscription ID becomes the new owner, but the previous
+    /// request stays alive until the replacement commits successfully.
     pub(crate) async fn begin_pending_subscription(
         &self,
         sub_id: &str,
     ) -> Arc<PendingSubscription> {
-        let pending = Arc::new(PendingSubscription::new());
-        if let Some(replaced) = self
-            .pending_subscriptions
-            .lock()
-            .await
-            .insert(sub_id.to_owned(), Arc::clone(&pending))
-        {
-            replaced.cancel();
-        }
+        let mut pending_subscriptions = self.pending_subscriptions.lock().await;
+        let predecessor = pending_subscriptions.get(sub_id).cloned();
+        let pending = Arc::new(PendingSubscription::new(predecessor));
+        pending_subscriptions.insert(sub_id.to_owned(), Arc::clone(&pending));
         pending
     }
 
@@ -144,7 +169,7 @@ impl ConnectionState {
     async fn cancel_all_pending_subscriptions(&self) {
         let mut pending = self.pending_subscriptions.lock().await;
         for (_, request) in pending.drain() {
-            request.cancel();
+            request.cancel_lineage();
         }
     }
 
@@ -159,7 +184,11 @@ impl ConnectionState {
             .get(sub_id)
             .is_some_and(|current| Arc::ptr_eq(current, completed))
         {
-            pending.remove(sub_id);
+            if let Some(predecessor) = completed.live_predecessor() {
+                pending.insert(sub_id.to_owned(), predecessor);
+            } else {
+                pending.remove(sub_id);
+            }
         }
     }
 
@@ -860,6 +889,53 @@ fn topic_for_subscription(channel_id: Option<Uuid>) -> EventTopic {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn failed_same_id_replacement_restores_the_previous_lease() {
+        let conn = ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: TenantContext::resolved(
+                buzz_core::CommunityId::from_uuid(Uuid::new_v4()),
+                "lease.test",
+            ),
+            remote_addr: "127.0.0.1:1234".parse().expect("socket address"),
+            auth_state: RwLock::new(AuthState::Failed),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pending_subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx: mpsc::channel(1).0,
+            ctrl_tx: mpsc::channel(1).0,
+            cancel: CancellationToken::new(),
+            backpressure_count: Arc::new(AtomicU8::new(0)),
+            grace_limit: 3,
+        };
+
+        let original = conn.begin_pending_subscription("same-id").await;
+        let replacement = conn.begin_pending_subscription("same-id").await;
+        assert!(!original.is_cancelled());
+
+        conn.finish_pending_subscription("same-id", &replacement)
+            .await;
+        let current = conn
+            .pending_subscriptions
+            .lock()
+            .await
+            .get("same-id")
+            .cloned()
+            .expect("original lease restored");
+        assert!(Arc::ptr_eq(&current, &original));
+        assert!(!original.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn committed_same_id_replacement_cancels_the_previous_lease() {
+        let original = Arc::new(PendingSubscription::new(None));
+        let replacement = PendingSubscription::new(Some(Arc::clone(&original)));
+
+        replacement.commit();
+
+        assert!(original.is_cancelled());
+        assert!(!replacement.is_cancelled());
+    }
 
     #[derive(Debug, Default)]
     struct MockSinkState {

@@ -33,7 +33,7 @@ pub(crate) async fn remove_subscription(
     // lease makes the later registration check fail closed.
     let mut pending_subscriptions = conn.pending_subscriptions.lock().await;
     if let Some(pending) = pending_subscriptions.remove(sub_id) {
-        pending.cancel();
+        pending.cancel_lineage();
     }
 
     conn.subscriptions.lock().await.remove(sub_id);

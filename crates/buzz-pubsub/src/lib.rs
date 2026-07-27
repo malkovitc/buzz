@@ -200,10 +200,19 @@ impl PubSubManager {
         };
 
         if should_subscribe {
-            let _ = self
+            // `desired_topics` is the source of truth. A full command queue is
+            // only a stale live-connection hint: reconnect snapshots desired
+            // topics, while blocking here can deadlock REQ/CLOSE lifecycle
+            // commits during a Redis outage.
+            match self
                 .subscription_tx
-                .send(subscriber::SubscriptionCommand::Subscribe(topic_key))
-                .await;
+                .try_send(subscriber::SubscriptionCommand::Subscribe(topic_key))
+            {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(?topic_key, "pubsub subscription command queue full");
+                }
+            }
         }
     }
 

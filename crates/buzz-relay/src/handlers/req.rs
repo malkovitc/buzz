@@ -481,6 +481,10 @@ async fn register_subscription_if_current(
         .retain_topic(&conn.tenant, topic_for_subscription(channel_id))
         .await;
 
+    // Only a successful replacement commit supersedes historical delivery from
+    // the previous same-ID REQ. Validation/search failures leave it untouched.
+    pending.commit();
+
     drop(pending_subscriptions);
     true
 }
