@@ -45,6 +45,7 @@ pub(crate) struct RestartClose {
 pub(crate) struct PendingSubscription {
     cancel: CancellationToken,
     committed: AtomicBool,
+    completed: AtomicBool,
     predecessor: Option<Arc<PendingSubscription>>,
 }
 
@@ -53,6 +54,7 @@ impl PendingSubscription {
         Self {
             cancel: CancellationToken::new(),
             committed: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             predecessor,
         }
     }
@@ -79,11 +81,18 @@ impl PendingSubscription {
     }
 
     fn live_predecessor(&self) -> Option<Arc<PendingSubscription>> {
-        (!self.committed.load(Ordering::Acquire))
-            .then_some(self.predecessor.as_ref())
-            .flatten()
-            .filter(|predecessor| !predecessor.is_cancelled())
-            .cloned()
+        if self.committed.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let mut current = self.predecessor.clone();
+        while let Some(predecessor) = current {
+            if !predecessor.is_cancelled() && !predecessor.completed.load(Ordering::Acquire) {
+                return Some(predecessor);
+            }
+            current = predecessor.predecessor.clone();
+        }
+        None
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -179,6 +188,7 @@ impl ConnectionState {
         sub_id: &str,
         completed: &Arc<PendingSubscription>,
     ) {
+        completed.completed.store(true, Ordering::Release);
         let mut pending = self.pending_subscriptions.lock().await;
         if pending
             .get(sub_id)
@@ -924,6 +934,43 @@ mod tests {
             .expect("original lease restored");
         assert!(Arc::ptr_eq(&current, &original));
         assert!(!original.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_does_not_restore_a_completed_predecessor() {
+        let conn = ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: TenantContext::resolved(
+                buzz_core::CommunityId::from_uuid(Uuid::new_v4()),
+                "lease.test",
+            ),
+            remote_addr: "127.0.0.1:1234".parse().expect("socket address"),
+            auth_state: RwLock::new(AuthState::Failed),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pending_subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx: mpsc::channel(1).0,
+            ctrl_tx: mpsc::channel(1).0,
+            cancel: CancellationToken::new(),
+            backpressure_count: Arc::new(AtomicU8::new(0)),
+            grace_limit: 3,
+        };
+
+        let original = conn.begin_pending_subscription("same-id").await;
+        let replacement = conn.begin_pending_subscription("same-id").await;
+
+        // The predecessor finishes while the replacement still owns the map.
+        conn.finish_pending_subscription("same-id", &original).await;
+        assert!(conn
+            .pending_subscriptions
+            .lock()
+            .await
+            .contains_key("same-id"));
+
+        // If the replacement also fails, the completed predecessor must not be
+        // restored as an owner whose completion callback will never run again.
+        conn.finish_pending_subscription("same-id", &replacement)
+            .await;
+        assert!(conn.pending_subscriptions.lock().await.is_empty());
     }
 
     #[tokio::test]
