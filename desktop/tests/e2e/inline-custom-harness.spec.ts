@@ -14,7 +14,7 @@
  * selection untouched. The three surfaces share the same routing, so those
  * checks are not repeated on every one.
  */
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 
 import { installMockBridge } from "../helpers/bridge";
 

@@ -10,7 +10,7 @@
  * handler open long enough for the channel click to race the in-flight send.
  */
 
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 
 import { installMockBridge } from "../helpers/bridge";
 

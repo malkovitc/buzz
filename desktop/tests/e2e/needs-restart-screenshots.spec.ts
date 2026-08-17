@@ -11,7 +11,7 @@
  *   - Generic rendering: unknown field ids, number/array values, masked values.
  */
 
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";

@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { E2E_APP_ORIGIN, bootstrapE2ePage } from "../helpers/bootstrap";
@@ -13,7 +13,7 @@ type MockFeedWindow = Window & {
   __BUZZ_E2E_PUSH_MOCK_FEED_ITEM__?: (item: Record<string, unknown>) => void;
 };
 
-test.use({ viewport: { width: 1280, height: 720 } });
+test.use({ e2eBootstrap: false, viewport: { width: 1280, height: 720 } });
 
 test("Inbox All hides drafts while the Drafts filter keeps them", async ({
   page,

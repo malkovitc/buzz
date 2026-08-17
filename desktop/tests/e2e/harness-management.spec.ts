@@ -18,7 +18,7 @@
  *  - Preset rows render bundled logos, never initials
  *  - Onboarding navigate: setup-page "More harnesses" click → Settings → Agents (F8)
  */
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { passThroughBackupStep } from "../helpers/onboarding";

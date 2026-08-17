@@ -14,7 +14,7 @@
  * container (the same relative wrapper that owns the real top unread pill) and
  * asserts the pill clears the pinned header.
  */
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";

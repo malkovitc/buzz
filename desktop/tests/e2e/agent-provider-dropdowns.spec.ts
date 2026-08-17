@@ -16,7 +16,7 @@
  *       Previously, the seeding effect bailed in edit mode, leaving the runtime
  *       empty and the model dropdown silently blank.
  */
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";

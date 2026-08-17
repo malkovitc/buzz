@@ -384,13 +384,15 @@ you; prefer them over a manual build plus `playwright test`.
 serves old code. Kill port 4173 and re-run `pnpm build:e2e` before re-running
 tests after code changes.
 
-**Bootstrap before app interaction:** New Playwright specs must use
-`bootstrapE2ePage(page, { beforeNavigate })` from `tests/helpers/bootstrap`
-for their first app navigation. Register `addInitScript` seeding in
-`beforeNavigate` (and before `installMockBridge(page)`) so React reads it at
-mount. The helper requires a successful navigation to the configured HTTP
-origin and reports a missing build or preview server before a later
-`localStorage` access can misreport it as a storage failure.
+**Automatic E2E bootstrap:** Import `test` and `expect` from the suite's
+`tests/helpers/test`, not `@playwright/test`. Its page fixture automatically
+commits the first navigation to the configured HTTP origin and reports a missing
+build or preview server before later storage access can misreport it as a
+`localStorage` failure. For the exceptional test that must register
+`addInitScript`, a route, or the mock bridge before the first navigation, scope
+`test.use({ e2eBootstrap: false })` narrowly and call
+`bootstrapE2ePage(page)` after setup. Keep storage init scripts origin-guarded;
+do not suppress storage errors.
 
 **Live messages:** Call `waitForMockLiveSubscription(page, channelName)` before
 `__BUZZ_E2E_EMIT_MOCK_MESSAGE__` — messages are silently dropped without a

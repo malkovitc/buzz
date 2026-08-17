@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 import { readFileSync } from "node:fs";
 
 import { installMockBridge } from "../helpers/bridge";

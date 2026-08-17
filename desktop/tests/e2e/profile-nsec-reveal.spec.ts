@@ -2,7 +2,7 @@
  * Compact E2E tests for NsecRevealRow in ProfileSettingsCard.
  * Covers: reveal fetches + renders masked value, error state, collapse clears state.
  */
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 import { installMockBridge } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
 

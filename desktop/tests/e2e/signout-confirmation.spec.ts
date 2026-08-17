@@ -6,7 +6,7 @@
  *   1. backup — check "I have saved my private key"
  *   2. typed confirmation — type the exact phrase "wipe all my data"
  */
-import { expect, type Page, test } from "@playwright/test";
+import { expect, type Page, test } from "../helpers/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";

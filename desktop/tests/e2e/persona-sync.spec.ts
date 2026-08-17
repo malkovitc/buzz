@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { finalizeEvent } from "nostr-tools/pure";
 

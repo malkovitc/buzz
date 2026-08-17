@@ -22,7 +22,7 @@
  * after the probe resolves; it is pinned at the unit level in
  * whereToRunIntent.test.mjs (applyProbeResult).
  */
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 
 import { installMockBridge } from "../helpers/bridge";
 

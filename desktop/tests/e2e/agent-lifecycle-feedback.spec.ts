@@ -9,7 +9,7 @@
  *    the old "Running agents keep their current settings…" text is gone.
  */
 
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";

@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "../helpers/test";
 
 import { installRelayBridge } from "../helpers/bridge";
 import { assertRelaySeeded } from "../helpers/seed";

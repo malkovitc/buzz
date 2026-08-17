@@ -1,4 +1,4 @@
-import { test } from "@playwright/test";
+import { test } from "../helpers/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";

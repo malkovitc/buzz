@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type Page, type Route } from "../helpers/test";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { finalizeEvent, type VerifiedEvent } from "nostr-tools/pure";
 

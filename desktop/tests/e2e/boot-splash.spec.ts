@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 import { installMockBridge } from "../helpers/bridge";
 
 // Cold-boot splash hold: on a real boot the community resolves in well under

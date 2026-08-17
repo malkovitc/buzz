@@ -5,7 +5,7 @@
  * when an .agent.json or .agent.png attachment is detected, and the full
  * Add agent → preview → confirm flow.
  */
-import { expect, test } from "@playwright/test";
+import { expect, test } from "../helpers/test";
 import { installMockBridge } from "../helpers/bridge";
 
 type CommandLogEntry = { command: string; payload: unknown };
