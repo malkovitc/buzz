@@ -192,9 +192,7 @@ requires confidentiality and integrity.
 | `0x00` | Invalid; MUST deny. |
 | `0x01` | NIP-42 connection proof. |
 | `0x02` | NIP-98 HTTP proof. |
-| `0x03` | Git smart-HTTP session proof profile. |
-| `0x04` | Blossom proof profile. |
-| `0x05`–`0x7f` | Unassigned; allocation requires a published stable specification. |
+| `0x03`–`0x7f` | Unassigned; allocation requires a published stable specification. |
 | `0x80`–`0xfe` | Private use under an explicit shared proxy/verifier contract only. |
 | `0xff` | Reserved for a future extended encoding; invalid in HMAC-v2. |
 

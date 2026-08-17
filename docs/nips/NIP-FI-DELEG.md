@@ -50,8 +50,9 @@ when their concrete encoding belongs to the supplying delegation protocol.
 
 The evidence authenticates every field, has one unambiguous owner and delegate,
 matches the server-owned domain and exact request or target, and has a finite
-expiry. If present, `not_before` is live. Equality at either temporal boundary
-is expired. The proven actor equals `delegate_key`. [FI-DELEG-EVIDENCE-CLOSED]
+expiry satisfying `now < mandatory_expiry`; equality at an expiry is expired.
+Optional `not_before` satisfies `not_before <= now + skew`, as core defines for
+`nbf`. The proven actor equals `delegate_key`. [FI-DELEG-EVIDENCE-CLOSED]
 
 A delegated request carries fresh request-appropriate Nostr proof and no
 `Nostr-Federated-Identity` or profile provenance field. Mixed direct and
@@ -114,7 +115,7 @@ is no later than the minimum of:
 - owner binding administrative bound, when applicable;
 - current relationship bound;
 - local policy bound;
-- the configured delegated maximum; and
+- the lease issue instant plus the configured delegated maximum; and
 - any stronger owner-assertion bound the deployment requires.
 
 Missing finite configuration denies. Equality is expired and arithmetic is

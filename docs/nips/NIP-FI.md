@@ -514,24 +514,30 @@ policy revision. NIP-FI-CONF defines evidence and mutation-adequacy rules.
 | `FI-TRACE-TOKEN-CLASS` | An RFC 9068 `at+jwt` access token and a dedicated `nip-fi+jwt` assertion pass only their selected class. ID tokens, wrong/generic types outside a named compatibility policy, client-only audiences, absent or ambiguous `client_id`, resource-owner/client-subject ambiguity, and every attempted cross-class fallback deny. |
 | `FI-TRACE-CONTRACT-IDENTITIES` | Mutate each assertion semantic, transport semantic, and mutable dependency independently: semantic mutations change only their owning contract ID; snapshot/binding/lifecycle/policy/resource/status mutations change neither ID but force current revalidation. |
 | `FI-TRACE-VERIFIER-PARITY` | Equal authoritative input and policy produce the same canonical normalized result. |
-| `FI-TRACE-JWKS-ADD` / `REMOVE` | Retained-key rotation can revalidate; removed-key evidence and leases deny. |
-| `FI-TRACE-CURRENT-STATUS-REVOKED` / `STALE` | Revocation, including one racing final admission, closes authority within the advertised tested bound. Inactive/ambiguous status denies; expiry equality, outage, delayed events, and changed status versions cannot mint or extend a witness. |
+| `FI-TRACE-JWKS-ADD` | Retained-key rotation revalidates successfully under the changed snapshot version. |
+| `FI-TRACE-JWKS-REMOVE` | Evidence and leases under a removed key deny after snapshot change. |
+| `FI-TRACE-CURRENT-STATUS-REVOKED` | Revocation, including one racing final admission, closes authority within the advertised tested bound. |
+| `FI-TRACE-CURRENT-STATUS-STALE` | Inactive/ambiguous status denies; expiry equality, outage, delayed events, and changed status versions cannot mint or extend a witness. |
 | `FI-TRACE-CAPABILITY-REVOCATION` | Removal of a revocation-bounded external capability projection from authoritative local policy closes prepared evidence and lease use within the declared bound; assertion-only projection cannot satisfy this oracle. |
-| `FI-TRACE-BODY-BINDING` / `BOUNDS` | Exact complete relevant body passes; absent/duplicate/mutated/partial/transformed/oversized/quota variants deny without effects. |
+| `FI-TRACE-BODY-BINDING` | Exact complete relevant body passes; absent/duplicate/mutated/partial/transformed payload variants deny without effects. |
+| `FI-TRACE-BODY-BOUNDS` | Oversized, over-quota, and pre-EOF variants deny with bounded work, cleanup, and no effects. |
 | `FI-TRACE-DOMAIN-SPOOF` | Client routing and forwarded authority cannot replace server-owned context. |
 | `FI-TRACE-ASSERTION-KEY-MISMATCH` | Mismatch denies with no mutation and the private-state response. |
-| `FI-TRACE-BINDING-CONFLICT` / `TOMBSTONE-REPLAY` | Conflicts and fresh evidence for retired/revoked state deny without replacement. |
+| `FI-TRACE-BINDING-CONFLICT` | A binding conflict denies without replacing either existing binding. |
+| `FI-TRACE-TOMBSTONE-REPLAY` | Fresh eligible evidence for a retired pair or revoked key denies without recreation. |
 | `FI-TRACE-ASSERTION-REFRESH` | Fresh evidence reuses the same eligible durable binding after prior assertion expiry. |
 | `FI-TRACE-PREPARED-STALE` | Changed identity-class witnesses or extended bounds deny; provenance-only rotation revalidates. |
 | `FI-TRACE-CONCURRENT-ENROLLMENT` | Identical first use converges; conflicting first use commits at most one winner. |
 | `FI-TRACE-FINAL-DENIAL-NO-MUTATION` | Every failed phase leaves all authoritative stores and effects unchanged. |
 | `FI-TRACE-LIFECYCLE-AUTHORITY` | Unprivileged/stale transitions deny; authorized retirement/revocation/rotation is atomic. |
-| `FI-TRACE-LEASE-BOUND` / `MULTI-KEY-SESSION` | Equality expires and one actor's lease never authorizes another. |
+| `FI-TRACE-LEASE-BOUND` | A lease ends at its earliest bound; equality at any bound is expired. |
+| `FI-TRACE-MULTI-KEY-SESSION` | One actor's lease never authorizes another key on the same connection. |
 | `FI-TRACE-DENIAL-ORACLE` | Each private row produces its exact fixed bytes; all private-state rows compare byte-identical. |
 | `FI-TRACE-DEPENDENCY-FAIL-CLOSED` | Each unreadable authoritative dependency denies. |
 | `FI-TRACE-AUTHORITY-UNIFORM` | Every protected ingress reaches one current final-admission authority. |
 | `FI-TRACE-CROSS-DOMAIN-COLLISION` | Equal subjects across issuers and equal pairs across domains remain distinct. |
-| `FI-TRACE-PRIVACY-NONPUBLIC` / `DISCOVERY-PRIVATE` | Private identity does not enter public surfaces; complete discovery bytes remain identical across attested-key, TOFU, and companion enrollment modes. |
+| `FI-TRACE-PRIVACY-NONPUBLIC` | Private identity does not enter public surfaces. |
+| `FI-TRACE-DISCOVERY-PRIVATE` | Complete discovery bytes remain identical across attested-key, TOFU, and companion enrollment modes. |
 | `FI-TRACE-TOFU-THEFT` | Stolen-assertion first use denies unless private TOFU is enabled and the attacker also proves its chosen key. |
 
 ## Security considerations
