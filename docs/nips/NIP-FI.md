@@ -506,7 +506,7 @@ public claims.
 
 A protected HTTP POST under `client-attached` with NIP-98 proof and an
 authorization-relevant body. Credentials are elided; the NIP-FI-CONF exit
-fixture pins complete byte-exact values.
+fixture pins the complete request compared objects.
 
 ```text
 POST /media HTTP/1.1
