@@ -37,6 +37,8 @@ A conformance claim names exactly one immutable tuple:
  adapter revision,
  build artifact digest,
  deployment revision,
+ governing document revision,
+ exit fixture digest,
  claimed profiles,
  assertion_policy_id,
  transport_contract_id,
@@ -44,10 +46,14 @@ A conformance claim names exactly one immutable tuple:
 ```
 
 Changing any element creates a new claim. Results from one tuple MUST NOT be
-carried into another. A report contains every applicable oracle from core and
-every claimed profile exactly once, with status `pass` or `not-applicable`
-only. Blank, skipped, expected-failure, and not-run results cannot support a
-claim (`FI-CONF-CLAIM-COMPLETE`).
+carried into another. The governing document revision and exit fixture digest
+are in the tuple because the same evidence means different things under
+different text: a claim that does not name the revision it was judged against
+is unfalsifiable once the specification moves, and a suite that does not name
+its fixture cannot be shown to have run the pinned inputs. A report contains
+every applicable oracle from core and every claimed profile exactly once, with
+status `pass` or `not-applicable` only. Blank, skipped, expected-failure, and
+not-run results cannot support a claim (`FI-CONF-CLAIM-COMPLETE`).
 
 Enrollment mode is part of the claim unit and is private. It is recorded in the
 access-controlled report, never in discovery or any public artifact.
@@ -90,7 +96,9 @@ A claim listing an artifact without the record is incomplete.
 Reports and artifacts hold private deployment detail and MUST remain access
 controlled. They MUST NOT enter public reports, examples, discovery, or
 protocol output, and MUST NOT contain raw assertions, secrets, or unredacted
-`iss`, `sub`, or claim values.
+`iss`, `sub`, or claim values. The shared exit fixture is exempt: its values are
+synthetic by construction and name no real principal, issuer, or key, and the
+interoperability exit test cannot run on redacted inputs.
 
 ## Denial fixtures
 
@@ -118,16 +126,15 @@ which owns that mapping and the exact response bytes.
 | 14 | `dependency_unreadable` | `authorization_unavailable` | core |
 
 The names in the private-condition column are fixture identifiers for this
-enumeration. Six of them — `key_mismatch`, `attestation_required`,
-`binding_conflict`, `pair_retired`, `key_revoked`, and `binding_required` — are
-the symbols core's preparation pseudocode denies by name, and that list MUST
-equal core's set exactly. `policy_denied` and `dependency_unreadable` are core's
-conditions expressed only in prose — a bare policy denial and `FI-INV-14`
-fail-closed — and core is not required to name
-them symbolically; they are the only two core rows so exempted. The remaining
-rows name conditions the profiles define in prose. None is a wire value, and a
-deployment MAY use different private reason codes internally as long as every
-enumerated condition has a fixture.
+enumeration. Some are the symbols core's preparation pseudocode denies by name;
+that set is read from core, never restated here, because a copied list is state
+that drifts and the whole subject of this section is that unguarded restatements
+rot. `policy_denied` and `dependency_unreadable` are core's conditions expressed
+only in prose — a bare policy denial and `FI-INV-14` fail-closed — and core is
+not required to name them symbolically; they are the only two core rows so
+exempted. The remaining rows name conditions the profiles define in prose. None
+is a wire value, and a deployment MAY use different private reason codes
+internally as long as every enumerated condition has a fixture.
 
 Every row whose public class is `authorization_denied` is in the private-state
 anonymity set. Their public responses MUST compare byte-identical to each other,
@@ -158,37 +165,28 @@ required to grow and every positional reference silently retargets when it does.
 The suite MUST check, mechanically at the claimed head
 (`FI-CONF-DENIAL-FIXTURES`):
 
-1. every symbol core denies by name has a row here;
-2. every symbol core denies by name is attributed to core;
-3. the naming paragraph above lists exactly the symbols core denies by name;
-4. the count word in that paragraph equals the number of symbols it lists;
-5. every symbol core denies by name carries the same public class — quantified
+1. every symbol core denies by name has a row here, attributed to core;
+2. every symbol core denies by name carries the same public class — quantified
    over core's symbolic set, not over all core-attributed rows, since
    `dependency_unreadable` is core-attributed and correctly
-   `authorization_unavailable`;
-6. no allowlist entry appears in core's symbolic denial set; and
-7. the set of symbols named by core-attributed rows equals core's symbolic
-   denial set together with the allowlist, exactly.
+   `authorization_unavailable`; and
+3. the set of symbols named by core-attributed rows equals core's symbolic
+   denial set together with the allowlist, exactly, and the allowlist is
+   disjoint from core's symbolic denial set.
 
 Every check above MUST be run against the unmutated document and be green before
 any mutant is scored. A check that is red on a conforming document detects
 nothing: it cannot be observed to flip, so every mutant reads as caught. Two of
 these checks shipped red for exactly that reason.
 
-Checks 3 and 4 are independent and neither implies the other: an editor who
-corrects the count without the names is caught by 3, and one who corrects the
-names without the count is caught by 4.
-
-Checks 6 and 7 guard the allowlist itself, which is otherwise unguarded state
-in a document whose subject is that unguarded claims rot. Check 6 is what makes
+Check 3 keeps the allowlist honest in both directions. Its equality half catches
+a core-attributed row core never emits. Its disjointness half is what makes
 promotion visible: if a later core turns `policy_denied` or
-`dependency_unreadable` into a named symbol, check 2 does **not** fail — that
-row is already attributed to core, so promotion satisfies check 2 more, not
-less — and an editor who updates this paragraph honestly at the same time
-satisfies 3 and 4 as well. Only check 6 fails, and the stale entry is then the
-thing to delete. Check 7 restores equality in both directions, weakened by
-exactly the allowlist and nothing more, so a core-attributed row that core
-never emits is caught without failing a conforming document.
+`dependency_unreadable` into a named symbol, every other check still passes —
+the row is already attributed to core — and only disjointness fails, leaving the
+stale allowlist entry as the thing to delete. Promotion MUST NOT be applied to
+`dependency_unreadable` without moving it out of the set check 2 quantifies
+over; it is the one core condition whose public class differs.
 
 **Compared object.** This object governs the interoperability comparison between
 two implementations. The anonymity comparison above is wider. Byte-identity is
@@ -210,28 +208,19 @@ Header order and unnamed header fields are outside it, and their values MUST NOT
 depend on the private condition — which the anonymity requirement above already
 demands and tests directly.
 
-Each of these three readings is stated because an independently written
-conforming implementation diverges on it by language default, not by error: a
-canonicalizing HTTP library emits `Www-Authenticate`, a server that sets no
-`Content-Length` frames the body as chunked, and a JSON encoder inserts spaces
-after `,` and `:`. An exit test whose result depends on a convention this
-document does not state is the same defect as an oracle no pair can satisfy,
-one layer down.
-
-Comparing the ordered sequence of header field names, or every header value
-except `Date`, would fail every conforming pair. Two independent servers emit
-different automatic fields in different orders — `Server` and `Connection` are
-the common divergences — so an exit test comparing them can never be passed by
-anyone, and an oracle that no conforming implementation can satisfy is a defect
-in this document rather than evidence about either implementation. The compared
-object is therefore closed over what core names and nothing more; if core later
-pins an additional field, it joins the compared object with no edit here.
-
-`Date` needs no special exclusion under this rule, since core does not name it;
-RFC 9110 Section 6.6.1 requires an origin server with a clock to generate it on
-every response, so it could never be held constant. Any field an implementation
-must exclude despite core naming it MUST be reported with the reason it cannot
-be held constant, and its value MUST be independent of the private condition.
+Each reading is stated because an independently written conforming
+implementation diverges on it by language default, not by error: a canonicalizing
+HTTP library emits `Www-Authenticate`, a server that sets no `Content-Length`
+frames the body as chunked, a JSON encoder inserts spaces after `,` and `:`, and
+two servers emit different automatic fields — `Server`, `Connection` — in
+different orders. Comparing those would fail every conforming pair, and an
+oracle no conforming implementation can satisfy is a defect in this document
+rather than evidence about either implementation. The compared object is
+therefore closed over what core names and nothing more; if core later pins an
+additional field, it joins with no edit here. `Date` needs no special exclusion,
+since core does not name it. Any field an implementation must exclude despite
+core naming it MUST be reported with the reason it cannot be held constant, and
+its value MUST be independent of the private condition.
 
 The oracle runs a fixed positive iteration count on a pinned isolated runner at
 the exact claimed head. Before the run the operator records the environment,
@@ -254,25 +243,44 @@ Naming an oracle for a requirement proves the requirement is claimed, not that
 the oracle can fail. A requirement whose oracle cannot fail is untested and
 reads as tested, which is worse than an acknowledged gap.
 
-For each normative requirement in core and each claimed profile, the suite MUST
-retain at least one **mutant**: an implementation variant that violates exactly
-that requirement, together with the failing output of the oracle that requirement
-names (`FI-CONF-MUTATION`). Evidence is the exact patch identity, the oracle
-identifier, and the retained failure output at the claimed head.
+The denominator is the **listed oracle**. An oracle table is identified by its
+rows: each names exactly one complete literal oracle identifier in its first
+cell, with no shorthand and no name left to inference. The denominator is every
+such row in NIP-FI core, in each claimed normative profile, and in this document
+when CONF is claimed — selected by that first cell, not by section title, since
+the tables do not share one. Enumerating it is reading rows, so two readers
+obtain the same set. It is not the set of normative sentences, RFC 2119
+keywords, or invariant labels: none is enumerable without judgement, and a
+denominator two readers count differently decides how much of the specification
+is tested at all.
 
-Four rules make the mutant meaningful:
+For each listed oracle in core and each claimed profile, the suite MUST retain at
+least one **mutant**: an implementation variant that violates a requirement that
+oracle governs, together with that oracle's failing output (`FI-CONF-MUTATION`).
+Evidence is the exact patch identity, the oracle identifier, and the retained
+failure output at the claimed head.
+
+Normative prose outside the oracle tables remains binding. It is not a second
+denominator. Prose that no listed oracle can detect is untestable text: add the
+oracle that detects it, or delete it.
+
+Five rules make the mutant meaningful:
 
 1. **One at a time.** Mutants are applied singly against an otherwise unmodified
    implementation. Layered defenses mask each other: a guard looks covered
    because a different guard denies first.
-2. **Attribution.** The kill MUST come from the oracle the requirement names. A
-   mutant killed only by some other oracle establishes coverage for neither.
-3. **Reachability.** The suite MUST witness that a fixture reaches the mutated
+2. **Attribution.** The kill MUST come from the entry's own oracle. A mutant
+   killed only by some other oracle establishes coverage for neither.
+3. **One entry per mutant.** A mutant satisfies only the entry it was selected
+   for, even when it also kills other oracles. Otherwise one broad mutant
+   discharges several obligations at once and the count reads complete while
+   the coverage is not.
+4. **Reachability.** The suite MUST witness that a fixture reaches the mutated
    decision, not merely the enclosing operation. A mutant behind a bound,
    length field, or earlier denial that no fixture ever passes is never
    exercised, and the suite reports clean on an implementation that is
    provably broken.
-4. **Survivors are recorded.** A mutant its named oracle fails to kill is a
+5. **Survivors are recorded.** A mutant its named oracle fails to kill is a
    defect in the specification or the suite. It is recorded with that
    disposition and MUST NOT be waived or replaced by an easier mutant.
 
@@ -290,8 +298,8 @@ sufficient to build against (`FI-CONF-INTEROP-EXIT`). Two implementations that
 have not shared code and have not consulted a common reference implementation
 each produce, from NIP-FI core and any claimed profile documents alone:
 
-- one byte-exact valid `client-attached` request, over WebSocket upgrade and
-  over HTTP; and
+- one valid `client-attached` request, over WebSocket upgrade and over HTTP,
+  compared over its signing inputs as defined below; and
 - one byte-exact public denial response for each of the four public classes, on
   both transports, compared over the object defined under **Denial fixtures**.
 
@@ -310,26 +318,38 @@ produce equal bytes however correct both are, so the run is parameterized by a
 - one frozen evaluation instant, and the skew and lifetime bounds in force; and
 - the domain, target resource, operation, and enrollment policy for each case.
 
+**Request compared object.** A minted request cannot be compared as bytes.
+`ES256` and BIP-340 each draw fresh randomness per signature, so two correct
+implementations signing one fixture produce different signature octets, and no
+document here pins JWS or JSON member order. Requiring byte-equality would fail
+every conforming pair — the defect this document names one layer down. The
+compared object is therefore the **signing inputs**: for the NIP-98 proof, the
+NIP-01 serialization the event id is taken over, which NIP-01 fixes
+byte-for-byte; for the assertion, the decoded protected header and claim set
+compared as JSON values, with member order excluded. Signature octets are
+excluded because they are unequal by construction, not by disagreement; the
+mutual-acceptance requirement below tests them instead. A divergence in a
+signing input is a divergence in what this document told each side to sign,
+which is what the exit test exists to detect.
+
 Every value the compared object depends on MUST be pinned here. A value left to
 the implementation is a divergence the test will attribute to a defect in this
 document, which is the correct disposition but a slow way to discover a missing
-fixture field. The fixture records the document revision it was authored
-against.
+fixture field.
 
 The exchanged artifact per case is the complete request frame and the complete
 response frame on each transport: for HTTP the request line, headers and body,
 and the response status, headers and body; for Nostr the complete client
 message and the complete relay message. Both sides emit whole frames even
-though the compared object is narrower, because the request side and the
-unnamed response fields are what the reader needs in order to explain a
-mismatch.
+though the compared objects are narrower, because the unnamed fields are what
+the reader needs in order to explain a mismatch.
 
-The evidence is the produced bytes, the fixture identity, the document revision
-used, and a statement of independence. The test passes when the outputs compare
-equal over the compared object and each implementation accepts the other's
-valid request and reproduces the other's denials. Any divergence traced to an
-underspecified value is a defect in the specification, not in either
-implementation, and is fixed there.
+The evidence is the produced bytes and a statement of independence; the claim
+tuple already pins the fixture and the document revision. The test passes when
+the outputs compare equal over their compared objects and each implementation
+accepts the other's valid request and reproduces the other's denials. Any
+divergence traced to an underspecified value is a defect in the specification,
+not in either implementation, and is fixed there.
 
 This test has a mandatory negative control. One implementation is patched to
 emit a denial that differs from the other only outside the compared object —
@@ -350,6 +370,10 @@ the surface is absent:
   configured and executable evidence proves the absence;
 - `FI-TRACE-TOFU-THEFT` only when TOFU is neither configurable nor configured
   and executable first-use cases deny;
+- `FI-TRACE-CURRENT-STATUS-STALE` and `FI-TRACE-CURRENT-STATUS-REVOKED` only
+  when every configured assertion policy declares freshness class
+  `offline-jwt`, so no status witness exists to be stale or revoked, and
+  executable cases prove a presented witness is never consulted;
 - lifecycle and delegation oracles only when the profile is unclaimed, disabled,
   and denied on every ingress; and
 - every other oracle is required for an enforcing deployment.
