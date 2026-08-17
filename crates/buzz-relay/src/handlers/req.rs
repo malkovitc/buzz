@@ -453,10 +453,10 @@ async fn register_subscription_if_current(
     pending: &Arc<PendingSubscription>,
 ) -> bool {
     let pending_subscriptions = conn.pending_subscriptions.lock().await;
-    let still_current = pending_subscriptions
+    let permitted_to_commit = pending_subscriptions
         .get(sub_id)
-        .is_some_and(|current| Arc::ptr_eq(current, pending));
-    if conn.cancel.is_cancelled() || pending.is_cancelled() || !still_current {
+        .is_some_and(|current| PendingSubscription::permits_commit(current, pending));
+    if conn.cancel.is_cancelled() || !permitted_to_commit {
         return false;
     }
 
@@ -1555,6 +1555,64 @@ mod tests {
             });
         });
         assert_eq!(subscription_gauge_value(&snapshotter), 0.0);
+    }
+
+    #[tokio::test]
+    async fn predecessor_commits_while_newer_same_id_req_is_pending() {
+        let community = CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let conn = test_connection(TenantContext::resolved(community, "race.test"));
+        let registry = crate::subscription::SubscriptionRegistry::new();
+        let pubsub = test_pubsub().await;
+        let channel_id = uuid::Uuid::new_v4();
+        let sub_id = "replacement-pending";
+        let filters = vec![Filter::new().kind(Kind::TextNote)];
+
+        let predecessor = conn.begin_pending_subscription(sub_id).await;
+        let replacement = conn.begin_pending_subscription(sub_id).await;
+
+        assert!(
+            register_subscription_if_current(
+                sub_id,
+                &filters,
+                Some(channel_id),
+                &conn,
+                &registry,
+                pubsub.as_ref(),
+                &predecessor,
+            )
+            .await
+        );
+        assert!(!predecessor.is_cancelled());
+        assert_eq!(registry.total_subscriptions(), 1);
+        assert_eq!(
+            pubsub
+                .topic_refcount(&conn.tenant, EventTopic::Channel(channel_id))
+                .await,
+            1
+        );
+
+        // The predecessor's handler completes after establishing its persistent
+        // subscription. If the newer request then fails, pending ownership is
+        // cleared without disturbing that already-registered subscription.
+        conn.finish_pending_subscription(sub_id, &predecessor).await;
+        conn.finish_pending_subscription(sub_id, &replacement).await;
+
+        assert!(conn.pending_subscriptions.lock().await.is_empty());
+        assert_eq!(registry.total_subscriptions(), 1);
+        assert_eq!(
+            conn.subscriptions
+                .lock()
+                .await
+                .get(sub_id)
+                .map(Vec::as_slice),
+            Some(filters.as_slice())
+        );
+        assert_eq!(
+            pubsub
+                .topic_refcount(&conn.tenant, EventTopic::Channel(channel_id))
+                .await,
+            1
+        );
     }
 
     #[test]

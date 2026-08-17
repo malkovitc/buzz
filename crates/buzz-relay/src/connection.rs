@@ -80,6 +80,25 @@ impl PendingSubscription {
         }
     }
 
+    /// Return whether `candidate` is allowed to commit while this request owns
+    /// the subscription ID. A newer same-ID REQ may take map ownership while
+    /// an older request is still doing validation or historical setup. Until
+    /// the newer request commits, any uncancelled request in its predecessor
+    /// lineage may still establish the subscription it started.
+    pub(crate) fn permits_commit(
+        current: &Arc<PendingSubscription>,
+        candidate: &Arc<PendingSubscription>,
+    ) -> bool {
+        let mut request = Some(Arc::clone(current));
+        while let Some(request_in_lineage) = request {
+            if Arc::ptr_eq(&request_in_lineage, candidate) {
+                return !candidate.is_cancelled();
+            }
+            request = request_in_lineage.predecessor.clone();
+        }
+        false
+    }
+
     fn live_predecessor(&self) -> Option<Arc<PendingSubscription>> {
         if self.committed.load(Ordering::Acquire) {
             return None;
@@ -183,7 +202,7 @@ impl ConnectionState {
     }
 
     /// Forget a completed REQ only if it still owns this subscription ID.
-    async fn finish_pending_subscription(
+    pub(crate) async fn finish_pending_subscription(
         &self,
         sub_id: &str,
         completed: &Arc<PendingSubscription>,
