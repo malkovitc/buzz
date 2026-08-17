@@ -1,6 +1,11 @@
 import * as React from "react";
 import { Smile } from "lucide-react";
 
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/shared/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import {
@@ -91,10 +96,14 @@ export function ProfilePopover({
 
   return (
     <>
-      <Popover open={open} onOpenChange={handlePopoverOpenChange}>
-        <PopoverTrigger asChild>{children}</PopoverTrigger>
+      <DropdownMenu
+        modal={false}
+        open={open}
+        onOpenChange={handlePopoverOpenChange}
+      >
+        <DropdownMenuTrigger asChild>{children}</DropdownMenuTrigger>
 
-        <PopoverContent
+        <DropdownMenuContent
           side="top"
           align="start"
           sideOffset={-32}
@@ -277,8 +286,8 @@ export function ProfilePopover({
               </kbd>
             </button>
           </div>
-        </PopoverContent>
-      </Popover>
+        </DropdownMenuContent>
+      </DropdownMenu>
 
       <SetStatusDialog
         hasExistingStatus={hasUserStatus}

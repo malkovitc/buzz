@@ -275,10 +275,21 @@ test.describe("community rail", () => {
     expect(communityBox?.y).toBeLessThan(feedbackBox?.y ?? 0);
     expect(feedbackBox?.y).toBeLessThan(settingsBox?.y ?? 0);
 
-    await page.getByTestId("community-switcher").click();
+    await page.getByTestId("community-switcher").hover();
 
     const menu = page.getByRole("menu", { name: "Community actions" });
     await expect(menu).toBeVisible();
+    const openCommunityBox = await communityTrigger.boundingBox();
+    const menuBox = await menu.boundingBox();
+    expect(openCommunityBox).not.toBeNull();
+    expect(menuBox).not.toBeNull();
+    expect(
+      Math.abs(
+        (openCommunityBox?.y ?? 0) +
+          (openCommunityBox?.height ?? 0) -
+          ((menuBox?.y ?? 0) + (menuBox?.height ?? 0)),
+      ),
+    ).toBeLessThanOrEqual(1);
     await expect(
       menu.getByRole("menuitem", { name: "Copy community URL" }),
     ).toBeVisible();

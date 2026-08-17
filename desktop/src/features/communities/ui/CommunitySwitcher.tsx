@@ -1,7 +1,6 @@
 import {
   Check,
   ChevronDown,
-  ChevronRight,
   Link2,
   MoreHorizontal,
   Plus,
@@ -20,6 +19,9 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
 import {
@@ -27,7 +29,6 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/shared/ui/sidebar";
-import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { cn } from "@/shared/lib/cn";
 import type { ConnectionState } from "@/shared/api/relayClientShared";
@@ -108,7 +109,6 @@ export function CommunitySwitcher({
   const [dropdownOpen, setDropdownOpen] = React.useState(false);
   const [leaveError, setLeaveError] = React.useState<string | null>(null);
   const [isLeaving, setIsLeaving] = React.useState(false);
-  const profileMenuHoverTimer = React.useRef<number | null>(null);
   const connectionState = useRelayConnection();
   const degraded = isRelayConnectionDegraded(connectionState);
   const connectionLabel = CONNECTION_STATE_LABEL[connectionState];
@@ -116,49 +116,9 @@ export function CommunitySwitcher({
   const activeIcon = activeIconQuery.data ?? null;
   const isProfileVariant = variant === "profile";
 
-  function clearProfileMenuHoverTimer() {
-    if (profileMenuHoverTimer.current !== null) {
-      window.clearTimeout(profileMenuHoverTimer.current);
-      profileMenuHoverTimer.current = null;
-    }
-  }
-
-  function scheduleProfileMenu(nextOpen: boolean) {
-    if (variant !== "profile-menu") return;
-    clearProfileMenuHoverTimer();
-    profileMenuHoverTimer.current = window.setTimeout(
-      () => setDropdownOpen(nextOpen),
-      nextOpen ? 80 : 160,
-    );
-  }
-
-  function handleProfileMenuOpenChange(nextOpen: boolean) {
-    if (variant !== "profile-menu") {
-      setDropdownOpen(nextOpen);
-      return;
-    }
-    if (!nextOpen) {
-      clearProfileMenuHoverTimer();
-    }
-    setDropdownOpen(nextOpen);
-  }
-
-  React.useEffect(
-    () => () => {
-      if (profileMenuHoverTimer.current !== null) {
-        window.clearTimeout(profileMenuHoverTimer.current);
-      }
-    },
-    [],
-  );
-
   const handleLeaveCommunity = React.useCallback(async () => {
     if (!activeCommunity || isLeaving) return;
 
-    if (profileMenuHoverTimer.current !== null) {
-      window.clearTimeout(profileMenuHoverTimer.current);
-      profileMenuHoverTimer.current = null;
-    }
     setIsLeaving(true);
     setLeaveError(null);
     try {
@@ -223,9 +183,7 @@ export function CommunitySwitcher({
       >
         {activeCommunity?.name ?? "No community"}
       </span>
-      {variant === "profile-menu" ? (
-        <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-      ) : (
+      {variant === "profile-menu" ? null : (
         <ChevronDown
           className={
             isProfileVariant
@@ -237,118 +195,76 @@ export function CommunitySwitcher({
     </>
   );
 
-  const profileMenuPopover =
+  const profileMenuSubmenu =
     variant === "profile-menu" ? (
-      <Popover open={dropdownOpen} onOpenChange={handleProfileMenuOpenChange}>
-        <PopoverTrigger asChild>
-          <button
-            aria-expanded={dropdownOpen}
-            aria-haspopup="menu"
-            aria-label={
-              degraded
-                ? `${activeCommunity?.name ?? "Community"} — ${connectionLabel}`
-                : "Community actions"
-            }
-            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-popover-foreground outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none data-[state=open]:bg-muted/50 data-[state=open]:text-popover-foreground"
-            data-testid="community-switcher"
-            onMouseEnter={() => scheduleProfileMenu(true)}
-            onMouseLeave={() => scheduleProfileMenu(false)}
-            role="menuitem"
-            type="button"
-          >
-            {triggerContent}
-          </button>
-        </PopoverTrigger>
-        <PopoverContent
+      <DropdownMenuSub open={dropdownOpen} onOpenChange={setDropdownOpen}>
+        <DropdownMenuSubTrigger
+          aria-label={
+            degraded
+              ? `${activeCommunity?.name ?? "Community"} — ${connectionLabel}`
+              : "Community actions"
+          }
+          className="px-3"
+          data-testid="community-switcher"
+        >
+          {triggerContent}
+        </DropdownMenuSubTrigger>
+        <DropdownMenuSubContent
           align="end"
-          className="w-60 p-1"
-          onMouseEnter={() => scheduleProfileMenu(true)}
-          onMouseLeave={() => scheduleProfileMenu(false)}
-          onOpenAutoFocus={(event) => event.preventDefault()}
-          side="right"
+          aria-label="Community actions"
+          className="w-60"
+          data-testid="profile-community-actions"
           sideOffset={0}
         >
-          <div
-            aria-label="Community actions"
-            data-testid="profile-community-actions"
-            role="menu"
-          >
-            {activeCommunity ? (
-              <>
-                <button
-                  className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none"
-                  onClick={() => {
-                    setDropdownOpen(false);
-                    void writeTextToClipboard(activeCommunity.relayUrl);
-                  }}
-                  role="menuitem"
-                  type="button"
-                >
-                  <Link2 className="h-4 w-4" />
-                  <span>Copy community URL</span>
-                </button>
-                {canInvite && onInvite ? (
-                  <button
-                    className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none"
-                    onClick={() => {
-                      setDropdownOpen(false);
-                      onInvite();
-                    }}
-                    role="menuitem"
-                    type="button"
-                  >
-                    <Ticket className="h-4 w-4" />
-                    <span>Invite to community</span>
-                  </button>
-                ) : null}
-                <button
-                  className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none"
-                  onClick={() => {
-                    setDropdownOpen(false);
-                    setEditingCommunity(activeCommunity);
-                  }}
-                  role="menuitem"
-                  type="button"
-                >
-                  <Settings2 className="h-4 w-4" />
-                  <span>Community settings</span>
-                </button>
-                <button
-                  className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-destructive outline-hidden transition-colors hover:bg-destructive/10 focus:bg-destructive/10 focus:outline-none focus-visible:bg-destructive/10 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50"
-                  disabled={isLeaving}
-                  onClick={() => void handleLeaveCommunity()}
-                  role="menuitem"
-                  type="button"
-                >
-                  <LogOut className="h-4 w-4" />
-                  <span>{isLeaving ? "Leaving…" : "Leave community"}</span>
-                </button>
-                {leaveError ? (
-                  <p
-                    className="px-3 py-1 text-xs text-destructive"
-                    role="alert"
-                  >
-                    {leaveError}
-                  </p>
-                ) : null}
-                <hr className="-mx-1 my-1 h-px border-0 bg-muted" />
-              </>
-            ) : null}
-            <button
-              className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none"
-              onClick={() => {
-                setDropdownOpen(false);
-                onAddCommunity();
-              }}
-              role="menuitem"
-              type="button"
-            >
-              <Plus className="h-4 w-4" />
-              <span>Add a community</span>
-            </button>
-          </div>
-        </PopoverContent>
-      </Popover>
+          {activeCommunity ? (
+            <>
+              <DropdownMenuItem
+                onSelect={(event) => {
+                  event.preventDefault();
+                  setDropdownOpen(false);
+                  void writeTextToClipboard(activeCommunity.relayUrl);
+                }}
+              >
+                <Link2 className="h-4 w-4" />
+                <span>Copy community URL</span>
+              </DropdownMenuItem>
+              {canInvite && onInvite ? (
+                <DropdownMenuItem onSelect={onInvite}>
+                  <Ticket className="h-4 w-4" />
+                  <span>Invite to community</span>
+                </DropdownMenuItem>
+              ) : null}
+              <DropdownMenuItem
+                onSelect={() => setEditingCommunity(activeCommunity)}
+              >
+                <Settings2 className="h-4 w-4" />
+                <span>Community settings</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+                disabled={isLeaving}
+                onSelect={(event) => {
+                  event.preventDefault();
+                  void handleLeaveCommunity();
+                }}
+              >
+                <LogOut className="h-4 w-4" />
+                <span>{isLeaving ? "Leaving…" : "Leave community"}</span>
+              </DropdownMenuItem>
+              {leaveError ? (
+                <p className="px-3 py-1 text-xs text-destructive" role="alert">
+                  {leaveError}
+                </p>
+              ) : null}
+              <DropdownMenuSeparator />
+            </>
+          ) : null}
+          <DropdownMenuItem onSelect={onAddCommunity}>
+            <Plus className="h-4 w-4" />
+            <span>Add a community</span>
+          </DropdownMenuItem>
+        </DropdownMenuSubContent>
+      </DropdownMenuSub>
     ) : null;
 
   const switcherDropdown = (
@@ -436,7 +352,7 @@ export function CommunitySwitcher({
       {variant === "profile" ? (
         switcherDropdown
       ) : variant === "profile-menu" ? (
-        profileMenuPopover
+        profileMenuSubmenu
       ) : (
         <SidebarMenu>
           <SidebarMenuItem>{switcherDropdown}</SidebarMenuItem>
