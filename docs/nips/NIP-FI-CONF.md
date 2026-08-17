@@ -288,7 +288,7 @@ Two global controls bound the suite from both sides. A deny-everything
 implementation MUST fail every positive oracle, proving each oracle has a
 positive arm. An allow-everything implementation MUST fail every negative
 oracle, proving each has a negative arm. Neither control substitutes for
-per-requirement mutants; an implementation can pass both while violating any
+per-entry mutants; an implementation can pass both while violating any
 individual requirement.
 
 ## Interoperability exit test
@@ -310,27 +310,38 @@ produce equal bytes however correct both are, so the run is parameterized by a
 
 - one issuer identity and one JWK set, including the private key needed to mint
   assertions and the `kid` selecting it;
-- one assertion per denial class and one for the valid request, each with fixed
+- one assertion per denial class and one for the valid request, each expressed
+  as complete pre-signature protected-header and claim-set JSON values —
+  including `alg`, `typ`, `kid`, and every member the policy allows, and fixed
   `iss`, `sub`, `aud`, `nostr_pubkey`, `client_id`, `iat`, `exp`, and token
-  class, expressed as complete pre-signature JWT claim sets;
-- one Nostr secret key for the proof, with the exact event fields including
-  `created_at`, so both sides derive the same actor;
+  class;
+- one Nostr secret key for the proof, with the complete unsigned event fields
+  for each transport — the NIP-98 event over HTTP and the NIP-42 event with its
+  challenge and relay values over the WebSocket upgrade — including
+  `created_at`, so both sides derive the same actor and the same event id;
 - one frozen evaluation instant, and the skew and lifetime bounds in force; and
 - the domain, target resource, operation, and enrollment policy for each case.
 
-**Request compared object.** A minted request cannot be compared as bytes.
-`ES256` and BIP-340 each draw fresh randomness per signature, so two correct
-implementations signing one fixture produce different signature octets, and no
-document here pins JWS or JSON member order. Requiring byte-equality would fail
-every conforming pair — the defect this document names one layer down. The
-compared object is therefore the **signing inputs**: for the NIP-98 proof, the
-NIP-01 serialization the event id is taken over, which NIP-01 fixes
-byte-for-byte; for the assertion, the decoded protected header and claim set
-compared as JSON values, with member order excluded. Signature octets are
-excluded because they are unequal by construction, not by disagreement; the
-mutual-acceptance requirement below tests them instead. A divergence in a
-signing input is a divergence in what this document told each side to sign,
-which is what the exit test exists to detect.
+**Request compared object.** A minted request cannot be compared as bytes. Two
+conforming implementations may produce different signature octets for the same
+semantic input — randomized `ES256` and BIP-340 with fresh auxiliary input do,
+while deterministic ECDSA and fixed-aux BIP-340 need not — and no document here
+pins JWS or JSON member order. An object requiring equal octets would therefore
+fail conforming pairs, which is the defect this document names one layer down.
+The compared object is the **signing inputs**:
+
+- for a NIP-98 proof over HTTP and a NIP-42 proof over the WebSocket upgrade,
+  the NIP-01 serialization the event id is taken over, which NIP-01 fixes
+  byte-for-byte; each transport's proof is compared against its own transport's
+  serialization, not across transports; and
+- for the assertion, the decoded protected header and claim set compared as
+  JSON values, with member order excluded.
+
+Signature octets are excluded because conforming implementations need not agree
+on them, not because they disagree about this document; the mutual-acceptance
+requirement below tests them instead. A divergence in a signing input is a
+divergence in what this document told each side to sign, which is what the exit
+test exists to detect.
 
 Every value the compared object depends on MUST be pinned here. A value left to
 the implementation is a divergence the test will attribute to a defect in this
@@ -374,6 +385,9 @@ the surface is absent:
   when every configured assertion policy declares freshness class
   `offline-jwt`, so no status witness exists to be stale or revoked, and
   executable cases prove a presented witness is never consulted;
+- `FI-TRACE-CAPABILITY-REVOCATION` only when no external capability projection
+  requiring a declared revocation bound is configured, and executable evidence
+  proves no assertion capability or local-policy value claims such a bound;
 - lifecycle and delegation oracles only when the profile is unclaimed, disabled,
   and denied on every ingress; and
 - every other oracle is required for an enforcing deployment.
@@ -386,7 +400,7 @@ one deployed domain does not activate it.
 Before NIP-FI enforcement or discovery is enabled, reviewers verify that one
 immutable claim tuple passes every applicable oracle at one reviewed revision;
 that the protected-ingress inventory has no uncovered or competing authority;
-that every core requirement has a killed, attributed, reachable mutant and every
+that every listed oracle has a killed, attributed, reachable mutant and every
 survivor is recorded; that the denial-fixture enumeration is complete for the
 claimed profiles and its negative control fails as required; that the
 interoperability exit test has passed against an independent implementation;
@@ -402,8 +416,8 @@ They close no item in this gate.
 |---|---|
 | `FI-CONF-CLAIM-COMPLETE` | A report missing an applicable oracle, duplicating one, carrying a result from another claim tuple, or claiming a status other than `pass`/`not-applicable` is rejected. |
 | `FI-CONF-DENIAL-FIXTURES` | Every enumerated private condition has a fixture; anonymity-set responses compare byte-identical; the distinguishing negative control fails. |
-| `FI-CONF-MUTATION` | Every normative requirement has a singly-applied, attributed, reachability-witnessed mutant killed by its named oracle; survivors are recorded, not waived. |
-| `FI-CONF-INTEROP-EXIT` | Two independent implementations produce byte-identical valid requests and per-class denials from the documents alone and accept each other's output. |
+| `FI-CONF-MUTATION` | Every listed oracle has a singly-applied, attributed, reachability-witnessed mutant killed by that entry's own oracle; survivors are recorded, not waived. |
+| `FI-CONF-INTEROP-EXIT` | Two independent implementations produce, from the documents alone, valid requests equal over the request compared object and per-class denials equal over the denial compared object, and accept each other's output. |
 
 ## Security considerations
 
