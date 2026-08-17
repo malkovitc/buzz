@@ -545,7 +545,7 @@ test("scales the sidebar backward while its chrome closes", async ({
 
   await expect(sidebarSurface).toHaveCSS("opacity", "0");
   await expect(sidebar).toHaveCSS("pointer-events", "none");
-  await expect(sidebar).toHaveCSS("overflow", "hidden");
+  await expect(sidebar).toHaveCSS("overflow", "visible");
   await expect(sidebar.locator(':scope > [data-sidebar="sidebar"]')).toHaveCSS(
     "background-color",
     await sidebarSurface.evaluate((element) => {
