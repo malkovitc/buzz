@@ -502,6 +502,32 @@ may distinguish the configured mode. Profile documents own only non-enrollment
 public claims.
 [FI-TRACE-DISCOVERY-PRIVATE]
 
+## Worked example (non-normative)
+
+A protected HTTP POST under `client-attached` with NIP-98 proof and an
+authorization-relevant body. Credentials are elided; the NIP-FI-CONF exit
+fixture pins complete byte-exact values.
+
+```text
+POST /media HTTP/1.1
+Host: relay.example
+Nostr-Federated-Identity: Bearer eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIs...
+Authorization: Nostr eyJpZCI6IjE1ZTI3ZDc0Li4uIiwicHVia2V5IjoiOTljNzQ4Li4u...
+Content-Type: application/octet-stream
+Content-Length: 4
+
+abcd
+```
+
+The bearer JWS validates under the configured assertion policy: exact `iss`
+and `aud`, token class `at+jwt`, live time claims, and `nostr_pubkey` equal to
+the NIP-98 event's `pubkey`. The NIP-98 event binds the server-resolved method
+and URL, and its single `payload` tag equals the SHA-256 of the four body
+bytes. Admission then follows Direct preparation and Final admission; success
+returns the application response, and every failure class returns exactly the
+bytes fixed in the Rejection table. On a WebSocket upgrade the same header
+attaches to the upgrade request and NIP-42 supplies the proof after connect.
+
 ## Core behavioral oracles
 
 A core claim covers every applicable oracle below at one implementation and
