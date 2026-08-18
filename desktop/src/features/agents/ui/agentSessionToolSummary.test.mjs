@@ -360,6 +360,40 @@ test("buildCompactToolSummary parses file edit stats from shell JSON stdout", ()
   ]);
 });
 
+test("buildCompactToolSummary renders Codex apply_patch input when result is only an acknowledgement", () => {
+  const summary = buildCompactToolSummary(
+    makeTool({
+      toolName: "apply_patch",
+      args: {
+        patch: [
+          "*** Begin Patch",
+          "*** Update File: desktop/src/app/App.tsx",
+          "@@",
+          "-const oldValue = true;",
+          "+const newValue = true;",
+          "*** End Patch",
+        ].join("\n"),
+      },
+      result: "Done!",
+    }),
+  );
+
+  assert.equal(summary.kind, "file-edit");
+  assert.deepEqual(summary.fileEditSummary, {
+    path: "desktop/src/app/App.tsx",
+    filename: "App.tsx",
+    additions: 1,
+    deletions: 1,
+  });
+  assert.deepEqual(summary.fileEditDiff?.lines, [
+    { kind: "meta", text: "*** Update File: desktop/src/app/App.tsx" },
+    { kind: "meta", text: "@@" },
+    { kind: "remove", text: "-const oldValue = true;" },
+    { kind: "add", text: "+const newValue = true;" },
+    { kind: "meta", text: "*** End Patch" },
+  ]);
+});
+
 test("buildCompactToolSummary trims only trailing blank diff lines", () => {
   const summary = buildCompactToolSummary(
     makeTool({

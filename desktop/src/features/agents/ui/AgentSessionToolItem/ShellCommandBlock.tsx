@@ -11,7 +11,8 @@ export function ShellCommandBlock({
   result: string;
 }) {
   const output = parseShellToolOutput(result);
-  const stdout = output.stdout.trimEnd();
+  const stdout = (output.stdout || output.raw).trimEnd();
+  const stderr = output.stderr.trimEnd();
 
   return (
     <div
@@ -37,6 +38,25 @@ export function ShellCommandBlock({
             {stdout}
           </pre>
         </ScrollFadeMonoPanel>
+      ) : null}
+      {stderr ? (
+        <ScrollFadeMonoPanel
+          className="mt-2 border-t border-destructive/20 pt-2"
+          fadeFromClassName="from-muted"
+          maxHeightClassName="max-h-36"
+        >
+          <p className="mb-1 text-2xs font-semibold uppercase tracking-wide text-destructive/80">
+            stderr
+          </p>
+          <pre className="whitespace-pre-wrap wrap-break-word text-destructive">
+            {stderr}
+          </pre>
+        </ScrollFadeMonoPanel>
+      ) : null}
+      {output.exitCode !== null || output.timedOut ? (
+        <p className="mt-2 text-2xs text-muted-foreground">
+          {output.timedOut ? "Timed out" : `Exited ${output.exitCode}`}
+        </p>
       ) : null}
     </div>
   );

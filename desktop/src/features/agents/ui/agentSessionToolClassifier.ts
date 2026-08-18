@@ -36,6 +36,7 @@ const DEVELOPER_TOOL_BASES = new Set([
   "read_file",
   "view_image",
   "str_replace",
+  "apply_patch",
   "todo",
   "stop",
   "postcompact",
@@ -342,7 +343,12 @@ function classifyDeveloperToolName(value: string | null | undefined) {
     return "read_file";
   if (base === "view_image" || normalized.endsWith("_view_image"))
     return "view_image";
-  if (base === "str_replace" || normalized.endsWith("_str_replace"))
+  if (
+    base === "str_replace" ||
+    normalized.endsWith("_str_replace") ||
+    base === "apply_patch" ||
+    normalized.endsWith("_apply_patch")
+  )
     return "str_replace";
   if (base === "todo") return "todo";
   if (base === "stop") return "stop_hook";

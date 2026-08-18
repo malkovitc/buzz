@@ -40,18 +40,23 @@ export function buildFileEditDiff(
   }
 
   const resultText = getResultText(item.result);
+  const inputPatch = getToolString(item.args, ["patch", "diff", "input"]);
+  const diffText = hasDiffContent(resultText)
+    ? resultText
+    : (inputPatch ?? resultText);
   const path =
     getToolString(item.args, ["path", "file", "file_path", "target_file"]) ??
+    getDiffPath(diffText) ??
+    getPatchPath(diffText) ??
     descriptor.object ??
-    descriptor.preview ??
-    getDiffPath(resultText);
+    descriptor.preview;
 
   if (!path) {
     return null;
   }
 
-  const lines = getDiffLines(resultText);
-  const stats = getDiffStats(resultText, lines);
+  const lines = getDiffLines(diffText);
+  const stats = getDiffStats(diffText, lines);
   if (!stats) {
     return null;
   }
@@ -82,6 +87,17 @@ function getResultText(result: string): string {
   return output || result;
 }
 
+function hasDiffContent(text: string) {
+  return /^(?:diff --git|--- |\+\+\+ |@@|\*\*\* (?:Update|Add|Delete) File:)/m.test(
+    text,
+  );
+}
+
+function getPatchPath(text: string): string | null {
+  const match = text.match(/^\*\*\* (?:Update|Add|Delete) File:\s*(.+)$/m);
+  return match?.[1]?.trim() ?? null;
+}
+
 function getDiffPath(text: string): string | null {
   for (const line of text.split(/\r?\n/)) {
     const match = line.match(/^\+\+\+\s+(?:b\/)?(.+)$/);
@@ -103,7 +119,9 @@ function getDiffPath(text: string): string | null {
 function getDiffLines(text: string): FileEditDiffLine[] {
   const rawLines = text.split(/\r?\n/);
   const hasUnifiedDiff = rawLines.some((line) =>
-    /^(diff --git|--- |\+\+\+ |@@)/.test(line),
+    /^(diff --git|--- |\+\+\+ |@@|\*\*\* (?:Begin|End|Update|Add|Delete) (?:Patch|File:))/.test(
+      line,
+    ),
   );
   const lines: FileEditDiffLine[] = [];
   let inUnifiedDiff = false;
@@ -122,7 +140,11 @@ function getDiffLines(text: string): FileEditDiffLine[] {
     }
 
     if (hasUnifiedDiff && !inUnifiedDiff) {
-      if (!/^(diff --git|--- |\+\+\+ |@@)/.test(rawLine)) {
+      if (
+        !/^(diff --git|--- |\+\+\+ |@@|\*\*\* (?:Update|Add|Delete) File:)/.test(
+          rawLine,
+        )
+      ) {
         continue;
       }
       inUnifiedDiff = true;
@@ -162,7 +184,11 @@ function getShikiDiffKind(line: string): "add" | "remove" | null {
 }
 
 function classifyUnifiedDiffLine(line: string): FileEditDiffLine {
-  if (/^(diff --git|--- |\+\+\+ |@@)/.test(line)) {
+  if (
+    /^(diff --git|--- |\+\+\+ |@@|\*\*\* (?:Begin|End|Update|Add|Delete) (?:Patch|File:))/.test(
+      line,
+    )
+  ) {
     return { kind: "meta", text: line };
   }
   if (line.startsWith("+")) {

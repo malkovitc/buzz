@@ -1,10 +1,17 @@
 import * as React from "react";
-import { Clock, Loader2, MailOpen } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { Clock, Loader2, MailOpen, MessageSquareText } from "lucide-react";
 
 import { useAppShell } from "@/app/AppShellContext";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import type { ActiveChannelTurnSummary } from "@/features/agents/activeAgentTurnsStore";
+import {
+  getActivityHeadline,
+  isMeaningfulItem,
+  isSpineItem,
+} from "@/features/agents/ui/agentSessionTranscriptPresentation";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
+import { useAgentTranscript } from "@/features/agents/ui/useObserverEvents";
 import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { buildInboxItems, type InboxItem } from "@/features/home/lib/inbox";
 import { getGroupedInboxItemIds } from "@/features/home/useHomeInboxReadState";
@@ -13,6 +20,7 @@ import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { useRemindLater } from "@/features/reminders/ui/RemindMeLaterProvider";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { Channel, FeedItem, HomeFeedResponse } from "@/shared/api/types";
+import { resolveWorkingThreadContext } from "@/features/sidebar/lib/workingThreadContext";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import { useNow } from "@/shared/lib/useNow";
 import { Markdown } from "@/shared/ui/markdown";
@@ -142,23 +150,41 @@ function ThreadPreviewRow({
 
 function WorkingAgentRow({
   avatarUrl,
+  channelId,
   elapsed,
   name,
   onOpen,
+  onOpenThread,
   pubkey,
+  triggeringEventId,
 }: {
   avatarUrl: string | null;
+  channelId: string;
   elapsed: string;
   name: string;
   onOpen: () => void;
+  onOpenThread: (rootId: string) => void;
   pubkey: string;
+  triggeringEventId?: string;
 }) {
+  const transcript = useAgentTranscript(true, pubkey);
+  const currentAction = React.useMemo(() => {
+    const scoped = transcript.filter((item) => item.channelId === channelId);
+    const candidates = scoped.some(isSpineItem)
+      ? scoped.filter(isSpineItem)
+      : scoped.filter(isMeaningfulItem);
+    for (let index = candidates.length - 1; index >= 0; index--) {
+      const headline = getActivityHeadline(candidates[index]);
+      if (headline) return headline;
+    }
+    return "Starting turn…";
+  }, [channelId, transcript]);
+  const threadContext = useWorkingThreadContext(triggeringEventId, channelId);
+
   return (
-    <button
-      className="flex w-full min-w-0 items-start gap-2.5 border-t border-border/50 px-3 py-3 text-left transition-colors first:border-t-0 hover:bg-muted/50 focus-visible:bg-muted/50 focus-visible:outline-hidden"
+    <div
+      className="flex w-full min-w-0 items-start gap-2.5 border-t border-border/50 px-3 py-3 text-left first:border-t-0"
       data-testid={`channel-activity-agent-${pubkey}`}
-      onClick={onOpen}
-      type="button"
     >
       <UserAvatar
         avatarUrl={avatarUrl}
@@ -167,32 +193,65 @@ function WorkingAgentRow({
         size="md"
       />
       <div className="min-w-0 flex-1">
-        <div className="flex min-w-0 items-start gap-2">
-          <span className="min-w-0 flex-1 truncate text-sm font-semibold leading-4 text-foreground">
-            {name}
+        <button
+          className="block w-full rounded text-left hover:text-primary focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+          onClick={onOpen}
+          type="button"
+        >
+          <span className="flex min-w-0 items-start gap-2">
+            <span className="min-w-0 flex-1 truncate text-sm font-semibold leading-4 text-foreground">
+              {name}
+            </span>
+            <span className="shrink-0 text-xs leading-4 text-muted-foreground/70">
+              {elapsed}
+            </span>
           </span>
-          <span className="shrink-0 text-xs leading-4 text-muted-foreground/70">
-            {elapsed}
+          <span className="mt-0.5 flex items-center gap-1.5 text-xs leading-4 text-muted-foreground">
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary/70" />
+            <span className="truncate">{currentAction}</span>
           </span>
-        </div>
-        <span className="mt-0.5 flex items-center gap-1.5 text-xs leading-4 text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin text-primary/70" />
-          Working
-        </span>
+        </button>
+        {threadContext ? (
+          <button
+            className="mt-1 flex max-w-full items-center gap-1 text-xs text-primary/80 hover:underline focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+            data-testid={`channel-activity-thread-${pubkey}`}
+            onClick={() => onOpenThread(threadContext.rootId)}
+            title={threadContext.label}
+            type="button"
+          >
+            <MessageSquareText className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate">{threadContext.label}</span>
+          </button>
+        ) : null}
       </div>
-    </button>
+    </div>
   );
+}
+
+function useWorkingThreadContext(
+  triggeringEventId: string | undefined,
+  channelId: string,
+) {
+  return useQuery({
+    queryKey: ["working-forum-thread", channelId, triggeringEventId],
+    enabled: Boolean(triggeringEventId),
+    staleTime: Number.POSITIVE_INFINITY,
+    queryFn: () =>
+      resolveWorkingThreadContext(triggeringEventId ?? "", channelId),
+  }).data;
 }
 
 function WorkingAgentRows({
   activeWorking,
   channelId,
   onOpen,
+  onOpenThread,
   profiles,
 }: {
   activeWorking: ActiveChannelTurnSummary;
   channelId: string;
   onOpen: (pubkey: string, channelId: string) => void;
+  onOpenThread: (channelId: string, rootId: string) => void;
   profiles?: UserProfileLookup;
 }) {
   const now = useNow(1000);
@@ -211,11 +270,18 @@ function WorkingAgentRows({
     return (
       <WorkingAgentRow
         avatarUrl={profile?.avatarUrl ?? null}
+        channelId={channelId}
         elapsed={elapsed}
         key={pubkey}
         name={name}
         onOpen={() => onOpen(pubkey, channelId)}
+        onOpenThread={(rootId) => onOpenThread(channelId, rootId)}
         pubkey={pubkey}
+        triggeringEventId={
+          activeWorking.triggeringEventIdsByAgent?.[
+            normalizePubkey(pubkey)
+          ]?.[0]
+        }
       />
     );
   });
@@ -413,6 +479,13 @@ export function ChannelActivityPopover({
                 onOpen={(pubkey, channelId) => {
                   setOpen(false);
                   openAgentActivity(pubkey, { channelId });
+                }}
+                onOpenThread={(channelId, rootId) => {
+                  setOpen(false);
+                  void goChannel(channelId, {
+                    messageId: rootId,
+                    threadRootId: rootId,
+                  });
                 }}
                 profiles={profiles}
               />

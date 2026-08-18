@@ -339,7 +339,7 @@ test.describe("channel activity hover preview", () => {
     ).toContainText("Charlie");
     await expect(
       popover.getByTestId(`channel-activity-agent-${AGENT_PUBKEY}`),
-    ).toContainText("Working");
+    ).toContainText("Starting turn");
     const orderedRows = popover.locator(
       '[data-testid^="channel-activity-agent-"], [data-testid^="channel-activity-item-"]',
     );

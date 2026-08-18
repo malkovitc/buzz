@@ -310,6 +310,20 @@ describe("activeAgentTurnsStore", () => {
       );
     });
 
+    it("retains triggering message ids so sidebar activity can name the thread", () => {
+      const triggerId = "1".repeat(64);
+      syncAgentTurnsFromEvents(AGENT, [
+        makeEvent({
+          channelId: "forum",
+          payload: { triggeringEventIds: [triggerId, "not-an-event-id"] },
+        }),
+      ]);
+
+      assert.deepEqual(getActiveTurnsByChannel()[0].triggeringEventIdsByAgent, {
+        [AGENT]: [triggerId],
+      });
+    });
+
     it("removes a channel summary when the last active turn ends", () => {
       syncAgentTurnsFromEvents(AGENT, [
         makeEvent({ seq: 1, turnId: "t1", channelId: "c1" }),
