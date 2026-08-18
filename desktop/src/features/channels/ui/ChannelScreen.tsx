@@ -803,12 +803,20 @@ export function ChannelScreen({
           {activeChannel ? (
             activeChannel.channelType === "forum" ? (
               <ForumChannelContent
+                agentSessionAgents={agentSessionAgents}
                 canResetPanelWidth={canResetThreadPanelWidth}
                 channel={activeChannel}
                 currentPubkey={currentPubkey}
                 header={channelHeader}
+                onBackFromAgentSession={
+                  hasAgentSessionReturnTarget
+                    ? handleBackFromAgentSession
+                    : undefined
+                }
+                onCloseAgentSession={handleCloseAgentSession}
                 onClosePost={onCloseForumPost}
                 onCloseProfilePanel={handleCloseProfilePanel}
+                onOpenAgentSession={handleOpenAgentSession}
                 onOpenDm={handleOpenDm}
                 onOpenProfilePanel={handleOpenProfilePanel}
                 onPanelResizeStart={handleThreadPanelResizeStart}
@@ -816,8 +824,10 @@ export function ChannelScreen({
                 onProfilePanelViewChange={setProfilePanelView}
                 onResetPanelWidth={handleThreadPanelWidthReset}
                 onSelectPost={onSelectForumPost}
+                openAgentSessionPubkey={openAgentSessionPubkey}
                 panelWidthPx={threadPanelWidthPx}
                 profilePanelPubkey={profilePanelPubkey}
+                profiles={messageProfiles}
                 profilePanelTab={profilePanelTab}
                 profilePanelView={profilePanelView}
                 selectedPostId={selectedForumPostId}

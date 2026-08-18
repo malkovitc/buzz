@@ -32,6 +32,8 @@ type ForumThreadPanelProps = {
   currentPubkey?: string;
   profiles?: UserProfileLookup;
   onBack: () => void;
+  onOpenAgentSession?: (pubkey: string, channelId?: string | null) => void;
+  openAgentSessionPubkey?: string | null;
   onReply: (
     content: string,
     mentionPubkeys: string[],
@@ -138,6 +140,8 @@ export function ForumThreadPanel({
   currentPubkey,
   profiles,
   onBack,
+  onOpenAgentSession,
+  openAgentSessionPubkey = null,
   onReply,
   onDeletePost,
   onDeleteReply,
@@ -322,7 +326,8 @@ export function ForumThreadPanel({
             <BotActivityComposerAction
               agents={workingAgents}
               channelId={channelId}
-              openAgentSessionPubkey={null}
+              onOpenAgentSession={onOpenAgentSession}
+              openAgentSessionPubkey={openAgentSessionPubkey}
               profiles={profiles}
               variant="inline"
               workingBotPubkeys={workingAgentPubkeys}

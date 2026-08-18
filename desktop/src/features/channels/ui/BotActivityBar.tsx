@@ -27,7 +27,7 @@ type BotActivityBarProps = {
 };
 
 const HOVER_OPEN_DELAY_MS = 150;
-const HOVER_CLOSE_DELAY_MS = 180;
+const HOVER_CLOSE_DELAY_MS = 500;
 const HEADLINE_ROTATION_MS = 2200;
 
 export function BotActivityComposerAction({
