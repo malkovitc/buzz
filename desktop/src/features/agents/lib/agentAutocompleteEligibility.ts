@@ -66,16 +66,30 @@ export function getMentionableAgentPubkeys({
   managedAgentPubkeys,
   relayAgents,
   sharedChannelIds,
+  channelMemberAgentPubkeys = [],
 }: {
   currentPubkey?: string | null;
   eligibilityScope: AgentEligibilityScope;
   managedAgentPubkeys: Iterable<string>;
   relayAgents: readonly RelayAgent[] | undefined;
   sharedChannelIds: ReadonlySet<string>;
+  channelMemberAgentPubkeys?: Iterable<string>;
 }) {
   const pubkeys = new Set(
     [...managedAgentPubkeys].map((pubkey) => normalizePubkey(pubkey)),
   );
+
+  if (eligibilityScope.type === "channel") {
+    const directoryPubkeys = new Set(
+      (relayAgents ?? []).map((agent) => normalizePubkey(agent.pubkey)),
+    );
+    for (const pubkey of channelMemberAgentPubkeys) {
+      const normalized = normalizePubkey(pubkey);
+      // Membership is a fallback only when the relay directory is incomplete;
+      // an explicit directory denial must continue to win.
+      if (!directoryPubkeys.has(normalized)) pubkeys.add(normalized);
+    }
+  }
 
   for (const agent of relayAgents ?? []) {
     const isAllowed =

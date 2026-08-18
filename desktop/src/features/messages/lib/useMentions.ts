@@ -193,11 +193,21 @@ export function useMentions(
         managedAgentPubkeys,
         relayAgents: relayAgentsQuery.data,
         sharedChannelIds,
+        channelMemberAgentPubkeys: (members ?? [])
+          .filter(
+            (member) =>
+              member.isAgent === true ||
+              member.role === "bot" ||
+              profiles?.[normalizePubkey(member.pubkey)]?.isAgent === true,
+          )
+          .map((member) => member.pubkey),
       }),
     [
       currentPubkey,
       managedAgentPubkeys,
+      members,
       mentionChannelId,
+      profiles,
       relayAgentsQuery.data,
       sharedChannelIds,
     ],
