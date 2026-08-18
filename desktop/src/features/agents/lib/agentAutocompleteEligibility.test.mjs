@@ -190,6 +190,12 @@ test("getMentionableAgentPubkeys: scopes channel composers and fails closed with
       respondToAllowlist: [CURRENT_PUBKEY],
       channelIds: ["general"],
     },
+    {
+      pubkey: PUB_D,
+      respondTo: "allowlist",
+      respondToAllowlist: [],
+      channelIds: ["general"],
+    },
   ];
   const base = {
     currentPubkey: CURRENT_PUBKEY,
@@ -215,7 +221,16 @@ test("getMentionableAgentPubkeys: scopes channel composers and fails closed with
   assert.deepEqual(
     getMentionableAgentPubkeys({
       ...base,
+      eligibilityScope: { type: "channel", channelId: "general" },
+      channelMemberAgentPubkeys: [PUB_C, PUB_D],
+    }),
+    new Set([PUB_A, PUB_C, PUB_B]),
+  );
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
       eligibilityScope: { type: "managed-only" },
+      channelMemberAgentPubkeys: [PUB_C],
     }),
     new Set([PUB_A]),
   );
