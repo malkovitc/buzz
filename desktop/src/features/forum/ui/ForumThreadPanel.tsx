@@ -1,6 +1,8 @@
 import { ArrowLeft, MessageSquare } from "lucide-react";
 import * as React from "react";
 
+import { useChannelWorkingAgentPubkeys } from "@/features/agents/agentWorkingSignal";
+import { BotActivityComposerAction } from "@/features/channels/ui/BotActivityBar";
 import {
   resolveUserLabel,
   type UserProfileLookup,
@@ -150,6 +152,20 @@ export function ForumThreadPanel({
     () => channels.filter((c) => c.channelType !== "dm").map((c) => c.name),
     [channels],
   );
+  const workingAgentPubkeys = useChannelWorkingAgentPubkeys(channelId);
+  const workingAgents = React.useMemo(
+    () =>
+      workingAgentPubkeys.map((pubkey) => ({
+        pubkey,
+        name: resolveUserLabel({
+          pubkey,
+          currentPubkey,
+          profiles,
+          preferResolvedSelfLabel: true,
+        }),
+      })),
+    [currentPubkey, profiles, workingAgentPubkeys],
+  );
 
   React.useEffect(() => {
     if (!thread || !targetEventId) {
@@ -297,15 +313,32 @@ export function ForumThreadPanel({
         </div>
       </div>
 
-      <div className="border-t border-border/60 p-4">
-        <ForumComposer
-          channelId={channelId}
-          channelType="forum"
-          isSending={isSendingReply}
-          onSubmit={onReply}
-          placeholder="Reply to this post..."
-          profiles={profiles}
-        />
+      <div className="border-t border-border/60">
+        {workingAgentPubkeys.length > 0 ? (
+          <div
+            className="flex min-h-8 items-center px-5 pt-2"
+            data-testid="forum-agent-activity-row"
+          >
+            <BotActivityComposerAction
+              agents={workingAgents}
+              channelId={channelId}
+              openAgentSessionPubkey={null}
+              profiles={profiles}
+              variant="inline"
+              workingBotPubkeys={workingAgentPubkeys}
+            />
+          </div>
+        ) : null}
+        <div className="p-4">
+          <ForumComposer
+            channelId={channelId}
+            channelType="forum"
+            isSending={isSendingReply}
+            onSubmit={onReply}
+            placeholder="Reply to this post..."
+            profiles={profiles}
+          />
+        </div>
       </div>
     </div>
   );

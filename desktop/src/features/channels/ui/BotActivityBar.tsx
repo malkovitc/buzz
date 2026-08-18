@@ -19,7 +19,7 @@ export type BotActivityAgent = Pick<ManagedAgent, "pubkey" | "name">;
 type BotActivityBarProps = {
   agents: BotActivityAgent[];
   channelId?: string | null;
-  onOpenAgentSession: (pubkey: string, channelId?: string | null) => void;
+  onOpenAgentSession?: (pubkey: string, channelId?: string | null) => void;
   openAgentSessionPubkey: string | null;
   profiles?: UserProfileLookup;
   workingBotPubkeys: string[];
@@ -147,6 +147,7 @@ export function BotActivityComposerAction({
     workingAgents.length === 1
       ? `${workingAgents[0]?.name ?? "Agent"} is working`
       : `${workingAgents.length} agents working`;
+  const canOpenAgentSession = Boolean(onOpenAgentSession);
   const isInline = variant === "inline";
   const visibleStatusLabel =
     workingAgents.length === 1
@@ -234,23 +235,8 @@ export function BotActivityComposerAction({
           {workingAgents.map((agent) => {
             const isSelected = selectedPubkey === agent.pubkey.toLowerCase();
 
-            return (
-              <button
-                className={cn(
-                  "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm transition-colors",
-                  isSelected
-                    ? "bg-primary/10 text-primary"
-                    : "text-foreground hover:bg-accent hover:text-accent-foreground",
-                )}
-                data-testid={`bot-activity-composer-item-${agent.pubkey}`}
-                key={agent.pubkey}
-                onClick={() => {
-                  clearHoverTimer();
-                  setOpen(false);
-                  onOpenAgentSession(agent.pubkey, channelId);
-                }}
-                type="button"
-              >
+            const content = (
+              <>
                 <UserAvatar
                   avatarUrl={agentAvatarUrl(agent)}
                   className="shrink-0"
@@ -259,10 +245,40 @@ export function BotActivityComposerAction({
                 />
                 <span className="min-w-0 flex-1 truncate">{agent.name}</span>
                 <span className="shrink-0 whitespace-nowrap text-xs font-medium opacity-80">
-                  View activity
+                  {canOpenAgentSession ? "View activity" : "Working"}
                 </span>
                 <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground/70" />
+              </>
+            );
+            const itemClassName = cn(
+              "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm",
+              isSelected ? "bg-primary/10 text-primary" : "text-foreground",
+              canOpenAgentSession &&
+                "transition-colors hover:bg-accent hover:text-accent-foreground",
+            );
+
+            return canOpenAgentSession ? (
+              <button
+                className={itemClassName}
+                data-testid={`bot-activity-composer-item-${agent.pubkey}`}
+                key={agent.pubkey}
+                onClick={() => {
+                  clearHoverTimer();
+                  setOpen(false);
+                  onOpenAgentSession?.(agent.pubkey, channelId);
+                }}
+                type="button"
+              >
+                {content}
               </button>
+            ) : (
+              <div
+                className={itemClassName}
+                data-testid={`bot-activity-composer-item-${agent.pubkey}`}
+                key={agent.pubkey}
+              >
+                {content}
+              </div>
             );
           })}
         </div>
