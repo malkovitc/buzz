@@ -23,7 +23,7 @@ import {
   takeQueuedAttachmentsForDraft,
   useBackgroundMediaUpload,
 } from "@/features/messages/lib/backgroundMediaUploadStore";
-import { useMentions } from "@/features/messages/lib/useMentions";
+import { useComposerMentions } from "@/features/messages/lib/useComposerMentions";
 import { getPersistentAgentAudienceScope } from "@/features/messages/lib/persistentAgentAudience";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import {
@@ -139,9 +139,7 @@ function MessageComposerImpl({
     queuedAttachments: ReturnType<typeof useMediaUpload>["queuedAttachments"];
     spoileredAttachmentUrls: Set<string>;
   } | null>(null);
-  const mentions = useMentions(channelId, undefined, profiles, {
-    channelType,
-  });
+  const mentions = useComposerMentions(channelId, profiles, channelType);
   const channelLinks = useChannelLinks();
   const customEmoji = useCustomEmoji();
   const emojiAutocomplete = useEmojiAutocomplete(customEmoji);

@@ -7,20 +7,25 @@ async function source(relativePath) {
 }
 
 test("supported conversation hosts opt into explicit audience contexts", async () => {
-  const [channelPane, threadPanel, newMessage, inboxDetail] = await Promise.all(
-    [
+  const [channelPane, threadPanel, threadAudience, newMessage, inboxDetail] =
+    await Promise.all([
       source("../../channels/ui/ChannelPane.tsx"),
       source("./MessageThreadPanel.tsx"),
+      source("../lib/useThreadInitialAgentPubkeys.ts"),
       source("./NewMessageScreen.tsx"),
       source("../../home/ui/InboxDetailPane.tsx"),
-    ],
-  );
+    ]);
 
   assert.doesNotMatch(channelPane, /audienceContext=/);
   assert.doesNotMatch(newMessage, /audienceContext=/);
   assert.match(
     threadPanel,
     /type: "thread"[\s\S]*threadRootId: threadHead\.id/,
+  );
+  assert.match(
+    threadAudience,
+    /member\.role === "bot"[\s\S]*botMemberPubkeys\.has\(pubkey\)/,
+    "a bot channel member addressed by the root must persist in later thread replies",
   );
   assert.match(
     inboxDetail,
