@@ -26,6 +26,8 @@ type ForumViewProps = {
   channel: Channel;
   currentPubkey?: string;
   onClosePost: () => void;
+  onOpenAgentSession?: (pubkey: string, channelId?: string | null) => void;
+  openAgentSessionPubkey?: string | null;
   onSelectPost: (postId: string) => void;
   onTargetReached?: (messageId: string) => void;
   selectedPostId: string | null;
@@ -43,6 +45,8 @@ export function ForumView({
   channel,
   currentPubkey,
   onClosePost,
+  onOpenAgentSession,
+  openAgentSessionPubkey = null,
   onSelectPost,
   onTargetReached,
   selectedPostId,
@@ -145,6 +149,8 @@ export function ForumView({
           deleteReplyMutation.mutate({ eventId });
         }}
         channelId={channel.id}
+        onOpenAgentSession={onOpenAgentSession}
+        openAgentSessionPubkey={openAgentSessionPubkey}
         onReply={(content, mentionPubkeys, mediaTags) =>
           createReplyMutation.mutateAsync({
             content,

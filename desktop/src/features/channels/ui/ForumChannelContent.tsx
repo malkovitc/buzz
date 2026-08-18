@@ -4,22 +4,30 @@ import {
   ForumView,
   UserProfilePanel,
 } from "@/features/channels/ui/ChannelScreenLazyViews";
+import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
+import * as agentSessionSelection from "@/features/channels/ui/agentSessionSelection";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
+import type { ChannelAgentSessionAgent } from "@/features/channels/ui/useChannelAgentSessions";
 import type {
   ProfilePanelTab,
   ProfilePanelView,
 } from "@/features/profile/ui/UserProfilePanelUtils";
+import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { Channel } from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 
 type ForumChannelContentProps = {
+  agentSessionAgents: ChannelAgentSessionAgent[];
   canResetPanelWidth: boolean;
   channel: Channel;
   currentPubkey?: string;
   header: React.ReactNode;
+  onBackFromAgentSession?: () => void;
+  onCloseAgentSession: () => void;
   onClosePost: () => void;
   onCloseProfilePanel: () => void;
+  onOpenAgentSession: (pubkey: string, channelId?: string | null) => void;
   onOpenDm?: (pubkeys: string[]) => Promise<void> | void;
   onOpenProfilePanel: (
     pubkey: string,
@@ -36,8 +44,10 @@ type ForumChannelContentProps = {
   ) => void;
   onResetPanelWidth: () => void;
   onSelectPost: (postId: string) => void;
+  openAgentSessionPubkey: string | null;
   panelWidthPx: number;
   profilePanelPubkey?: string | null;
+  profiles?: UserProfileLookup;
   profilePanelTab: ProfilePanelTab;
   profilePanelView: ProfilePanelView;
   selectedPostId: string | null;
@@ -52,12 +62,16 @@ type ForumChannelContentProps = {
  * state that never renders.
  */
 export function ForumChannelContent({
+  agentSessionAgents,
   canResetPanelWidth,
   channel,
   currentPubkey,
   header,
+  onBackFromAgentSession,
+  onCloseAgentSession,
   onClosePost,
   onCloseProfilePanel,
+  onOpenAgentSession,
   onOpenDm,
   onOpenProfilePanel,
   onPanelResizeStart,
@@ -65,13 +79,26 @@ export function ForumChannelContent({
   onProfilePanelViewChange,
   onResetPanelWidth,
   onSelectPost,
+  openAgentSessionPubkey,
   panelWidthPx,
   profilePanelPubkey,
+  profiles,
   profilePanelTab,
   profilePanelView,
   selectedPostId,
   targetReplyId,
 }: ForumChannelContentProps) {
+  const selectedAgent = React.useMemo(
+    () =>
+      agentSessionSelection.resolveSelectedAgentSession({
+        agentSessionAgents,
+        openAgentSessionPubkey,
+        profilePanelPubkey,
+        profiles,
+      }),
+    [agentSessionAgents, openAgentSessionPubkey, profilePanelPubkey, profiles],
+  );
+
   return (
     <>
       {header}
@@ -85,13 +112,36 @@ export function ForumChannelContent({
               channel={channel}
               currentPubkey={currentPubkey}
               onClosePost={onClosePost}
+              onOpenAgentSession={onOpenAgentSession}
+              openAgentSessionPubkey={openAgentSessionPubkey}
               onSelectPost={onSelectPost}
               selectedPostId={selectedPostId}
               targetReplyId={targetReplyId}
             />
           </React.Suspense>
         </section>
-        {profilePanelPubkey ? (
+        {selectedAgent ? (
+          <RightAuxiliaryPane
+            canResetWidth={canResetPanelWidth}
+            onResetWidth={onResetPanelWidth}
+            onResizeStart={onPanelResizeStart}
+            testId="agent-session-thread-panel"
+            widthPx={panelWidthPx}
+          >
+            <AgentSessionThreadPanel
+              agent={selectedAgent}
+              canInterruptTurn={selectedAgent.canInterruptTurn}
+              channel={channel}
+              channelId={channel.id}
+              layout="split"
+              onBack={onBackFromAgentSession}
+              onClose={onCloseAgentSession}
+              profiles={profiles}
+              transparentChrome
+              widthPx={panelWidthPx}
+            />
+          </RightAuxiliaryPane>
+        ) : profilePanelPubkey ? (
           <RightAuxiliaryPane
             canResetWidth={canResetPanelWidth}
             onResetWidth={onResetPanelWidth}
