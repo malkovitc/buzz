@@ -56,6 +56,7 @@ type ActiveTurn = {
   channelId: string;
   startedAt: number;
   lastActivityAt: number;
+  triggeringEventIds?: string[];
 };
 
 /** One working channel surfaced to the UI, anchored to the desktop clock. */
@@ -71,6 +72,7 @@ export type ActiveChannelTurnSummary = {
   agentCount: number;
   agentPubkeys: string[];
   agentNames?: string[];
+  triggeringEventIdsByAgent?: Record<string, readonly string[]>;
 };
 
 // Module-level state: agentPubkey → turnId → ActiveTurn
@@ -174,11 +176,26 @@ function parseTimestamp(timestamp: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function getTriggeringEventIds(payload: unknown): string[] {
+  if (!payload || typeof payload !== "object") return [];
+  const value = (payload as Record<string, unknown>).triggeringEventIds;
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value.filter(
+        (id): id is string =>
+          typeof id === "string" && /^[0-9a-f]{64}$/i.test(id),
+      ),
+    ),
+  ];
+}
+
 function startTurn(
   agentPubkey: string,
   channelId: string,
   turnId: string,
   timestamp: string,
+  triggeringEventIds: string[] = [],
 ) {
   const key = normalizePubkey(agentPubkey);
   let agentTurns = activeTurnsByAgent.get(key);
@@ -208,6 +225,7 @@ function startTurn(
     channelId,
     startedAt,
     lastActivityAt: Date.now(),
+    ...(triggeringEventIds.length > 0 ? { triggeringEventIds } : {}),
   });
   invalidateCache(key);
 }
@@ -408,6 +426,7 @@ function processEvent(agentPubkey: string, event: ObserverEvent) {
           event.channelId,
           event.turnId ?? `seq-${event.seq}`,
           event.timestamp,
+          getTriggeringEventIds(event.payload),
         );
         notifyListeners();
         return;
@@ -539,7 +558,11 @@ export function getActiveTurnsByChannel(): ActiveChannelTurnSummary[] {
 
   const summaries = new Map<
     string,
-    { anchorAt: number; agentPubkeys: Set<string> }
+    {
+      anchorAt: number;
+      agentPubkeys: Set<string>;
+      triggeringEventIdsByAgent: Map<string, Set<string>>;
+    }
   >();
 
   for (const [agentKey, agentTurns] of activeTurnsByAgent) {
@@ -553,11 +576,22 @@ export function getActiveTurnsByChannel(): ActiveChannelTurnSummary[] {
         summaries.set(turn.channelId, {
           anchorAt,
           agentPubkeys: new Set([agentKey]),
+          triggeringEventIdsByAgent: new Map(
+            turn.triggeringEventIds?.length
+              ? [[agentKey, new Set(turn.triggeringEventIds)]]
+              : [],
+          ),
         });
         continue;
       }
 
       summary.agentPubkeys.add(agentKey);
+      if (turn.triggeringEventIds?.length) {
+        const ids =
+          summary.triggeringEventIdsByAgent.get(agentKey) ?? new Set<string>();
+        for (const id of turn.triggeringEventIds) ids.add(id);
+        summary.triggeringEventIdsByAgent.set(agentKey, ids);
+      }
       if (anchorAt < summary.anchorAt) {
         summary.anchorAt = anchorAt;
       }
@@ -565,12 +599,20 @@ export function getActiveTurnsByChannel(): ActiveChannelTurnSummary[] {
   }
 
   const result = [...summaries.entries()]
-    .map(([channelId, summary]) => ({
-      channelId,
-      anchorAt: summary.anchorAt,
-      agentCount: summary.agentPubkeys.size,
-      agentPubkeys: [...summary.agentPubkeys].sort(),
-    }))
+    .map(([channelId, summary]) => {
+      const triggeringEntries = [...summary.triggeringEventIdsByAgent].map(
+        ([pubkey, ids]) => [pubkey, [...ids]] as const,
+      );
+      return {
+        channelId,
+        anchorAt: summary.anchorAt,
+        agentCount: summary.agentPubkeys.size,
+        agentPubkeys: [...summary.agentPubkeys].sort(),
+        ...(triggeringEntries.length > 0
+          ? { triggeringEventIdsByAgent: Object.fromEntries(triggeringEntries) }
+          : {}),
+      };
+    })
     .sort((a, b) => a.channelId.localeCompare(b.channelId));
   cachedChannelTurnSummaries = result;
   return result;

@@ -225,7 +225,7 @@ export function BotActivityComposerAction({
       </PopoverTrigger>
       <PopoverContent
         align={isInline ? "start" : "end"}
-        className="w-64 p-1"
+        className="w-80 p-1"
         onMouseEnter={keepOpen}
         onMouseLeave={closeWithDelay}
         onOpenAutoFocus={(event) => event.preventDefault()}
@@ -240,19 +240,13 @@ export function BotActivityComposerAction({
             const isSelected = selectedPubkey === agent.pubkey.toLowerCase();
 
             const content = (
-              <>
-                <UserAvatar
-                  avatarUrl={agentAvatarUrl(agent)}
-                  className="shrink-0"
-                  displayName={agent.name}
-                  size="sm"
-                />
-                <span className="min-w-0 flex-1 truncate">{agent.name}</span>
-                <span className="shrink-0 whitespace-nowrap text-xs font-medium opacity-80">
-                  {canOpenAgentSession ? "View activity" : "Working"}
-                </span>
-                <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground/70" />
-              </>
+              <WorkingAgentActivityRow
+                agent={agent}
+                avatarUrl={agentAvatarUrl(agent)}
+                key={agent.pubkey}
+                canOpenAgentSession={canOpenAgentSession}
+                channelId={channelId}
+              />
             );
             const itemClassName = cn(
               "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm",
@@ -288,5 +282,54 @@ export function BotActivityComposerAction({
         </div>
       </PopoverContent>
     </Popover>
+  );
+}
+
+function WorkingAgentActivityRow({
+  agent,
+  avatarUrl,
+  canOpenAgentSession,
+  channelId,
+}: {
+  agent: BotActivityAgent;
+  avatarUrl: string | null;
+  canOpenAgentSession: boolean;
+  channelId: string | null;
+}) {
+  const transcript = useAgentTranscript(true, agent.pubkey);
+  const headline = React.useMemo(() => {
+    const scoped = channelId
+      ? transcript.filter((item) => item.channelId === channelId)
+      : transcript;
+    const candidates = scoped.some(isSpineItem)
+      ? scoped.filter(isSpineItem)
+      : scoped.filter(isMeaningfulItem);
+
+    for (let index = candidates.length - 1; index >= 0; index--) {
+      const value = getActivityHeadline(candidates[index]);
+      if (value) return value;
+    }
+    return "Starting turn…";
+  }, [channelId, transcript]);
+
+  return (
+    <>
+      <UserAvatar
+        avatarUrl={avatarUrl}
+        className="shrink-0"
+        displayName={agent.name}
+        size="sm"
+      />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate">{agent.name}</span>
+        <Shimmer className="block truncate text-xs font-normal text-muted-foreground">
+          {headline}
+        </Shimmer>
+      </span>
+      <span className="shrink-0 whitespace-nowrap text-xs font-medium opacity-80">
+        {canOpenAgentSession ? "Open" : "Working"}
+      </span>
+      <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground/70" />
+    </>
   );
 }
