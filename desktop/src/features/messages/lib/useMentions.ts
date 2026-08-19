@@ -64,9 +64,7 @@ export type PersonaMentionTarget = {
   displayName: string;
   persona: AgentPersona;
 };
-type UseMentionsOptions = {
-  channelType?: ChannelType | null;
-};
+type UseMentionsOptions = { channelType?: ChannelType | null };
 export function useMentions(
   channelId: string | null,
   externalMembers?: ChannelMember[],
@@ -180,6 +178,16 @@ export function useMentions(
     () => getSharedChannelIds(channelsQuery.data),
     [channelsQuery.data],
   );
+  const agentIdentityPubkeys = React.useMemo(
+    () =>
+      getAgentIdentityPubkeys({
+        managedAgentPubkeys,
+        relayAgents: relayAgentsQuery.data ?? [],
+        members: members ?? [],
+        profileIsAgent: (pubkey) => profiles?.[pubkey]?.isAgent === true,
+      }),
+    [managedAgentPubkeys, members, profiles, relayAgentsQuery.data],
+  );
   const mentionChannelId = isAgentMentionChannelType(options?.channelType)
     ? channelId
     : null;
@@ -193,21 +201,13 @@ export function useMentions(
         managedAgentPubkeys,
         relayAgents: relayAgentsQuery.data,
         sharedChannelIds,
-        channelMemberAgentPubkeys: (members ?? [])
-          .filter(
-            (member) =>
-              member.isAgent === true ||
-              member.role === "bot" ||
-              profiles?.[normalizePubkey(member.pubkey)]?.isAgent === true,
-          )
-          .map((member) => member.pubkey),
+        channelMemberAgentPubkeys: agentIdentityPubkeys,
       }),
     [
+      agentIdentityPubkeys,
       currentPubkey,
       managedAgentPubkeys,
-      members,
       mentionChannelId,
-      profiles,
       relayAgentsQuery.data,
       sharedChannelIds,
     ],
@@ -245,16 +245,6 @@ export function useMentions(
     () =>
       new Set((members ?? []).map((member) => normalizePubkey(member.pubkey))),
     [members],
-  );
-  const agentIdentityPubkeys = React.useMemo(
-    () =>
-      getAgentIdentityPubkeys({
-        managedAgentPubkeys,
-        relayAgents: relayAgentsQuery.data ?? [],
-        members: members ?? [],
-        profileIsAgent: (pubkey) => profiles?.[pubkey]?.isAgent === true,
-      }),
-    [managedAgentPubkeys, members, profiles, relayAgentsQuery.data],
   );
   const mentionCandidates = React.useMemo<MentionCandidate[]>(() => {
     const candidatesByPubkey = new Map<string, MentionCandidate>();
