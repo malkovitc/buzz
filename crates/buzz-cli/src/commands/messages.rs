@@ -57,7 +57,7 @@ fn find_root_from_tags(tags: &serde_json::Value) -> Option<String> {
 async fn resolve_thread_ref(
     client: &BuzzClient,
     parent_event_id: &str,
-) -> Result<ThreadRef, CliError> {
+) -> Result<(ThreadRef, Option<u16>), CliError> {
     let parent_eid = parse_event_id(parent_event_id)?;
     let filter = serde_json::json!({ "ids": [parent_event_id], "limit": 1 });
     let raw = client.query(&filter).await?;
@@ -71,16 +71,27 @@ async fn resolve_thread_ref(
         .get("tags")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let parent_kind = event
+        .get("kind")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|kind| u16::try_from(kind).ok());
 
     let root_eid = match find_root_from_tags(&tags) {
         Some(root_hex) if root_hex != parent_event_id => parse_event_id(&root_hex)?,
         _ => parent_eid,
     };
 
-    Ok(ThreadRef {
-        root_event_id: root_eid,
-        parent_event_id: parent_eid,
-    })
+    Ok((
+        ThreadRef {
+            root_event_id: root_eid,
+            parent_event_id: parent_eid,
+        },
+        parent_kind,
+    ))
+}
+
+fn effective_message_kind(explicit: Option<u16>, parent_kind: Option<u16>) -> Option<u16> {
+    explicit.or_else(|| matches!(parent_kind, Some(45001 | 45003)).then_some(45003))
 }
 
 /// Resolve the channel UUID for an event by querying for it via POST /query.
@@ -635,21 +646,24 @@ pub async fn cmd_send_message(
 
     // Build thread ref if replying. `--reply-to` is the immediate parent; the
     // thread root is derived from the parent's NIP-10 tags via the relay.
-    let thread_ref = if let Some(ref r) = p.reply_to {
+    let reply_context = if let Some(ref r) = p.reply_to {
         Some(resolve_thread_ref(client, r).await?)
     } else {
         None
     };
+    let thread_ref = reply_context.as_ref().map(|(thread_ref, _)| thread_ref);
+    let effective_kind =
+        effective_message_kind(p.kind, reply_context.as_ref().and_then(|(_, kind)| *kind));
 
     let mention_refs: Vec<&str> = mention_pubkeys.iter().map(String::as_str).collect();
 
-    let builder = match p.kind {
+    let builder = match effective_kind {
         Some(45001) => {
             buzz_sdk::build_forum_post(channel_uuid, &final_content, &mention_refs, &media_tags)
                 .map_err(|e| CliError::Other(format!("build_forum_post failed: {e}")))?
         }
         Some(45003) => {
-            let tr = thread_ref.as_ref().ok_or_else(|| {
+            let tr = thread_ref.ok_or_else(|| {
                 CliError::Usage("--reply-to is required for forum comments (kind 45003)".into())
             })?;
             buzz_sdk::build_forum_comment(
@@ -664,7 +678,7 @@ pub async fn cmd_send_message(
         None | Some(9) => buzz_sdk::build_message(
             channel_uuid,
             &final_content,
-            thread_ref.as_ref(),
+            thread_ref,
             &mention_refs,
             p.broadcast,
             &media_tags,
@@ -746,7 +760,7 @@ pub async fn cmd_send_diff_message(client: &BuzzClient, p: SendDiffParams) -> Re
     // `--reply-to` is the immediate parent; the thread root is derived from
     // the parent's NIP-10 tags via the relay.
     let thread_ref = if let Some(r) = &p.reply_to {
-        Some(resolve_thread_ref(client, r).await?)
+        Some(resolve_thread_ref(client, r).await?.0)
     } else {
         None
     };
@@ -993,8 +1007,8 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        event_mention_pubkeys, find_root_from_tags, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
+        effective_message_kind, event_mention_pubkeys, find_root_from_tags, match_profiles_by_name,
+        merge_message_mentions, missing_members, normalize_explicit_mentions, parse_member_pubkeys,
         resolve_names_to_pubkeys,
     };
     use buzz_sdk::mentions::{
@@ -1011,6 +1025,15 @@ mod tests {
     const PK_VALID_A: &str = "35c18ae273fccfaf80d629e20e7f8721b90499379addff533054acc2504c12b4";
     const PK_VALID_B: &str = "c6237ef84fa537c78dcee78efd2d4e59f728859c7f194da42ac51ededfa0be05";
     const PK_VALID_C: &str = "f4a42a97e594b77bdbd8ee35191c8b28a94a4cb871d96f32921558275421fb68";
+
+    #[test]
+    fn forum_parent_infers_forum_comment_unless_kind_is_explicit() {
+        assert_eq!(effective_message_kind(None, Some(45001)), Some(45003));
+        assert_eq!(effective_message_kind(None, Some(45003)), Some(45003));
+        assert_eq!(effective_message_kind(None, Some(9)), None);
+        assert_eq!(effective_message_kind(None, None), None);
+        assert_eq!(effective_message_kind(Some(9), Some(45001)), Some(9));
+    }
 
     #[test]
     fn root_marker_wins_over_reply_marker() {
