@@ -72,7 +72,7 @@ async function run(
     };
     const abort = () => {
       abortRequested = true;
-      terminate("SIGTERM");
+      terminate("SIGKILL");
     };
     const finish = (error, result) => {
       if (settled) return;
@@ -98,7 +98,7 @@ async function run(
       detached: process.platform !== "win32",
     });
     if (abortRequested) {
-      terminate("SIGTERM");
+      terminate("SIGKILL");
       finish(abortError());
       return;
     }

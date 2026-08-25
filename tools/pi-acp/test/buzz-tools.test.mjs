@@ -146,7 +146,7 @@ test("aborting a wrapper terminates its publication process group", {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-group-abort-"));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const marker = path.join(dir, "descendant-published");
-  const childCode = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, ''), 600)`;
+  const childCode = `process.on('SIGTERM', () => {}); setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, ''), 600)`;
   const controller = new AbortController();
   const running = testOnly.run(
     "/bin/sh",
