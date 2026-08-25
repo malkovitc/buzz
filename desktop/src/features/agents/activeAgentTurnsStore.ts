@@ -56,6 +56,7 @@ type ActiveTurn = {
   channelId: string;
   startedAt: number;
   lastActivityAt: number;
+  triggeringEventIds: string[];
 };
 
 /** One working channel surfaced to the UI, anchored to the desktop clock. */
@@ -70,11 +71,16 @@ export type ActiveChannelTurnSummary = {
   anchorAt: number;
   agentCount: number;
   agentPubkeys: string[];
+  activeTurnScopesByAgent?: Record<
+    string,
+    { turnId: string; triggeringEventIds: string[] }[]
+  >;
   agentNames?: string[];
 };
 
 // Module-level state: agentPubkey → turnId → ActiveTurn
 const activeTurnsByAgent = new Map<string, Map<string, ActiveTurn>>();
+const turnAssociationsByAgent = new Map<string, Map<string, Set<string>>>();
 const listeners = new Set<() => void>();
 
 // Per-agent clock offset: the desktop clock minus the agent-host clock, in
@@ -174,11 +180,23 @@ function parseTimestamp(timestamp: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function readTriggeringEventIds(event: ObserverEvent): string[] {
+  const payload = event.payload as {
+    associationEventIds?: unknown;
+    triggeringEventIds?: unknown;
+  } | null;
+  const value = payload?.associationEventIds ?? payload?.triggeringEventIds;
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
 function startTurn(
   agentPubkey: string,
   channelId: string,
   turnId: string,
   timestamp: string,
+  triggeringEventIds: string[],
 ) {
   const key = normalizePubkey(agentPubkey);
   let agentTurns = activeTurnsByAgent.get(key);
@@ -203,13 +221,40 @@ function startTurn(
   }
 
   const startedAt = parseTimestamp(timestamp) ?? Date.now();
+  const associations =
+    turnAssociationsByAgent.get(key) ?? new Map<string, Set<string>>();
+  const associationIds = associations.get(turnId) ?? new Set<string>();
+  for (const id of triggeringEventIds) associationIds.add(id);
+  associations.set(turnId, associationIds);
+  turnAssociationsByAgent.set(key, associations);
   agentTurns.set(turnId, {
     turnId,
     channelId,
     startedAt,
     lastActivityAt: Date.now(),
+    triggeringEventIds: [...associationIds],
   });
   invalidateCache(key);
+}
+
+function extendTurnAssociation(
+  agentPubkey: string,
+  turnId: string | null,
+  eventIds: string[],
+): boolean {
+  if (!turnId || eventIds.length === 0) return false;
+  const key = normalizePubkey(agentPubkey);
+  const associations =
+    turnAssociationsByAgent.get(key) ?? new Map<string, Set<string>>();
+  const ids = associations.get(turnId) ?? new Set<string>();
+  const sizeBefore = ids.size;
+  for (const id of eventIds) ids.add(id);
+  associations.set(turnId, ids);
+  turnAssociationsByAgent.set(key, associations);
+  const turn = activeTurnsByAgent.get(key)?.get(turnId);
+  if (turn) turn.triggeringEventIds = [...ids];
+  if (ids.size !== sizeBefore) invalidateCache(key);
+  return ids.size !== sizeBefore;
 }
 
 function recordActivity(agentPubkey: string, turnId: string | null): boolean {
@@ -254,7 +299,13 @@ function resurrectTurn(agentPubkey: string, event: ObserverEvent): boolean {
     frameAt !== null && startedAtMs !== null && startedAtMs <= frameAt
       ? startedAt
       : event.timestamp;
-  startTurn(agentPubkey, event.channelId, event.turnId, safeStartedAt);
+  startTurn(
+    agentPubkey,
+    event.channelId,
+    event.turnId,
+    safeStartedAt,
+    readTriggeringEventIds(event),
+  );
   return true;
 }
 
@@ -290,6 +341,7 @@ function endTurn(
   // completion is authoritative and must outlive the active record.
   if (turnId) {
     recordTerminal(key, turnId, terminalAt);
+    turnAssociationsByAgent.get(key)?.delete(turnId);
   }
 
   const agentTurns = activeTurnsByAgent.get(key);
@@ -303,13 +355,15 @@ function endTurn(
     for (const [tid, turn] of agentTurns) {
       if (turn.channelId === channelId) {
         agentTurns.delete(tid);
+        turnAssociationsByAgent.get(key)?.delete(tid);
         recordTerminal(key, tid, terminalAt);
         break;
       }
     }
   }
-  if (agentTurns.size === 0) {
-    activeTurnsByAgent.delete(key);
+  if (agentTurns.size === 0) activeTurnsByAgent.delete(key);
+  if (turnAssociationsByAgent.get(key)?.size === 0) {
+    turnAssociationsByAgent.delete(key);
   }
   invalidateCache(key);
 }
@@ -408,6 +462,7 @@ function processEvent(agentPubkey: string, event: ObserverEvent) {
           event.channelId,
           event.turnId ?? `seq-${event.seq}`,
           event.timestamp,
+          readTriggeringEventIds(event),
         );
         notifyListeners();
         return;
@@ -424,6 +479,18 @@ function processEvent(agentPubkey: string, event: ObserverEvent) {
       );
       notifyListeners();
       return;
+    case "turn_association_update":
+      if (
+        extendTurnAssociation(
+          agentPubkey,
+          event.turnId ?? null,
+          readTriggeringEventIds(event),
+        )
+      ) {
+        notifyListeners();
+        return;
+      }
+      break;
     case "acp_read":
     case "acp_write":
     // turn_liveness keeps a quiet-but-alive turn from being pruned; same
@@ -432,8 +499,17 @@ function processEvent(agentPubkey: string, event: ObserverEvent) {
     // turn was pruned out from under a still-running host (a transient drop
     // raced the pause, or the lone-crash residual self-healed), resurrect it.
     case "turn_liveness": {
+      const associationChanged = extendTurnAssociation(
+        agentPubkey,
+        event.turnId ?? null,
+        readTriggeringEventIds(event),
+      );
       const refreshed = recordActivity(agentPubkey, event.turnId ?? null);
       if (!refreshed && resurrectTurn(agentPubkey, event)) {
+        notifyListeners();
+        return;
+      }
+      if (associationChanged) {
         notifyListeners();
         return;
       }
@@ -539,7 +615,14 @@ export function getActiveTurnsByChannel(): ActiveChannelTurnSummary[] {
 
   const summaries = new Map<
     string,
-    { anchorAt: number; agentPubkeys: Set<string> }
+    {
+      anchorAt: number;
+      agentPubkeys: Set<string>;
+      activeTurnScopesByAgent: Map<
+        string,
+        { turnId: string; triggeringEventIds: string[] }[]
+      >;
+    }
   >();
 
   for (const [agentKey, agentTurns] of activeTurnsByAgent) {
@@ -553,11 +636,28 @@ export function getActiveTurnsByChannel(): ActiveChannelTurnSummary[] {
         summaries.set(turn.channelId, {
           anchorAt,
           agentPubkeys: new Set([agentKey]),
+          activeTurnScopesByAgent: new Map([
+            [
+              agentKey,
+              [
+                {
+                  turnId: turn.turnId,
+                  triggeringEventIds: turn.triggeringEventIds,
+                },
+              ],
+            ],
+          ]),
         });
         continue;
       }
 
       summary.agentPubkeys.add(agentKey);
+      const scopes = summary.activeTurnScopesByAgent.get(agentKey) ?? [];
+      scopes.push({
+        turnId: turn.turnId,
+        triggeringEventIds: turn.triggeringEventIds,
+      });
+      summary.activeTurnScopesByAgent.set(agentKey, scopes);
       if (anchorAt < summary.anchorAt) {
         summary.anchorAt = anchorAt;
       }
@@ -570,6 +670,9 @@ export function getActiveTurnsByChannel(): ActiveChannelTurnSummary[] {
       anchorAt: summary.anchorAt,
       agentCount: summary.agentPubkeys.size,
       agentPubkeys: [...summary.agentPubkeys].sort(),
+      activeTurnScopesByAgent: Object.fromEntries(
+        summary.activeTurnScopesByAgent,
+      ),
     }))
     .sort((a, b) => a.channelId.localeCompare(b.channelId));
   cachedChannelTurnSummaries = result;
@@ -687,14 +790,18 @@ export function useActiveAgentTurnsBridge(
 export function clearActiveTurnsForAgent(agentPubkey: string): void {
   const key = normalizePubkey(agentPubkey);
   const agentTurns = activeTurnsByAgent.get(key);
-  if (!agentTurns || agentTurns.size === 0) return;
+  const associations = turnAssociationsByAgent.get(key);
+  if ((!agentTurns || agentTurns.size === 0) && !associations?.size) return;
 
   const agentClockNow = Date.now() - (clockOffsetByAgent.get(key) ?? 0);
-  for (const turnId of agentTurns.keys()) {
-    recordTerminal(key, turnId, agentClockNow);
-  }
+  const turnIds = new Set([
+    ...(agentTurns?.keys() ?? []),
+    ...(associations?.keys() ?? []),
+  ]);
+  for (const turnId of turnIds) recordTerminal(key, turnId, agentClockNow);
 
   activeTurnsByAgent.delete(key);
+  turnAssociationsByAgent.delete(key);
   invalidateCache(key);
   notifyListeners();
 }
@@ -706,6 +813,7 @@ export function clearActiveTurnsForAgent(agentPubkey: string): void {
  */
 export function resetActiveAgentTurnsStore() {
   activeTurnsByAgent.clear();
+  turnAssociationsByAgent.clear();
   lastProcessed.clear();
   clockOffsetByAgent.clear();
   cachedTurnSummaries.clear();
@@ -720,6 +828,7 @@ export function resetActiveAgentTurnsStore() {
 
 type TurnsStoreSnapshot = {
   turns: Map<string, Map<string, ActiveTurn>>;
+  associations: Map<string, Map<string, Set<string>>>;
   offsets: Map<string, number>;
   watermarks: Map<string, Map<string, ObserverEvent>>;
   terminals: Map<string, Map<string, number>>;
@@ -738,7 +847,11 @@ const savedByCommunity = new Map<string, TurnsStoreSnapshot>();
  * corrupt the snapshot.
  */
 export function saveActiveAgentTurnsForCommunity(communityId: string): void {
-  if (activeTurnsByAgent.size === 0 && terminalAtByAgent.size === 0) {
+  if (
+    activeTurnsByAgent.size === 0 &&
+    turnAssociationsByAgent.size === 0 &&
+    terminalAtByAgent.size === 0
+  ) {
     savedByCommunity.delete(communityId);
     return;
   }
@@ -752,6 +865,16 @@ export function saveActiveAgentTurnsForCommunity(communityId: string): void {
       clonedAgent.set(turnId, { ...turn });
     }
     turns.set(agentKey, clonedAgent);
+  }
+
+  const associations = new Map<string, Map<string, Set<string>>>();
+  for (const [agentKey, agentAssociations] of turnAssociationsByAgent) {
+    associations.set(
+      agentKey,
+      new Map(
+        [...agentAssociations].map(([turnId, ids]) => [turnId, new Set(ids)]),
+      ),
+    );
   }
 
   // Shallow-clone the offsets map (primitives as values).
@@ -770,7 +893,13 @@ export function saveActiveAgentTurnsForCommunity(communityId: string): void {
     terminals.set(agentKey, new Map(tombstones));
   }
 
-  savedByCommunity.set(communityId, { turns, offsets, watermarks, terminals });
+  savedByCommunity.set(communityId, {
+    turns,
+    associations,
+    offsets,
+    watermarks,
+    terminals,
+  });
 }
 
 /**
@@ -798,6 +927,7 @@ export function restoreActiveAgentTurnsForCommunity(communityId: string): void {
 
   // Clear before writing so this is a replace, not a merge.
   activeTurnsByAgent.clear();
+  turnAssociationsByAgent.clear();
   clockOffsetByAgent.clear();
   lastProcessed.clear();
   terminalAtByAgent.clear();
@@ -810,6 +940,15 @@ export function restoreActiveAgentTurnsForCommunity(communityId: string): void {
       restored.set(turnId, { ...turn, lastActivityAt: now });
     }
     activeTurnsByAgent.set(agentKey, restored);
+  }
+
+  for (const [agentKey, agentAssociations] of snap.associations) {
+    turnAssociationsByAgent.set(
+      agentKey,
+      new Map(
+        [...agentAssociations].map(([turnId, ids]) => [turnId, new Set(ids)]),
+      ),
+    );
   }
 
   for (const [agentKey, offset] of snap.offsets) {

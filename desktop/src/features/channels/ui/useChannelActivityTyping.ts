@@ -108,6 +108,13 @@ export function useChannelActivityTyping({
   // re-reports whenever botTypingEntries changes. Thread-only typing is
   // excluded — see channelScopedBotTypingPubkeyKey.
   const botTypingPubkeyKey = channelScopedBotTypingPubkeyKey(botTypingEntries);
+  const botTypingThreadKey = JSON.stringify(
+    botTypingEntries.map(({ pubkey, threadHeadId, generation }) => [
+      pubkey,
+      threadHeadId,
+      generation,
+    ]),
+  );
   React.useEffect(() => {
     if (!activeChannelId) {
       return;
@@ -115,11 +122,15 @@ export function useChannelActivityTyping({
     reportChannelBotTyping(
       activeChannelId,
       botTypingPubkeyKey ? botTypingPubkeyKey.split(",") : [],
+      (JSON.parse(botTypingThreadKey) as [string, string | null, number][]).map(
+        ([pubkey, threadHeadId]) => ({ pubkey, threadHeadId }),
+      ),
     );
-    return () => {
-      reportChannelBotTyping(activeChannelId, []);
-    };
-  }, [activeChannelId, botTypingPubkeyKey]);
+  }, [activeChannelId, botTypingPubkeyKey, botTypingThreadKey]);
+  React.useEffect(() => {
+    if (!activeChannelId) return;
+    return () => reportChannelBotTyping(activeChannelId, []);
+  }, [activeChannelId]);
 
   return {
     agentSessionCandidates: agentCandidates,

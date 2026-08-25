@@ -632,9 +632,6 @@ export function ChannelScreen({
         isPlaceholderData: messagesQuery.isPlaceholderData,
         dataLength: messagesQuery.data?.length ?? null,
       },
-      // A persisted head only counts as hydrated when it has rows to paint
-      // (channelHeadCache.ts), so this bypass never settles onto an empty
-      // placeholder while the authoritative refresh is still in flight.
       hasSettledThisChannel ||
         (activeChannelId !== null &&
           hasPersistedHydratedChannel(queryClient, activeChannelId)),
@@ -826,12 +823,15 @@ export function ChannelScreen({
           {activeChannel ? (
             activeChannel.channelType === "forum" ? (
               <ForumChannelContent
+                activityAgents={channelAgentSessionAgents}
                 canResetPanelWidth={canResetThreadPanelWidth}
                 channel={activeChannel}
-                currentPubkey={currentPubkey}
+                {...{ currentPubkey, openAgentSessionPubkey }}
                 header={channelHeader}
+                onCloseAgentSession={handleCloseAgentSession}
                 onClosePost={onCloseForumPost}
                 onCloseProfilePanel={handleCloseProfilePanel}
+                onOpenAgentSession={handleOpenAgentSession}
                 onOpenDm={handleOpenDm}
                 onOpenProfilePanel={handleOpenProfilePanel}
                 onPanelResizeStart={handleThreadPanelResizeStart}

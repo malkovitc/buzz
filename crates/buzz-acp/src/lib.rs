@@ -16,14 +16,15 @@ mod usage;
 pub use usage::TurnUsage;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::{ensure, Context, Result};
 use buzz_core::kind::{
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
+    KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -1568,6 +1569,9 @@ struct RespawnResult {
 struct SteerAckEvent {
     channel_id: Uuid,
     event_id: String,
+    turn_id: String,
+    association_event_ids: Vec<String>,
+    typing_scope: ThreadTags,
     /// `Ok` if the read loop sent any of the locked `SteerAck` variants.
     /// `Err` if the oneshot was dropped without a send — should not happen
     /// under the current read-loop drains, but if it ever does the main
@@ -2261,7 +2265,7 @@ async fn tokio_main() -> Result<()> {
     } else {
         None
     };
-    let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
+    let mut typing_channels: HashMap<Uuid, Vec<ThreadTags>> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // Independent of pool readiness: a never-mentioned lazy agent must still
@@ -3123,14 +3127,16 @@ async fn tokio_main() -> Result<()> {
                     // Use try_publish (non-blocking) for typing indicators —
                     // they're ephemeral and must not block the main loop during
                     // relay reconnection (#35).
-                    for (&ch, thread_tags) in &typing_channels {
-                        if let Ok(event) = relay.build_typing_event(
-                            ch,
-                            thread_tags.root_event_id.as_deref(),
-                            thread_tags.parent_event_id.as_deref(),
-                        ) {
-                            if let Err(e) = relay.try_publish_event(event) {
-                                tracing::debug!("typing indicator dropped for {ch}: {e}");
+                    for (&ch, scopes) in &typing_channels {
+                        for thread_tags in scopes {
+                            if let Ok(event) = relay.build_typing_event(
+                                ch,
+                                thread_tags.root_event_id.as_deref(),
+                                thread_tags.parent_event_id.as_deref(),
+                            ) {
+                                if let Err(e) = relay.try_publish_event(event) {
+                                    tracing::debug!("typing indicator dropped for {ch}: {e}");
+                                }
                             }
                         }
                     }
@@ -3214,6 +3220,9 @@ async fn tokio_main() -> Result<()> {
             Some(PoolEvent::SteerAck(SteerAckEvent {
                 channel_id,
                 event_id,
+                turn_id,
+                association_event_ids,
+                typing_scope,
                 ack,
             })) => {
                 // Mid-turn steer attempt resolved (either transport:
@@ -3225,17 +3234,6 @@ async fn tokio_main() -> Result<()> {
                 //     path. Drop the withheld event so normal dispatch
                 //     never redelivers it.
                 //
-                //     Also covers `_session/steering`'s `startedNewTurn`
-                //     outcome: the message was delivered, but into a fresh
-                //     turn because the one being steered had already
-                //     finished. Delivery is what this arm keys on, so the
-                //     event is still dropped. The read loop deliberately
-                //     does NOT renew its hard deadline in that case (the
-                //     awaited turn is settled), while
-                //     `extend_in_flight_deadline` below still applies —
-                //     the agent really is running more work, so the
-                //     channel's in-flight budget should reflect it.
-                //
                 //   Err(_) where the write never landed (Transport /
                 //   ExpectedRunIdMissing):
                 //     Delivery state of the underlying message is "never
@@ -3245,8 +3243,8 @@ async fn tokio_main() -> Result<()> {
                 //
                 //   Err(OutcomeRejected { .. })
                 //     A `_session/steering` request returned a JSON-RPC
-                //     success whose `outcome` was not `injected` or
-                //     `startedNewTurn` (codex's `failed`, an unknown value,
+                //     success whose `outcome` was neither `injected` nor
+                //     `startedNewTurn` (`failed`, an unknown value,
                 //     or a bare `{}` with no `outcome` at all). The steer
                 //     did not land, so this is treated exactly like a write
                 //     that never happened: release withheld AND fire the
@@ -3326,6 +3324,16 @@ async fn tokio_main() -> Result<()> {
                     "non-cancelling steer ack received"
                 );
                 if let Ok(pool::SteerAck::Success { session_id }) = &ack {
+                    if pool.is_turn_in_flight(channel_id, &turn_id) {
+                        pool.extend_turn_associations(&turn_id, &association_event_ids);
+                        let scopes = typing_channels.entry(channel_id).or_default();
+                        if !scopes.iter().any(|scope| {
+                            scope.root_event_id == typing_scope.root_event_id
+                                && scope.parent_event_id == typing_scope.parent_event_id
+                        }) {
+                            scopes.push(typing_scope);
+                        }
+                    }
                     queue.extend_in_flight_deadline(channel_id, config.max_turn_duration_secs);
                     if !pool.record_successful_steer(
                         channel_id,
@@ -3633,6 +3641,22 @@ fn signal_in_flight_task(
 ///
 /// The withheld event is NOT released here on `false` because no withhold
 /// was established: `mark_native_steer_pending` only runs on `Ok(())`.
+fn typing_scope_for_event(event: &nostr::Event) -> ThreadTags {
+    let mut scope = queue::parse_thread_tags(event);
+    match event.kind.as_u16() as u32 {
+        KIND_FORUM_POST if scope.root_event_id.is_none() => {
+            let event_id = event.id.to_hex();
+            scope.root_event_id = Some(event_id.clone());
+            scope.parent_event_id = Some(event_id);
+        }
+        KIND_FORUM_COMMENT => {
+            scope.parent_event_id = scope.root_event_id.clone();
+        }
+        _ => {}
+    }
+    scope
+}
+
 fn try_native_steer(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
@@ -3656,6 +3680,11 @@ fn try_native_steer(
     // steering (which is to inject only what's new).
     let (header, closing) = queue::native_steer_framing();
     let event_id_hex = event.id.to_hex();
+    let typing_scope = typing_scope_for_event(&event);
+    let mut association_event_ids = vec![event_id_hex.clone()];
+    if let Some(root) = typing_scope.root_event_id.clone() {
+        association_event_ids.push(root);
+    }
     let be = queue::BatchEvent {
         event,
         prompt_tag: prompt_tag.clone(),
@@ -3664,9 +3693,14 @@ fn try_native_steer(
     let event_block = queue::format_event_block(channel_id, None, &be, None);
     let body = format!("{header}\n\n[Buzz event: {prompt_tag}]\n{event_block}\n\n{closing}");
 
+    let Some(turn_id) = pool.in_flight_turn_id(channel_id) else {
+        return false;
+    };
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
+    let steer_association_event_ids = association_event_ids.clone();
     let request = pool::SteerRequest {
         prompt_blocks: vec![body],
+        association_event_ids,
         ack_tx,
     };
 
@@ -3700,6 +3734,9 @@ fn try_native_steer(
                 let _ = ack_tx_clone.send(SteerAckEvent {
                     channel_id,
                     event_id: event_id_for_watcher,
+                    turn_id,
+                    association_event_ids: steer_association_event_ids,
+                    typing_scope,
                     ack,
                 });
             });
@@ -3724,7 +3761,7 @@ fn dispatch_pending(
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
     last_activity: &mut tokio::time::Instant,
-) -> Vec<(Uuid, ThreadTags)> {
+) -> Vec<(Uuid, Vec<ThreadTags>)> {
     let mut dispatched_channels = Vec::new();
     loop {
         let batch = match queue.flush_next() {
@@ -3732,11 +3769,20 @@ fn dispatch_pending(
             None => break,
         };
         let channel_id = batch.channel_id;
-        let typing_scope = batch
-            .events
-            .last()
-            .map(|event| queue::parse_thread_tags(&event.event))
-            .unwrap_or_default();
+        let typing_scopes = batch
+            .cancelled_events
+            .iter()
+            .chain(&batch.events)
+            .map(|event| typing_scope_for_event(&event.event))
+            .fold(Vec::<ThreadTags>::new(), |mut scopes, scope| {
+                if !scopes.iter().any(|known| {
+                    known.root_event_id == scope.root_event_id
+                        && known.parent_event_id == scope.parent_event_id
+                }) {
+                    scopes.push(scope);
+                }
+                scopes
+            });
         let affinity_hit = pool.has_session_for(channel_id);
         let mut agent = match pool.try_claim(Some(channel_id)) {
             Some(a) => a,
@@ -3777,6 +3823,8 @@ fn dispatch_pending(
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
+        let turn_associations = Arc::new(Mutex::new(Vec::new()));
+        let task_turn_associations = Arc::clone(&turn_associations);
 
         let abort_handle = pool.join_set.spawn(async move {
             pool::run_prompt_task(
@@ -3787,10 +3835,12 @@ fn dispatch_pending(
                 result_tx,
                 Some(control_rx),
                 task_turn_id,
+                task_turn_associations,
             )
             .await;
         });
 
+        pool.register_turn_associations(turn_id.clone(), turn_associations);
         pool.task_map_mut().insert(
             abort_handle.id(),
             pool::TaskMeta {
@@ -3803,7 +3853,7 @@ fn dispatch_pending(
                 successful_steer_deliveries: HashSet::new(),
             },
         );
-        dispatched_channels.push((channel_id, typing_scope));
+        dispatched_channels.push((channel_id, typing_scopes));
         *last_activity = tokio::time::Instant::now();
     }
     tracing::debug!(
@@ -3882,6 +3932,7 @@ fn handle_prompt_result(
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
+    pool.unregister_turn_associations(&result.turn_id);
     let successful_steer_deliveries = pool
         .task_map()
         .values()
@@ -4263,7 +4314,7 @@ fn recover_panicked_agent(
     join_error: tokio::task::JoinError,
     heartbeat_in_flight: &mut bool,
     removed_channels: &HashSet<Uuid>,
-    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    typing_channels: &mut HashMap<Uuid, Vec<ThreadTags>>,
     crash_history: &mut [SlotCircuit],
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
@@ -4274,6 +4325,7 @@ fn recover_panicked_agent(
         tracing::error!("panic for unknown task {task_id:?} — bug");
         return;
     };
+    pool.unregister_turn_associations(&meta.turn_id);
     let i = meta.agent_index;
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
@@ -4361,7 +4413,7 @@ fn drain_ready_join_results(
     config: &Config,
     heartbeat_in_flight: &mut bool,
     removed_channels: &HashSet<Uuid>,
-    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    typing_channels: &mut HashMap<Uuid, Vec<ThreadTags>>,
     crash_history: &mut [SlotCircuit],
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
@@ -4423,6 +4475,7 @@ fn dispatch_heartbeat(
             result_tx,
             None,
             task_turn_id,
+            Arc::new(Mutex::new(Vec::new())),
         )
         .await;
     });

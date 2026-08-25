@@ -8,6 +8,10 @@ import {
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import type { ForumThreadResponse, ThreadReply } from "@/shared/api/types";
+import {
+  clearThreadTypingAgents,
+  useThreadTypingAgentPubkeys,
+} from "@/features/agents/agentWorkingSignal";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
 import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
@@ -16,9 +20,18 @@ import { Button } from "@/shared/ui/button";
 import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 import { Markdown } from "@/shared/ui/markdown";
 import { hasLinkPreviewSuppression } from "@/features/messages/lib/formatTimelineMessages";
+import { recordTypingCompletion } from "@/features/messages/typingCompletionSuppression";
 import { Skeleton } from "@/shared/ui/skeleton";
+import {
+  BotActivityComposerAction,
+  type BotActivityAgent,
+} from "@/features/channels/ui/BotActivityBar";
 
 import { formatRelativeTime } from "../lib/time";
+import {
+  mergeForumThreadTypingPubkeys,
+  useForumThreadAgentActivity,
+} from "../useForumThreadAgentActivity";
 import { DeleteActionMenu } from "./DeleteActionMenu";
 import { ForumComposer } from "./ForumComposer";
 
@@ -41,6 +54,9 @@ type ForumThreadPanelProps = {
   canDeletePost?: boolean;
   isDeletingPost?: boolean;
   targetEventId?: string | null;
+  activityAgents: BotActivityAgent[];
+  onOpenAgentSession: (pubkey: string, channelId?: string | null) => void;
+  openAgentSessionPubkey: string | null;
 };
 
 function canDeleteReply(
@@ -143,13 +159,78 @@ export function ForumThreadPanel({
   canDeletePost,
   isDeletingPost,
   targetEventId,
+  activityAgents,
+  onOpenAgentSession,
+  openAgentSessionPubkey,
 }: ForumThreadPanelProps) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
+  const seenRepliesRef = React.useRef<{
+    postId: string;
+    replyIds: Set<string>;
+  } | null>(null);
   const { channels } = useChannelNavigation();
   const channelNames = React.useMemo(
     () => channels.filter((c) => c.channelType !== "dm").map((c) => c.name),
     [channels],
   );
+  const threadEventIds = React.useMemo(
+    () =>
+      new Set(
+        thread
+          ? [
+              thread.post.eventId,
+              ...thread.replies.map((reply) => reply.eventId),
+            ]
+          : [],
+      ),
+    [thread],
+  );
+  const { workingAgentPubkeys: observerAgentPubkeys, workingTurnIds } =
+    useForumThreadAgentActivity(activityAgents, channelId, threadEventIds);
+  const typingAgentPubkeys = useThreadTypingAgentPubkeys(
+    channelId,
+    thread?.post.eventId,
+  );
+  const workingAgentPubkeys = React.useMemo(
+    () =>
+      mergeForumThreadTypingPubkeys(observerAgentPubkeys, typingAgentPubkeys),
+    [observerAgentPubkeys, typingAgentPubkeys],
+  );
+
+  React.useEffect(() => {
+    if (!thread) return;
+    const currentIds = new Set(thread.replies.map((reply) => reply.eventId));
+    const previous = seenRepliesRef.current;
+    if (previous?.postId !== thread.post.eventId) {
+      seenRepliesRef.current = {
+        postId: thread.post.eventId,
+        replyIds: currentIds,
+      };
+      return;
+    }
+    const agentPubkeys = new Set(
+      activityAgents.map((agent) => agent.pubkey.toLowerCase()),
+    );
+    const completedReplies = thread.replies.filter(
+      (reply) =>
+        !previous.replyIds.has(reply.eventId) &&
+        agentPubkeys.has(reply.pubkey.toLowerCase()),
+    );
+    previous.replyIds = currentIds;
+    for (const reply of completedReplies) {
+      recordTypingCompletion({
+        channelId,
+        pubkey: reply.pubkey,
+        threadHeadId: thread.post.eventId,
+        createdAt: reply.createdAt,
+      });
+    }
+    clearThreadTypingAgents(
+      channelId,
+      thread.post.eventId,
+      completedReplies.map((reply) => reply.pubkey),
+    );
+  }, [activityAgents, channelId, thread]);
 
   React.useEffect(() => {
     if (!thread || !targetEventId) {
@@ -298,6 +379,20 @@ export function ForumThreadPanel({
       </div>
 
       <div className="border-t border-border/60 p-4">
+        {workingAgentPubkeys.length > 0 ? (
+          <div className="mb-2 px-1">
+            <BotActivityComposerAction
+              agents={activityAgents}
+              channelId={channelId}
+              onOpenAgentSession={onOpenAgentSession}
+              openAgentSessionPubkey={openAgentSessionPubkey}
+              profiles={profiles}
+              turnIds={workingTurnIds}
+              variant="inline"
+              workingBotPubkeys={workingAgentPubkeys}
+            />
+          </div>
+        ) : null}
         <ForumComposer
           channelId={channelId}
           channelType="forum"

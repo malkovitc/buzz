@@ -9,6 +9,7 @@ import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
 import { Skeleton } from "@/shared/ui/skeleton";
 import { VirtualizedList } from "@/shared/ui/VirtualizedList";
+import type { BotActivityAgent } from "@/features/channels/ui/BotActivityBar";
 
 import {
   useCreateForumPostMutation,
@@ -30,6 +31,9 @@ type ForumViewProps = {
   onTargetReached?: (messageId: string) => void;
   selectedPostId: string | null;
   targetReplyId: string | null;
+  activityAgents: BotActivityAgent[];
+  onOpenAgentSession: (pubkey: string, channelId?: string | null) => void;
+  openAgentSessionPubkey: string | null;
 };
 
 function canDelete(postPubkey: string, currentPubkey?: string): boolean {
@@ -47,6 +51,9 @@ export function ForumView({
   onTargetReached,
   selectedPostId,
   targetReplyId,
+  activityAgents,
+  onOpenAgentSession,
+  openAgentSessionPubkey,
 }: ForumViewProps) {
   const [isComposerOpen, setIsComposerOpen] = React.useState(false);
   const postsScrollRef = React.useRef<HTMLDivElement>(null);
@@ -132,12 +139,15 @@ export function ForumView({
 
     return (
       <ForumThreadPanel
+        activityAgents={activityAgents}
         canDeletePost={canDeleteExpandedPost}
         currentPubkey={effectiveCurrentPubkey}
         isDeletingPost={deletePostMutation.isPending}
         isLoading={threadQuery.isLoading}
         isSendingReply={createReplyMutation.isPending}
         onBack={onClosePost}
+        onOpenAgentSession={onOpenAgentSession}
+        openAgentSessionPubkey={openAgentSessionPubkey}
         onDeletePost={(eventId) => {
           deletePostMutation.mutate({ eventId }, { onSuccess: onClosePost });
         }}

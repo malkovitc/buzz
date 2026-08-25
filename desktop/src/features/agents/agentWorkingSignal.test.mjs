@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
 
 import {
+  clearThreadTypingAgents,
   getAgentWorkingState,
+  getThreadTypingAgentPubkeys,
   getWorkingAgentPubkeysForChannel,
   getWorkingChannels,
   reportChannelBotTyping,
@@ -145,6 +147,23 @@ describe("getWorkingChannels", () => {
 });
 
 describe("getWorkingAgentPubkeysForChannel", () => {
+  it("retains thread-scoped typing separately from channel typing", () => {
+    reportChannelBotTyping(
+      "chan-1",
+      [],
+      [
+        { pubkey: AGENT, threadHeadId: "post-a" },
+        { pubkey: AGENT_2, threadHeadId: "post-b" },
+      ],
+    );
+    assert.deepEqual(getThreadTypingAgentPubkeys("chan-1", "post-a"), [AGENT]);
+    assert.deepEqual(getThreadTypingAgentPubkeys("chan-1", "post-b"), [
+      AGENT_2,
+    ]);
+    clearThreadTypingAgents("chan-1", "post-a", [AGENT]);
+    assert.deepEqual(getThreadTypingAgentPubkeys("chan-1", "post-a"), []);
+  });
+
   it("unions observer and typing agents for the channel", () => {
     startTurn(AGENT, "chan-1");
     reportChannelBotTyping("chan-1", [AGENT_2]);

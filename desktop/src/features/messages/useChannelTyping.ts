@@ -12,15 +12,21 @@ import {
   KIND_TYPING_INDICATOR,
 } from "@/shared/constants/kinds";
 import { resolveEventAuthorPubkey } from "@/shared/lib/authors";
+import {
+  shouldSuppressTyping,
+  subscribeTypingCompletions,
+} from "./typingCompletionSuppression";
 
 export type TypingIndicatorEntry = {
   pubkey: string;
   threadHeadId: string | null;
+  generation?: number;
 };
 
 type TypingEntry = {
   expiresAt: number;
   firstSeenAt: number;
+  generation: number;
   pubkey: string;
   threadHeadId: string | null;
 };
@@ -72,7 +78,6 @@ export function useChannelTyping(
   relaySelfPubkey?: string | null,
 ) {
   const channelId = channel?.id ?? null;
-  const channelType = channel?.channelType ?? null;
   const [typingByPubkey, setTypingByPubkey] = useState<TypingState>({});
   const normalizedCurrentPubkey = currentPubkey?.toLowerCase();
   const typingSuppressUntilByPubkeyRef = useRef<Record<string, number>>({});
@@ -96,6 +101,16 @@ export function useChannelTyping(
     const typingPubkey = event.pubkey.toLowerCase();
     const threadHeadId = getTypingScopeId(event);
     const typingKey = getTypingStateKey(typingPubkey, threadHeadId);
+    if (
+      shouldSuppressTyping(
+        channelId,
+        typingPubkey,
+        threadHeadId,
+        event.created_at,
+      )
+    ) {
+      return;
+    }
     if (normalizedCurrentPubkey && typingPubkey === normalizedCurrentPubkey) {
       return;
     }
@@ -123,6 +138,7 @@ export function useChannelTyping(
         [typingKey]: {
           expiresAt: Math.min(now + TYPING_INDICATOR_TTL_MS, eventExpiresAt),
           firstSeenAt: existing?.firstSeenAt ?? now,
+          generation: event.created_at,
           pubkey: typingPubkey,
           threadHeadId,
         },
@@ -177,7 +193,28 @@ export function useChannelTyping(
   }, [channelId, latestMessageEvent, relaySelfPubkey]);
 
   useEffect(() => {
-    if (!channelId || channelType === "forum") {
+    if (!channelId) return;
+    return subscribeTypingCompletions((completion) => {
+      if (completion.channelId !== channelId) return;
+      const typingKey = getTypingStateKey(
+        completion.pubkey,
+        completion.threadHeadId,
+      );
+      latestMessageCreatedAtByPubkeyRef.current[typingKey] =
+        completion.createdAt;
+      typingSuppressUntilByPubkeyRef.current[typingKey] =
+        Date.now() + TYPING_POST_MESSAGE_SUPPRESS_MS;
+      setTypingByPubkey((current) => {
+        if (!(typingKey in current)) return current;
+        const next = { ...current };
+        delete next[typingKey];
+        return next;
+      });
+    });
+  }, [channelId]);
+
+  useEffect(() => {
+    if (!channelId) {
       return;
     }
 
@@ -212,7 +249,7 @@ export function useChannelTyping(
         void cleanup();
       }
     };
-  }, [channelId, channelType]);
+  }, [channelId]);
 
   const hasActiveTypers = Object.keys(typingByPubkey).length > 0;
 
@@ -234,7 +271,11 @@ export function useChannelTyping(
     () =>
       Object.values(typingByPubkey)
         .sort((left, right) => left.firstSeenAt - right.firstSeenAt)
-        .map(({ pubkey, threadHeadId }) => ({ pubkey, threadHeadId })),
+        .map(({ pubkey, threadHeadId, generation }) => ({
+          pubkey,
+          threadHeadId,
+          generation,
+        })),
     [typingByPubkey],
   );
 }

@@ -12,6 +12,8 @@ import type {
 import type { Channel } from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
+import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
+import type { ChannelAgentSessionAgent } from "@/features/channels/ui/useChannelAgentSessions";
 
 type ForumChannelContentProps = {
   canResetPanelWidth: boolean;
@@ -42,6 +44,10 @@ type ForumChannelContentProps = {
   profilePanelView: ProfilePanelView;
   selectedPostId: string | null;
   targetReplyId: string | null;
+  activityAgents: ChannelAgentSessionAgent[];
+  onCloseAgentSession: () => void;
+  onOpenAgentSession: (pubkey: string, channelId?: string | null) => void;
+  openAgentSessionPubkey: string | null;
 };
 
 /**
@@ -71,7 +77,15 @@ export function ForumChannelContent({
   profilePanelView,
   selectedPostId,
   targetReplyId,
+  activityAgents,
+  onCloseAgentSession,
+  onOpenAgentSession,
+  openAgentSessionPubkey,
 }: ForumChannelContentProps) {
+  const selectedAgent = activityAgents.find(
+    (agent) =>
+      agent.pubkey.toLowerCase() === openAgentSessionPubkey?.toLowerCase(),
+  );
   return (
     <>
       {header}
@@ -82,16 +96,38 @@ export function ForumChannelContent({
         >
           <React.Suspense fallback={<ViewLoadingFallback kind="forum" />}>
             <ForumView
+              activityAgents={activityAgents}
               channel={channel}
               currentPubkey={currentPubkey}
               onClosePost={onClosePost}
+              onOpenAgentSession={onOpenAgentSession}
+              openAgentSessionPubkey={openAgentSessionPubkey}
               onSelectPost={onSelectPost}
               selectedPostId={selectedPostId}
               targetReplyId={targetReplyId}
             />
           </React.Suspense>
         </section>
-        {profilePanelPubkey ? (
+        {selectedAgent ? (
+          <RightAuxiliaryPane
+            canResetWidth={canResetPanelWidth}
+            onResetWidth={onResetPanelWidth}
+            onResizeStart={onPanelResizeStart}
+            testId="agent-session-thread-panel"
+            widthPx={panelWidthPx}
+          >
+            <AgentSessionThreadPanel
+              agent={selectedAgent}
+              canInterruptTurn={selectedAgent.canInterruptTurn}
+              channel={channel}
+              channelId={channel.id}
+              layout="split"
+              onClose={onCloseAgentSession}
+              transparentChrome
+              widthPx={panelWidthPx}
+            />
+          </RightAuxiliaryPane>
+        ) : profilePanelPubkey ? (
           <RightAuxiliaryPane
             canResetWidth={canResetPanelWidth}
             onResetWidth={onResetPanelWidth}
