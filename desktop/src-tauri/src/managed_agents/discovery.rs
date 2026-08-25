@@ -11,6 +11,7 @@ use crate::managed_agents::{
 };
 mod auth_status_cache;
 mod login_shell;
+mod pi_runtime;
 mod presets;
 mod runtime_metadata;
 #[macro_use]
@@ -26,6 +27,7 @@ pub(crate) use presets::{
     preset_harness_ids,
 };
 use presets::{preset_catalog_entry, PRESET_HARNESSES};
+pub use runtime_metadata::missing_command_message;
 pub(crate) use runtime_metadata::KnownAcpRuntime;
 
 const GOOSE_AVATAR_URL: &str = "https://goose-docs.ai/img/logo_dark.png";
@@ -186,6 +188,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         // Verified: `codex login status` exits 0 when logged in, non-zero otherwise.
         auth_probe_args: Some(&["codex", "login", "status"]),
     },
+    pi_runtime::PI_RUNTIME,
     KnownAcpRuntime {
         id: "buzz-agent",
         label: "Buzz Agent",
@@ -452,7 +455,7 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
     match normalize_command_identity(command).as_str() {
         "goose" => Some(vec!["acp".to_string()]),
         "codex" | "codex-acp" | "claude-agent-acp" | "claude-code-acp" | "claude-code"
-        | "claudecode" | "buzz-agent" => Some(Vec::new()),
+        | "claudecode" | "pi" | "pi-acp" | "buzz-agent" => Some(Vec::new()),
         _ => None,
     }
 }
@@ -928,16 +931,6 @@ pub fn command_availability(command: &str) -> CommandAvailabilityInfo {
     }
 }
 
-pub fn missing_command_message(command: &str, role: &str) -> String {
-    if command_looks_like_path(command) {
-        return format!("{role} `{command}` does not exist.");
-    }
-
-    format!(
-        "{role} `{command}` was not found. Make sure it is installed and on your PATH. Antivirus software can quarantine bundled binaries — if that happened, restore the file or reinstall Buzz. (Source builds: see TESTING.md.)"
-    )
-}
-
 pub(crate) fn classify_runtime(
     adapter_result: Option<(&str, PathBuf)>,
     underlying_cli: Option<&str>,
@@ -1150,6 +1143,10 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
         } else if let Some(cached) = adapter_availability_cached() {
             availability = cached;
         }
+    }
+    if runtime.id == "pi" {
+        availability =
+            pi_runtime::gate_adapter(availability, command.as_deref(), binary_path.as_deref());
     }
 
     // Warm the adapter-availability cache for the badge fallback.

@@ -39,11 +39,6 @@ fn resolves_known_avatar_for_command_paths_and_aliases() {
 }
 
 #[test]
-fn returns_none_for_unknown_commands() {
-    assert!(managed_agent_avatar_url("custom-agent").is_none());
-}
-
-#[test]
 fn default_agent_command_resolves_bundled_buzz_agent() {
     // The default must be bundled buzz-agent, never bare `goose` on a stock Windows install.
     assert_eq!(default_agent_command(), "buzz-agent");
@@ -649,6 +644,7 @@ fn apply_agent_command_update_concrete_pin_keeps_materialized_runtime() {
 
 // ── probe_codex_acp_version ───────────────────────────────────────────────────
 
+mod basic;
 mod forced_discovery;
 mod managed_path_resolution;
 #[cfg(unix)]
@@ -678,6 +674,7 @@ fn probe_codex_acp_version_parses_full_semver_output() {
 }
 
 mod codex_version;
+mod pi_version;
 
 #[cfg(unix)]
 #[test]

@@ -1,3 +1,14 @@
+use super::command_looks_like_path;
+
+pub fn missing_command_message(command: &str, role: &str) -> String {
+    if command_looks_like_path(command) {
+        return format!("{role} `{command}` does not exist.");
+    }
+    format!(
+        "{role} `{command}` was not found. Make sure it is installed and on your PATH. Antivirus software can quarantine bundled binaries — if that happened, restore the file or reinstall Buzz. (Source builds: see TESTING.md.)"
+    )
+}
+
 /// Static capabilities and installation metadata for a known ACP runtime.
 pub(crate) struct KnownAcpRuntime {
     pub id: &'static str,
