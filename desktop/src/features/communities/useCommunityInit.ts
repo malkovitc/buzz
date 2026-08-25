@@ -24,6 +24,7 @@ import { resetRenderScopedReactionHydration } from "@/features/messages/lib/rend
 import { resetBackgroundMediaUploads } from "@/features/messages/lib/backgroundMediaUploadStore";
 import { resetLinkPreviewPreparations } from "@/features/messages/lib/linkPreviewPreparationStore";
 import { resetPersistentAgentAudienceStore } from "@/features/messages/lib/persistentAgentAudience";
+import { resetTypingCompletionSuppression } from "@/features/messages/typingCompletionSuppression";
 import {
   resetActiveAgentTurnsStore,
   saveActiveAgentTurnsForCommunity,
@@ -63,6 +64,7 @@ async function resetCommunityState({
   resetAgentObserverStore();
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
+  resetTypingCompletionSuppression();
   if (isTauri() && isMacPlatform()) {
     void clearTrayAgentActivity();
   }

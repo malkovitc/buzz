@@ -60,6 +60,10 @@ const IDLE_STATE: AgentWorkingState = {
 // reportChannelBotTyping from the channel typing hooks; entries follow the
 // typing TTL because the hooks re-report whenever their entries change.
 const typingByChannel = new Map<string, Map<string, number>>();
+const threadTypingByChannel = new Map<
+  string,
+  { pubkey: string; threadHeadId: string | null }[]
+>();
 
 const listeners = new Set<() => void>();
 let unsubscribeTurns: (() => void) | null = null;
@@ -69,11 +73,13 @@ let unsubscribeTurns: (() => void) | null = null;
 const stateCache = new Map<string, AgentWorkingState>();
 let channelsCache: WorkingChannelSummary[] | null = null;
 const channelPubkeysCache = new Map<string, string[]>();
+const threadPubkeysCache = new Map<string, string[]>();
 
 function invalidateCaches() {
   stateCache.clear();
   channelsCache = null;
   channelPubkeysCache.clear();
+  threadPubkeysCache.clear();
 }
 
 function notify() {
@@ -106,6 +112,10 @@ export function subscribeAgentWorkingSignal(listener: () => void) {
 export function reportChannelBotTyping(
   channelId: string,
   pubkeys: readonly string[],
+  threadEntries: readonly {
+    pubkey: string;
+    threadHeadId: string | null;
+  }[] = [],
 ) {
   const current = typingByChannel.get(channelId);
   const next = new Map<string, number>();
@@ -118,14 +128,29 @@ export function reportChannelBotTyping(
   const unchanged =
     (current?.size ?? 0) === next.size &&
     [...next.keys()].every((key) => current?.has(key));
-  if (unchanged) {
-    return;
-  }
+  const normalizedThreadEntries = threadEntries.map((entry) => ({
+    pubkey: normalizePubkey(entry.pubkey),
+    threadHeadId: entry.threadHeadId,
+  }));
+  const currentThreadEntries = threadTypingByChannel.get(channelId) ?? [];
+  const threadsUnchanged =
+    currentThreadEntries.length === normalizedThreadEntries.length &&
+    currentThreadEntries.every(
+      (entry, index) =>
+        entry.pubkey === normalizedThreadEntries[index]?.pubkey &&
+        entry.threadHeadId === normalizedThreadEntries[index]?.threadHeadId,
+    );
+  if (unchanged && threadsUnchanged) return;
 
   if (next.size === 0) {
     typingByChannel.delete(channelId);
   } else {
     typingByChannel.set(channelId, next);
+  }
+  if (normalizedThreadEntries.length === 0) {
+    threadTypingByChannel.delete(channelId);
+  } else {
+    threadTypingByChannel.set(channelId, normalizedThreadEntries);
   }
   notify();
 }
@@ -296,6 +321,43 @@ export function getWorkingAgentPubkeysForChannel(
   return result;
 }
 
+export function clearThreadTypingAgents(
+  channelId: string,
+  threadHeadId: string,
+  pubkeys: readonly string[],
+) {
+  const blocked = new Set(pubkeys.map(normalizePubkey));
+  const current = threadTypingByChannel.get(channelId) ?? [];
+  const next = current.filter(
+    (entry) =>
+      entry.threadHeadId !== threadHeadId || !blocked.has(entry.pubkey),
+  );
+  if (next.length === current.length) return;
+  if (next.length === 0) threadTypingByChannel.delete(channelId);
+  else threadTypingByChannel.set(channelId, next);
+  notify();
+}
+
+export function getThreadTypingAgentPubkeys(
+  channelId: string | null | undefined,
+  threadHeadId: string | null | undefined,
+): string[] {
+  if (!channelId || !threadHeadId) return EMPTY_PUBKEYS;
+  const cacheKey = `${channelId}\u0000${threadHeadId}`;
+  const cached = threadPubkeysCache.get(cacheKey);
+  if (cached) return cached;
+  const result = [
+    ...new Set(
+      (threadTypingByChannel.get(channelId) ?? [])
+        .filter((entry) => entry.threadHeadId === threadHeadId)
+        .map((entry) => entry.pubkey),
+    ),
+  ];
+  const snapshot = result.length === 0 ? EMPTY_PUBKEYS : result;
+  threadPubkeysCache.set(cacheKey, snapshot);
+  return snapshot;
+}
+
 // ── Hooks ────────────────────────────────────────────────────────────────────
 
 /** Working state for one agent, optionally scoped to a channel. */
@@ -316,6 +378,15 @@ export function useWorkingChannels(): WorkingChannelSummary[] {
   );
 }
 
+export function useThreadTypingAgentPubkeys(
+  channelId: string | null | undefined,
+  threadHeadId: string | null | undefined,
+): string[] {
+  return React.useSyncExternalStore(subscribeAgentWorkingSignal, () =>
+    getThreadTypingAgentPubkeys(channelId, threadHeadId),
+  );
+}
+
 /** Normalized pubkeys of agents working in a channel. */
 export function useChannelWorkingAgentPubkeys(
   channelId: string | null | undefined,
@@ -328,6 +399,7 @@ export function useChannelWorkingAgentPubkeys(
 /** Community-switch reset (see resetCommunityState in useCommunityInit). */
 export function resetAgentWorkingSignal() {
   typingByChannel.clear();
+  threadTypingByChannel.clear();
   invalidateCaches();
   for (const listener of listeners) {
     listener();

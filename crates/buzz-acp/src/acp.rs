@@ -372,11 +372,6 @@ const ACP_STEER_METHOD: &str = "_session/steering";
 /// `outcome` value meaning the steer was applied to the turn Buzz is waiting
 /// on, which therefore keeps running.
 const STEER_OUTCOME_INJECTED: &str = "injected";
-
-/// `outcome` value meaning the turn Buzz was steering had already finished, so
-/// the adapter began a fresh turn carrying the message. Still a delivery
-/// success, but the awaited turn is over — see the steer-response arm for why
-/// this must not renew the hard deadline.
 const STEER_OUTCOME_STARTED_NEW_TURN: &str = "startedNewTurn";
 
 /// Which wire method carried an in-flight steer request, recorded so the
@@ -1361,6 +1356,7 @@ impl AcpClient {
         let mut pending_steer: Option<(
             u64,
             SteerTransport,
+            Vec<String>,
             tokio::sync::oneshot::Sender<crate::pool::SteerAck>,
         )> = None;
 
@@ -1387,7 +1383,7 @@ impl AcpClient {
             // exists). Check the classified deadline here so a steady-
             // stream agent is still bounded.
             if Instant::now() >= next_deadline {
-                if let Some((_, _, ack_tx)) = pending_steer.take() {
+                if let Some((_, _, _, ack_tx)) = pending_steer.take() {
                     // Prompt is timing out — release the withheld event via
                     // PromptCompletedNeutral (no fallback signal: there is
                     // no in-flight turn to signal once we return, and
@@ -1489,7 +1485,12 @@ impl AcpClient {
                             );
                             match self.write_ndjson(&msg).await {
                                 Ok(()) => {
-                                    pending_steer = Some((id, transport, req.ack_tx));
+                                    pending_steer = Some((
+                                        id,
+                                        transport,
+                                        req.association_event_ids,
+                                        req.ack_tx,
+                                    ));
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -1512,7 +1513,7 @@ impl AcpClient {
                     // would catch this anyway, but firing the deadline arm
                     // here makes the wakeup immediate (no extra reader poll
                     // round-trip when stdout is idle).
-                    if let Some((_, _, ack_tx)) = pending_steer.take() {
+                    if let Some((_, _, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                     }
                     if idle_fires_first {
@@ -1536,13 +1537,13 @@ impl AcpClient {
 
             match read_result {
                 None => {
-                    if let Some((_, _, ack_tx)) = pending_steer.take() {
+                    if let Some((_, _, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::AgentExited);
                 }
                 Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
-                    if let Some((_, _, ack_tx)) = pending_steer.take() {
+                    if let Some((_, _, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::Protocol(
@@ -1550,7 +1551,7 @@ impl AcpClient {
                     ));
                 }
                 Some(Err(e)) => {
-                    if let Some((_, _, ack_tx)) = pending_steer.take() {
+                    if let Some((_, _, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::Io(std::io::Error::other(e)));
@@ -1593,14 +1594,15 @@ impl AcpClient {
                     // share the `no method` guard.
                     if let Some(id) = msg.get("id") {
                         if msg.get("method").is_none() {
-                            if let Some((steer_id, _, _)) = pending_steer.as_ref() {
+                            if let Some((steer_id, _, _, _)) = pending_steer.as_ref() {
                                 if *id == serde_json::json!(*steer_id) {
                                     // Take the ack_tx out and route the
                                     // response. We do not return — keep
                                     // reading until the prompt response
                                     // arrives.
-                                    let (_, transport, ack_tx) =
+                                    let (_, transport, association_event_ids, ack_tx) =
                                         pending_steer.take().expect("just checked");
+                                    let mut extends_current_turn = false;
                                     let ack = if let Some(error) = msg.get("error") {
                                         let code = error
                                             .get("code")
@@ -1636,25 +1638,8 @@ impl AcpClient {
                                                 }),
                                         };
                                         match outcome {
-                                            Some(STEER_OUTCOME_STARTED_NEW_TURN) => {
-                                                // Delivered, but into a NEW
-                                                // turn: the one this read loop
-                                                // is awaiting had already
-                                                // finished. Renewing the hard
-                                                // deadline here would extend
-                                                // the clock on a settled turn,
-                                                // so leave it alone and let the
-                                                // prompt response land on its
-                                                // original budget.
-                                                tracing::info!(
-                                                    "steer accepted as {STEER_OUTCOME_STARTED_NEW_TURN}: \
-                                                     awaited turn had ended — hard deadline not renewed"
-                                                );
-                                                crate::pool::SteerAck::Success {
-                                                    session_id: session_id.to_owned(),
-                                                }
-                                            }
                                             Some(_) => {
+                                                extends_current_turn = true;
                                                 let renew_now = Instant::now();
                                                 let new_deadline = renew_now + max_duration;
                                                 if new_deadline > hard_deadline {
@@ -1693,19 +1678,27 @@ impl AcpClient {
                                             }
                                         }
                                     };
+                                    if extends_current_turn {
+                                        self.observe(
+                                            "turn_association_update",
+                                            serde_json::json!({
+                                                "associationEventIds": association_event_ids,
+                                            }),
+                                        );
+                                    }
                                     let _ = ack_tx.send(ack);
                                     continue;
                                 }
                             }
                             if *id == serde_json::json!(expected_id) {
                                 if let Some(error) = msg.get("error") {
-                                    if let Some((_, _, ack_tx)) = pending_steer.take() {
+                                    if let Some((_, _, _, ack_tx)) = pending_steer.take() {
                                         let _ = ack_tx
                                             .send(crate::pool::SteerAck::PromptCompletedNeutral);
                                     }
                                     return Err(agent_error_from_json(error));
                                 }
-                                if let Some((_, _, ack_tx)) = pending_steer.take() {
+                                if let Some((_, _, _, ack_tx)) = pending_steer.take() {
                                     let _ =
                                         ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                                 }
@@ -3917,6 +3910,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
+                    association_event_ids: vec![],
                     ack_tx,
                 })
                 .await
@@ -3986,6 +3980,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
+                    association_event_ids: vec![],
                     ack_tx,
                 })
                 .await
@@ -4058,6 +4053,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    association_event_ids: vec![],
                     ack_tx,
                 })
                 .await
@@ -4132,6 +4128,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    association_event_ids: vec![],
                     ack_tx,
                 })
                 .await
@@ -4382,6 +4379,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    association_event_ids: vec![],
                     ack_tx,
                 })
                 .await
@@ -4420,13 +4418,21 @@ mod tests {
     /// would land and this returns `Ok`; without renewal the original
     /// deadline fires first and we get `HardTimeout`.
     #[tokio::test]
-    async fn acp_steer_started_new_turn_acks_success_without_renewing_hard_deadline() {
+    async fn acp_steer_started_new_turn_stays_in_tracked_buzz_turn() {
         let script = "sleep 0.5; \
              echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":\"startedNewTurn\"}}'; \
              sleep 1; \
              echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"done\":true}}'";
         let mut client = spawn_script(script).await;
         set_steering_supported(&mut client);
+        let observer = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+        client.set_observer_context(crate::observer::context_for_turn(
+            None,
+            None,
+            "turn-a".into(),
+            chrono::Utc::now().to_rfc3339(),
+        ));
 
         let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
@@ -4435,6 +4441,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    association_event_ids: vec!["post-b".into()],
                     ack_tx,
                 })
                 .await
@@ -4449,20 +4456,17 @@ mod tests {
             .await;
         send_task.await.expect("send_task should complete");
 
-        // The original deadline must still fire — renewal here would extend
-        // the clock on a turn the adapter has already finished.
         assert!(
-            matches!(result, Err(AcpError::HardTimeout { .. })),
-            "startedNewTurn must NOT renew the hard deadline, so the original \
-             one must still fire; got {result:?}"
+            result.is_ok(),
+            "startedNewTurn remains part of the tracked Buzz logical turn: {result:?}"
         );
-        // Delivery still succeeded, so the withheld event must be dropped
-        // rather than released — hence Success, not an Err.
         let ack = ack_rx.await.expect("ack must be received");
-        assert!(
-            matches!(ack, crate::pool::SteerAck::Success { .. }),
-            "startedNewTurn is a delivery success, got {ack:?}"
-        );
+        assert!(matches!(ack, crate::pool::SteerAck::Success { .. }));
+        assert!(observer.snapshot().iter().any(|event| {
+            event.kind == "turn_association_update"
+                && event.turn_id.as_deref() == Some("turn-a")
+                && event.payload["associationEventIds"] == serde_json::json!(["post-b"])
+        }));
     }
 
     /// Test 4 (companion to the existing

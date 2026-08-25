@@ -37,8 +37,8 @@ use crate::acp::{
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
 use crate::queue::{
-    CancelReason, ContextMessage, ConversationContext, FlushBatch, PromptChannelInfo,
-    PromptProfile, PromptProfileLookup, ThreadTags,
+    parse_thread_tags, CancelReason, ContextMessage, ConversationContext, FlushBatch,
+    PromptChannelInfo, PromptProfile, PromptProfileLookup, ThreadTags,
 };
 use crate::relay::{ChannelInfo, RestClient};
 
@@ -298,6 +298,7 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
+    turn_associations: HashMap<String, Arc<Mutex<Vec<String>>>>,
 }
 
 /// Result returned by a completed prompt task.
@@ -415,6 +416,8 @@ pub struct SteerRequest {
     /// `queue::native_steer_framing()` + `queue::format_event_block` so
     /// the wording cannot drift from the cancel+merge fallback path.
     pub prompt_blocks: Vec<String>,
+    /// Triggering event plus stable thread anchors for observer routing.
+    pub association_event_ids: Vec<String>,
     /// Oneshot for the read loop to report the outcome.
     pub ack_tx: tokio::sync::oneshot::Sender<SteerAck>,
 }
@@ -658,6 +661,7 @@ impl AgentPool {
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
+            turn_associations: HashMap::new(),
         }
     }
 
@@ -731,6 +735,44 @@ impl AgentPool {
 
     pub fn task_map_mut(&mut self) -> &mut HashMap<tokio::task::Id, TaskMeta> {
         &mut self.task_map
+    }
+
+    pub fn in_flight_turn_id(&self, channel_id: Uuid) -> Option<String> {
+        self.task_map
+            .values()
+            .find(|meta| meta.channel_id == Some(channel_id))
+            .map(|meta| meta.turn_id.clone())
+    }
+
+    pub fn is_turn_in_flight(&self, channel_id: Uuid, turn_id: &str) -> bool {
+        self.task_map
+            .values()
+            .any(|meta| meta.channel_id == Some(channel_id) && meta.turn_id == turn_id)
+    }
+
+    pub fn register_turn_associations(
+        &mut self,
+        turn_id: String,
+        associations: Arc<Mutex<Vec<String>>>,
+    ) {
+        self.turn_associations.insert(turn_id, associations);
+    }
+
+    pub fn extend_turn_associations(&self, turn_id: &str, event_ids: &[String]) {
+        let Some(associations) = self.turn_associations.get(turn_id) else {
+            return;
+        };
+        let mut guard = match associations.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.extend(event_ids.iter().cloned());
+        guard.sort_unstable();
+        guard.dedup();
+    }
+
+    pub fn unregister_turn_associations(&mut self, turn_id: &str) {
+        self.turn_associations.remove(turn_id);
     }
 
     /// Try to send a goose-native steer request to the in-flight task for
@@ -1741,6 +1783,7 @@ fn send_prompt_result(
 ///
 /// The agent is ALWAYS returned — even on panic the `JoinSet` detects the
 /// abort and the caller uses `task_map` to recover the agent index.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_prompt_task(
     mut agent: OwnedAgent,
     batch: Option<FlushBatch>,
@@ -1749,6 +1792,7 @@ pub async fn run_prompt_task(
     result_tx: mpsc::UnboundedSender<PromptResult>,
     control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
     turn_id: String,
+    turn_associations: Arc<Mutex<Vec<String>>>,
 ) {
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
@@ -1768,8 +1812,29 @@ pub async fn run_prompt_task(
     ));
     let triggering_event_ids: Vec<String> = batch
         .as_ref()
-        .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
+        .map(|b| {
+            b.events
+                .iter()
+                .chain(&b.cancelled_events)
+                .map(|be| be.event.id.to_hex())
+                .collect()
+        })
         .unwrap_or_default();
+    let mut association_event_ids = triggering_event_ids.clone();
+    for event in batch
+        .iter()
+        .flat_map(|batch| batch.events.iter().chain(&batch.cancelled_events))
+    {
+        if let Some(root) = parse_thread_tags(&event.event).root_event_id {
+            association_event_ids.push(root);
+        }
+    }
+    association_event_ids.sort_unstable();
+    association_event_ids.dedup();
+    match turn_associations.lock() {
+        Ok(mut guard) => *guard = association_event_ids.clone(),
+        Err(poisoned) => *poisoned.into_inner() = association_event_ids.clone(),
+    }
     agent.acp.observe(
         "turn_started",
         serde_json::json!({
@@ -1777,7 +1842,8 @@ pub async fn run_prompt_task(
                 PromptSource::Channel(_) => "channel",
                 PromptSource::Heartbeat => "heartbeat",
             },
-            "triggeringEventIds": triggering_event_ids,
+            "triggeringEventIds": &triggering_event_ids,
+            "associationEventIds": &association_event_ids,
         }),
     );
 
@@ -1816,6 +1882,7 @@ pub async fn run_prompt_task(
         ),
         ctx.turn_liveness_interval,
         Arc::clone(&liveness_state),
+        Arc::clone(&turn_associations),
     );
     let liveness_handle = tokio::spawn(liveness);
     let liveness_guard = LivenessGuard::new(liveness_handle, liveness_state);
@@ -4181,6 +4248,7 @@ async fn run_turn_liveness(
     mut context: observer::ObserverContext,
     interval: Duration,
     state: Arc<Mutex<LivenessState>>,
+    association_event_ids: Arc<Mutex<Vec<String>>>,
 ) {
     let Some(observer) = observer else {
         return std::future::pending::<()>().await;
@@ -4206,11 +4274,15 @@ async fn run_turn_liveness(
             return;
         }
         context.session_id = guard.session_id.clone();
+        let associations = match association_event_ids.lock() {
+            Ok(ids) => ids.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         observer.emit(
             "turn_liveness",
             agent_index,
             &context,
-            serde_json::json!({}),
+            serde_json::json!({ "associationEventIds": associations }),
         );
         drop(guard);
     }
@@ -6005,6 +6077,7 @@ done"#
                 result_tx.clone(),
                 None,
                 format!("turn-{turn}"),
+                Arc::new(Mutex::new(Vec::new())),
             )
             .await;
             let result = result_rx.recv().await.expect("prompt result");
@@ -6123,6 +6196,7 @@ done"#
                 result_tx.clone(),
                 None,
                 format!("turn-{turn}"),
+                Arc::new(Mutex::new(Vec::new())),
             )
             .await;
             let result = result_rx.recv().await.expect("prompt result");
@@ -6301,6 +6375,7 @@ done"#
                 result_tx.clone(),
                 None,
                 turn_id.into(),
+                Arc::new(Mutex::new(Vec::new())),
             )
             .await;
             let result = result_rx.recv().await.expect("prompt result");
@@ -6463,6 +6538,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             result_tx,
             None,
             "next-turn".into(),
+            Arc::new(Mutex::new(Vec::new())),
         )
         .await;
         let mut result = result_rx.recv().await.expect("next prompt result");
@@ -7110,6 +7186,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                     context,
                     Duration::from_secs(10),
                     Arc::clone(&state),
+                    Arc::new(Mutex::new(vec![])),
                 )),
                 state,
             );
@@ -7153,6 +7230,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let started_at = "2026-07-14T21:00:00Z".to_string();
         let context = observer::context_for_turn(None, None, "t-1".into(), started_at.clone());
         let state = open_liveness_state();
+        let association_ids = Arc::new(Mutex::new(vec!["mention-1".to_string()]));
         let guard = LivenessGuard::new(
             tokio::spawn(run_turn_liveness(
                 Some(observer.clone()),
@@ -7160,13 +7238,17 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 context,
                 Duration::from_secs(10),
                 Arc::clone(&state),
+                Arc::clone(&association_ids),
             )),
             state,
         );
         tokio::task::yield_now().await;
 
-        // First liveness tick at 10s and the second at 20s.
-        tokio::time::advance(Duration::from_secs(25)).await;
+        // First liveness tick at 10s, then a steer extends the second at 20s.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        association_ids.lock().unwrap().push("steer-2".to_string());
+        tokio::time::advance(Duration::from_secs(10)).await;
         tokio::task::yield_now().await;
         assert_eq!(liveness_count(&observer), 2);
 
@@ -7181,9 +7263,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         assert!(pings
             .iter()
             .all(|event| event.started_at.as_deref() == Some(&started_at)));
-        assert!(pings
-            .iter()
-            .all(|event| event.payload == serde_json::json!({})));
+        assert_eq!(
+            pings[0].payload,
+            serde_json::json!({ "associationEventIds": ["mention-1"] })
+        );
+        assert_eq!(
+            pings[1].payload,
+            serde_json::json!({ "associationEventIds": ["mention-1", "steer-2"] })
+        );
         assert_eq!(
             serde_json::to_value(&pings[0]).unwrap()["startedAt"],
             started_at,
@@ -7212,6 +7299,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 context,
                 Duration::from_secs(10),
                 Arc::clone(&state),
+                Arc::new(Mutex::new(vec![])),
             )),
             state,
         );
@@ -7254,6 +7342,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             context,
             Duration::ZERO,
             open_liveness_state(),
+            Arc::new(Mutex::new(vec![])),
         );
         tokio::pin!(liveness);
 
@@ -7277,6 +7366,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             context,
             Duration::from_secs(10),
             open_liveness_state(),
+            Arc::new(Mutex::new(vec![])),
         );
         tokio::pin!(liveness);
 
@@ -7316,6 +7406,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             context,
             Duration::from_secs(10),
             state,
+            Arc::new(Mutex::new(vec![])),
         );
         tokio::time::timeout(Duration::from_secs(60), liveness)
             .await

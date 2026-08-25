@@ -28,6 +28,7 @@ type BotActivityBarProps = {
   openAgentSessionPubkey: string | null;
   profiles?: UserProfileLookup;
   workingBotPubkeys: string[];
+  turnIds?: readonly string[];
   variant?: "toolbar" | "inline";
 };
 
@@ -41,6 +42,7 @@ export function BotActivityComposerAction({
   openAgentSessionPubkey,
   profiles,
   workingBotPubkeys,
+  turnIds,
   variant = "toolbar",
 }: BotActivityBarProps) {
   const [open, setOpen] = React.useState(false);
@@ -68,9 +70,12 @@ export function BotActivityComposerAction({
 
     const seen = new Set<string>();
     const headlines: string[] = [];
-    const scopedTranscript = channelId
-      ? transcript.filter((item) => item.channelId === channelId)
-      : transcript;
+    const turnIdSet = turnIds ? new Set(turnIds) : null;
+    const scopedTranscript = transcript.filter(
+      (item) =>
+        (!channelId || item.channelId === channelId) &&
+        (!turnIdSet || (item.turnId && turnIdSet.has(item.turnId))),
+    );
 
     // Two-tier scan: spine items first (reads recede when real work is present).
     // If no spine headlines are found (session start / idle), fall back to all
@@ -96,7 +101,7 @@ export function BotActivityComposerAction({
     }
 
     return headlines;
-  }, [channelId, singleWorkingAgent, transcript]);
+  }, [channelId, singleWorkingAgent, transcript, turnIds]);
   const [headlineIndex, setHeadlineIndex] = React.useState(0);
 
   const clearHoverTimer = React.useCallback(() => {
