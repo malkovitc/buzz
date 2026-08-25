@@ -123,6 +123,17 @@ test("buzz_reply rejects unbound reply targets", async () => {
   );
 });
 
+test("pre-spawn abort releases the safe publication reservation", async (t) => {
+  const f = await fixture(t, testOnly.run);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    f.reply.execute("call", { content: "safe to retry" }, controller.signal),
+    /aborted/,
+  );
+  assert.deepEqual(await fs.readdir(f.receiptDir), []);
+});
+
 test("pre-aborted command signals never spawn a publication process", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-abort-"));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
@@ -135,7 +146,9 @@ test("pre-aborted command signals never spawn a publication process", async (t) 
       ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, '')`],
       { signal: controller.signal },
     ),
-    /aborted/,
+    (error) =>
+      error.message.includes("aborted") &&
+      error.code === "PI_ACP_PRE_SPAWN_ABORT",
   );
   await assert.rejects(fs.access(marker));
 });

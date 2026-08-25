@@ -50,7 +50,11 @@ async function run(
     let child;
     let settled = false;
     let abortRequested = false;
-    const abortError = () => new Error("tool execution aborted");
+    const abortError = (preSpawn = false) => {
+      const error = new Error("tool execution aborted");
+      if (preSpawn) error.code = "PI_ACP_PRE_SPAWN_ABORT";
+      return error;
+    };
     const terminate = (signalName) => {
       if (!child) return;
       try {
@@ -83,13 +87,13 @@ async function run(
       else resolve(result);
     };
     if (signal?.aborted) {
-      finish(abortError());
+      finish(abortError(true));
       return;
     }
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
     if (abortRequested) {
-      finish(abortError());
+      finish(abortError(true));
       return;
     }
     child = spawn(command, args, {
@@ -239,22 +243,30 @@ export function createBuzzTools({
         });
       }
       const command = env.PI_ACP_BUZZ_COMMAND || "buzz";
-      const result = await runCommand(
-        command,
-        [
-          "--format",
-          "compact",
-          "messages",
-          "send",
-          "--channel",
-          context.channelId,
-          "--reply-to",
-          context.replyTo,
-          "--content",
-          "-",
-        ],
-        { input: content, signal, env },
-      );
+      let result;
+      try {
+        result = await runCommand(
+          command,
+          [
+            "--format",
+            "compact",
+            "messages",
+            "send",
+            "--channel",
+            context.channelId,
+            "--reply-to",
+            context.replyTo,
+            "--content",
+            "-",
+          ],
+          { input: content, signal, env },
+        );
+      } catch (error) {
+        if (error.code === "PI_ACP_PRE_SPAWN_ABORT") {
+          await fs.rm(reservation.directory, { recursive: true, force: true });
+        }
+        throw error;
+      }
       let response;
       try {
         response = JSON.parse(result.stdout);
