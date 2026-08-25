@@ -51,9 +51,19 @@ async function run(
     let settled = false;
     let abortRequested = false;
     const abortError = () => new Error("tool execution aborted");
+    const terminate = (signalName) => {
+      if (!child) return;
+      try {
+        if (process.platform !== "win32" && child.pid)
+          process.kill(-child.pid, signalName);
+        else child.kill(signalName);
+      } catch {
+        // The broker command group has already exited.
+      }
+    };
     const abort = () => {
       abortRequested = true;
-      child?.kill("SIGTERM");
+      terminate("SIGTERM");
     };
     const finish = (error, result) => {
       if (settled) return;
@@ -76,9 +86,10 @@ async function run(
     child = spawn(command, args, {
       env,
       stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     });
     if (abortRequested) {
-      child.kill("SIGTERM");
+      terminate("SIGTERM");
       finish(abortError());
       return;
     }
@@ -87,7 +98,7 @@ async function run(
     const append = (current, chunk) => {
       const next = Buffer.concat([current, chunk]);
       if (next.length > MAX_OUTPUT_BYTES) {
-        child.kill("SIGKILL");
+        terminate("SIGKILL");
         finish(new Error(`tool output exceeds ${MAX_OUTPUT_BYTES} bytes`));
       }
       return next;
@@ -113,7 +124,7 @@ async function run(
         );
     });
     timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      terminate("SIGKILL");
       finish(new Error(`${command} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
     if (input !== undefined) child.stdin.end(input);

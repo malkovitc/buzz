@@ -140,6 +140,25 @@ test("pre-aborted command signals never spawn a publication process", async (t) 
   await assert.rejects(fs.access(marker));
 });
 
+test("aborting a wrapper terminates its publication process group", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-group-abort-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const marker = path.join(dir, "descendant-published");
+  const childCode = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, ''), 600)`;
+  const controller = new AbortController();
+  const running = testOnly.run(
+    "/bin/sh",
+    ["-c", `${process.execPath} -e ${JSON.stringify(childCode)} & wait`],
+    { signal: controller.signal },
+  );
+  setTimeout(() => controller.abort(), 100);
+  await assert.rejects(running);
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  await assert.rejects(fs.access(marker));
+});
+
 test("kanban_tasks emits one bounded filtered compact query", async (t) => {
   const calls = [];
   const f = await fixture(t, async (command, args) => {
