@@ -16,6 +16,7 @@ const buzzMeta = {
   buzz: {
     channelId: "4dcab690-a2ca-4a56-9e5d-d901d12f83c3",
     triggeringEventIds: ["a".repeat(64)],
+    allowedReplyEventIds: ["a".repeat(64)],
     replyTo: "a".repeat(64),
   },
 };

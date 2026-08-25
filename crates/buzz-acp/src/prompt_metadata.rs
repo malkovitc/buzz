@@ -34,6 +34,7 @@ pub(crate) fn for_batch(
     Some(BuzzPromptMetadata {
         channel_id: batch.channel_id.to_string(),
         triggering_event_ids,
+        allowed_reply_event_ids: vec![reply_to.clone()],
         reply_to,
     })
 }
@@ -76,6 +77,7 @@ mod tests {
         let metadata = for_batch(&batch(tags), None, None).unwrap();
         assert_eq!(metadata.reply_to, root);
         assert_ne!(metadata.reply_to, metadata.triggering_event_ids[0]);
+        assert_eq!(metadata.allowed_reply_event_ids, vec![metadata.reply_to]);
     }
 
     #[test]

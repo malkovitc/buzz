@@ -8,6 +8,7 @@ import { createBuzzTools, testOnly } from "../src/buzz-tools.mjs";
 const context = {
   channelId: "4dcab690-a2ca-4a56-9e5d-d901d12f83c3",
   triggeringEventIds: ["a".repeat(64)],
+  allowedReplyEventIds: ["a".repeat(64)],
   replyTo: "a".repeat(64),
 };
 const eventId = "b".repeat(64);
@@ -109,7 +110,7 @@ test("buzz_reply fails closed after an ambiguous reserved publication", async (t
 test("buzz_reply rejects unbound reply targets", async () => {
   const invalid = {
     ...context,
-    triggeringEventIds: ["c".repeat(64)],
+    allowedReplyEventIds: ["c".repeat(64)],
   };
   const [reply] = createBuzzTools({
     getContext: () => invalid,
@@ -118,8 +119,25 @@ test("buzz_reply rejects unbound reply targets", async () => {
   });
   await assert.rejects(
     reply.execute("call", { content: "answer" }),
-    /triggering event set is invalid/,
+    /reply authorization set is invalid/,
   );
+});
+
+test("pre-aborted command signals never spawn a publication process", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-abort-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const marker = path.join(dir, "spawned");
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    testOnly.run(
+      process.execPath,
+      ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, '')`],
+      { signal: controller.signal },
+    ),
+    /aborted/,
+  );
+  await assert.rejects(fs.access(marker));
 });
 
 test("kanban_tasks emits one bounded filtered compact query", async (t) => {

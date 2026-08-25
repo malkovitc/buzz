@@ -22,10 +22,16 @@ function validateContext(context) {
   if (
     !Array.isArray(context.triggeringEventIds) ||
     context.triggeringEventIds.length === 0 ||
-    !context.triggeringEventIds.every((eventId) => HEX_EVENT.test(eventId)) ||
-    !context.triggeringEventIds.includes(context.replyTo)
+    !context.triggeringEventIds.every((eventId) => HEX_EVENT.test(eventId))
   ) {
     throw new Error("authenticated Buzz triggering event set is invalid");
+  }
+  if (
+    !Array.isArray(context.allowedReplyEventIds) ||
+    !context.allowedReplyEventIds.every((eventId) => HEX_EVENT.test(eventId)) ||
+    !context.allowedReplyEventIds.includes(context.replyTo)
+  ) {
+    throw new Error("authenticated Buzz reply authorization set is invalid");
   }
   return context;
 }
@@ -41,13 +47,14 @@ async function run(
 ) {
   return await new Promise((resolve, reject) => {
     let timer;
-    const child = spawn(command, args, {
-      env,
-      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-    });
-    let stdout = Buffer.alloc(0);
-    let stderr = Buffer.alloc(0);
+    let child;
     let settled = false;
+    let abortRequested = false;
+    const abortError = () => new Error("tool execution aborted");
+    const abort = () => {
+      abortRequested = true;
+      child?.kill("SIGTERM");
+    };
     const finish = (error, result) => {
       if (settled) return;
       settled = true;
@@ -56,6 +63,27 @@ async function run(
       if (error) reject(error);
       else resolve(result);
     };
+    if (signal?.aborted) {
+      finish(abortError());
+      return;
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    if (abortRequested) {
+      finish(abortError());
+      return;
+    }
+    child = spawn(command, args, {
+      env,
+      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    });
+    if (abortRequested) {
+      child.kill("SIGTERM");
+      finish(abortError());
+      return;
+    }
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
     const append = (current, chunk) => {
       const next = Buffer.concat([current, chunk]);
       if (next.length > MAX_OUTPUT_BYTES) {
@@ -84,8 +112,6 @@ async function run(
           new Error(result.stderr || `${command} exited with code ${code}`),
         );
     });
-    const abort = () => child.kill("SIGTERM");
-    signal?.addEventListener("abort", abort, { once: true });
     timer = setTimeout(() => {
       child.kill("SIGKILL");
       finish(new Error(`${command} timed out after ${timeoutMs}ms`));
@@ -278,4 +304,4 @@ export function createBuzzTools({
   return [buzzReply, kanbanTasks];
 }
 
-export const testOnly = { validateContext, reservationKey };
+export const testOnly = { validateContext, reservationKey, run };
