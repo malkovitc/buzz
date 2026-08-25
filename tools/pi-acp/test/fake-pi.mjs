@@ -97,7 +97,7 @@ attachJsonlReader(
               }),
             5,
           );
-        } else if (mode === "broker") {
+        } else if (mode === "broker" || mode === "broker-cancel") {
           writeJsonl(process.stdout, {
             type: "broker_tool_request",
             id: "broker-test",
@@ -107,7 +107,7 @@ attachJsonlReader(
         }
         break;
       case "broker_tool_response":
-        if (mode === "broker")
+        if (mode === "broker" || mode === "broker-cancel")
           setTimeout(
             () => complete(`broker:${command.success ? "ok" : command.error}`),
             5,

@@ -32,6 +32,7 @@ function startHarness(mode = "complete") {
       PI_ACP_BUZZ_COMMAND: fakeBuzzPath,
       PI_ACP_RECEIPT_DIR: receiptDir,
       BUZZ_PRIVATE_KEY: "1".repeat(64),
+      FAKE_BUZZ_DELAY_MS: mode === "broker-cancel" ? "2000" : "0",
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -342,6 +343,37 @@ test("brokers Buzz publication without exposing the signing key", async (t) => {
     harness.messages.some(
       (message) => message.params?.update?.content?.text === "broker:ok",
     ),
+  );
+});
+
+test("aborts an in-flight publication when the ACP prompt is cancelled", async (t) => {
+  const harness = startHarness("broker-cancel");
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+  harness.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "publish slowly" }],
+      _meta: buzzMeta,
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  harness.send({
+    jsonrpc: "2.0",
+    method: "session/cancel",
+    params: { sessionId },
+  });
+  const completed = await harness.waitFor((message) => message.id === 3);
+  assert.equal(completed.result.stopReason, "cancelled");
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(
+    harness.messages.some(
+      (message) => message.params?.update?.content?.text === "broker:ok",
+    ),
+    false,
   );
 });
 

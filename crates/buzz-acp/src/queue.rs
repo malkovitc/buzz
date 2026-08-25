@@ -1232,7 +1232,7 @@ fn turn_is_human_facing(
 ///
 /// Returns `None` for agent↔agent turns, leaving the agent free to nest deeply
 /// (intentional for agent coordination).
-fn resolve_reply_anchor(
+pub(crate) fn resolve_reply_anchor(
     sender_pubkey: &str,
     thread_tags: &ThreadTags,
     triggering_event_id: &str,

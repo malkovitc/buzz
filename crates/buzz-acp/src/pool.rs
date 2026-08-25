@@ -2284,6 +2284,7 @@ pub async fn run_prompt_task(
     // Event IDs represented by this prompt. Commit only after ACP reports a
     // successful turn; failed/cancelled prompts must be retryable without loss.
     let mut pending_delivered_event_ids = HashSet::new();
+    let mut buzz_prompt_metadata = None;
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
@@ -2345,6 +2346,8 @@ pub async fn run_prompt_task(
 
         let profile_lookup =
             fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
+        buzz_prompt_metadata =
+            crate::prompt_metadata::for_batch(b, channel_info.as_ref(), profile_lookup.as_ref());
 
         let known_names: Vec<&str> = profile_lookup
             .iter()
@@ -2416,26 +2419,6 @@ pub async fn run_prompt_task(
             .collect(),
         None => prompt_sections.iter().map(String::as_str).collect(),
     };
-    let buzz_prompt_metadata = batch.as_ref().and_then(|batch| {
-        let triggering_event_ids: Vec<String> = batch
-            .cancelled_events
-            .iter()
-            .chain(batch.events.iter())
-            .map(|event| event.event.id.to_hex())
-            .collect();
-        let reply_to = batch
-            .events
-            .last()
-            .or_else(|| batch.cancelled_events.last())?
-            .event
-            .id
-            .to_hex();
-        Some(crate::acp::BuzzPromptMetadata {
-            channel_id: batch.channel_id.to_string(),
-            triggering_event_ids,
-            reply_to,
-        })
-    });
     let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
