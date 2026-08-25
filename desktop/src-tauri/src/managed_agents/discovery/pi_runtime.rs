@@ -13,7 +13,7 @@ pub(super) const PI_RUNTIME: KnownAcpRuntime = KnownAcpRuntime {
     mcp_hooks: false,
     underlying_cli: Some("pi"),
     cli_install_commands: &["npm install -g @earendil-works/pi-coding-agent@0.84.2"],
-    cli_install_commands_windows: &["npm install -g @earendil-works/pi-coding-agent@0.84.2"],
+    cli_install_commands_windows: &[],
     adapter_install_commands: &["npm install -g https://github.com/malkovitc/buzz/releases/download/linza-patched-pi-v0.5.18.2/buzz-pi-acp-0.2.1.tgz"],
     cli_install_instructions_url: "https://github.com/badlogic/pi-mono",
     adapter_install_instructions_url: "https://github.com/malkovitc/buzz/tree/linza-patched-pi-v0.5.18.2/tools/pi-acp",

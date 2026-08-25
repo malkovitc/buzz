@@ -1,5 +1,6 @@
 use super::super::{known_acp_runtime_exact, normalize_agent_args};
 
+#[cfg(not(windows))]
 #[test]
 fn pilot_runtime_uses_managed_adapter_without_legacy_acp_args() {
     let runtime = known_acp_runtime_exact("pi").expect("Pi pilot runtime should exist");

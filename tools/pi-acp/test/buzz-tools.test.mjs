@@ -134,6 +134,15 @@ test("pre-spawn abort releases the safe publication reservation", async (t) => {
   assert.deepEqual(await fs.readdir(f.receiptDir), []);
 });
 
+test("missing publisher executables release the unstarted reservation", async (t) => {
+  const f = await fixture(t, testOnly.run);
+  await assert.rejects(
+    f.reply.execute("call", { content: "retry after install" }),
+    (error) => error.code === "PI_ACP_SAFE_UNSTARTED",
+  );
+  assert.deepEqual(await fs.readdir(f.receiptDir), []);
+});
+
 test("pre-aborted command signals never spawn a publication process", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-abort-"));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
@@ -148,7 +157,7 @@ test("pre-aborted command signals never spawn a publication process", async (t) 
     ),
     (error) =>
       error.message.includes("aborted") &&
-      error.code === "PI_ACP_PRE_SPAWN_ABORT",
+      error.code === "PI_ACP_SAFE_UNSTARTED",
   );
   await assert.rejects(fs.access(marker));
 });

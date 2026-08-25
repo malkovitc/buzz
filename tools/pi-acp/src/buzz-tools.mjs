@@ -49,10 +49,11 @@ async function run(
     let timer;
     let child;
     let settled = false;
+    let spawned = false;
     let abortRequested = false;
     const abortError = (preSpawn = false) => {
       const error = new Error("tool execution aborted");
-      if (preSpawn) error.code = "PI_ACP_PRE_SPAWN_ABORT";
+      if (preSpawn) error.code = "PI_ACP_SAFE_UNSTARTED";
       return error;
     };
     const terminate = (signalName) => {
@@ -116,13 +117,19 @@ async function run(
       }
       return next;
     };
+    child.once("spawn", () => {
+      spawned = true;
+    });
     child.stdout.on("data", (chunk) => {
       stdout = append(stdout, chunk);
     });
     child.stderr.on("data", (chunk) => {
       stderr = append(stderr, chunk);
     });
-    child.on("error", (error) => finish(error));
+    child.on("error", (error) => {
+      if (!spawned) error.code = "PI_ACP_SAFE_UNSTARTED";
+      finish(error);
+    });
     child.on("exit", (code, exitSignal) => {
       // A wrapper may exit after backgrounding the real publisher. Always
       // reap the whole broker tree before accepting the leader's result.
@@ -262,7 +269,7 @@ export function createBuzzTools({
           { input: content, signal, env },
         );
       } catch (error) {
-        if (error.code === "PI_ACP_PRE_SPAWN_ABORT") {
+        if (error.code === "PI_ACP_SAFE_UNSTARTED") {
           await fs.rm(reservation.directory, { recursive: true, force: true });
         }
         throw error;

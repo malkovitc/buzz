@@ -188,6 +188,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         // Verified: `codex login status` exits 0 when logged in, non-zero otherwise.
         auth_probe_args: Some(&["codex", "login", "status"]),
     },
+    #[cfg(not(windows))]
     pi_runtime::PI_RUNTIME,
     KnownAcpRuntime {
         id: "buzz-agent",
