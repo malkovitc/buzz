@@ -957,7 +957,6 @@ pub(crate) fn classify_runtime(
         (AcpAvailabilityStatus::NotInstalled, None, None)
     }
 }
-
 /// The oldest `codex-acp` version supported by Buzz managed agents.
 ///
 /// Older 1.x adapters are detected successfully, but can still bundle a Codex runtime
