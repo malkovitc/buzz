@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -54,9 +54,18 @@ async function run(
     const terminate = (signalName) => {
       if (!child) return;
       try {
-        if (process.platform !== "win32" && child.pid)
+        if (process.platform === "win32" && child.pid) {
+          const killed = spawnSync(
+            "taskkill",
+            ["/PID", String(child.pid), "/T", "/F"],
+            { stdio: "ignore", windowsHide: true },
+          );
+          if (killed.status !== 0) child.kill(signalName);
+        } else if (child.pid) {
           process.kill(-child.pid, signalName);
-        else child.kill(signalName);
+        } else {
+          child.kill(signalName);
+        }
       } catch {
         // The broker command group has already exited.
       }
