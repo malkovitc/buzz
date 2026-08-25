@@ -103,6 +103,7 @@ export class PiAcpAdapter {
   async shutdown() {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.currentPrompt?.brokerAbortController.abort();
     this.#stopPi();
   }
 
@@ -193,7 +194,7 @@ export class PiAcpAdapter {
           },
           mcpCapabilities: { http: false, sse: false },
         },
-        agentInfo: { name: "pi-acp", version: "0.2.0" },
+        agentInfo: { name: "pi-acp", version: "0.2.1" },
         _meta: {
           steering: { supported: true },
           pilot: { liveCanaryValidated: true, fleetApproved: false },
@@ -383,6 +384,7 @@ export class PiAcpAdapter {
       sessionId: session.id,
       buzzContext,
       cancelled: false,
+      brokerAbortController: new AbortController(),
       usage: emptyUsage(),
       finalStopReason: "end_turn",
     };
@@ -417,6 +419,7 @@ export class PiAcpAdapter {
     )
       return;
     this.currentPrompt.cancelled = true;
+    this.currentPrompt.brokerAbortController.abort();
     try {
       await this.#sendPiCommand("abort");
     } catch (error) {
@@ -513,34 +516,30 @@ export class PiAcpAdapter {
 
   async #brokerTool(event) {
     const tool = this.brokerTools.get(event.toolName);
-    if (!tool || !this.currentPrompt) {
-      writeJsonl(this.pi?.stdin, {
-        type: "broker_tool_response",
-        id: event.id,
-        success: false,
-        error: "brokered tool is unavailable outside an active prompt",
-      });
-      return;
-    }
+    const prompt = this.currentPrompt;
+    const brokerInput = this.pi?.stdin;
+    if (!tool || !prompt || !brokerInput?.writable) return;
     try {
       const result = await tool.execute(
         String(event.id),
         event.args ?? {},
-        new AbortController().signal,
+        prompt.brokerAbortController.signal,
       );
-      writeJsonl(this.pi?.stdin, {
-        type: "broker_tool_response",
-        id: event.id,
-        success: true,
-        result,
-      });
+      if (brokerInput.writable)
+        writeJsonl(brokerInput, {
+          type: "broker_tool_response",
+          id: event.id,
+          success: true,
+          result,
+        });
     } catch (error) {
-      writeJsonl(this.pi?.stdin, {
-        type: "broker_tool_response",
-        id: event.id,
-        success: false,
-        error: error.message,
-      });
+      if (brokerInput.writable)
+        writeJsonl(brokerInput, {
+          type: "broker_tool_response",
+          id: event.id,
+          success: false,
+          error: error.message,
+        });
     }
   }
 
@@ -627,6 +626,7 @@ export class PiAcpAdapter {
   #settlePrompt() {
     const prompt = this.currentPrompt;
     if (!prompt) return;
+    prompt.brokerAbortController.abort();
     this.currentPrompt = null;
     const usage = prompt.usage;
     const session = this.sessions.get(prompt.sessionId);
@@ -677,6 +677,7 @@ export class PiAcpAdapter {
   #failPrompt(error) {
     const prompt = this.currentPrompt;
     if (!prompt) return;
+    prompt.brokerAbortController.abort();
     this.currentPrompt = null;
     this.#send(rpcError(prompt.acpId, INTERNAL_ERROR, error.message));
     this.#stopPi();
@@ -688,6 +689,7 @@ export class PiAcpAdapter {
     for (const pending of this.piResponses.values()) pending.reject(error);
     this.piResponses.clear();
     if (this.currentPrompt) {
+      this.currentPrompt.brokerAbortController.abort();
       this.#send(
         rpcError(this.currentPrompt.acpId, INTERNAL_ERROR, error.message),
       );

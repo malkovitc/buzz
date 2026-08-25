@@ -188,6 +188,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         // Verified: `codex login status` exits 0 when logged in, non-zero otherwise.
         auth_probe_args: Some(&["codex", "login", "status"]),
     },
+    #[cfg(not(windows))]
     pi_runtime::PI_RUNTIME,
     KnownAcpRuntime {
         id: "buzz-agent",
@@ -956,7 +957,6 @@ pub(crate) fn classify_runtime(
         (AcpAvailabilityStatus::NotInstalled, None, None)
     }
 }
-
 /// The oldest `codex-acp` version supported by Buzz managed agents.
 ///
 /// Older 1.x adapters are detected successfully, but can still bundle a Codex runtime

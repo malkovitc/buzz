@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -22,10 +22,16 @@ function validateContext(context) {
   if (
     !Array.isArray(context.triggeringEventIds) ||
     context.triggeringEventIds.length === 0 ||
-    !context.triggeringEventIds.every((eventId) => HEX_EVENT.test(eventId)) ||
-    !context.triggeringEventIds.includes(context.replyTo)
+    !context.triggeringEventIds.every((eventId) => HEX_EVENT.test(eventId))
   ) {
     throw new Error("authenticated Buzz triggering event set is invalid");
+  }
+  if (
+    !Array.isArray(context.allowedReplyEventIds) ||
+    !context.allowedReplyEventIds.every((eventId) => HEX_EVENT.test(eventId)) ||
+    !context.allowedReplyEventIds.includes(context.replyTo)
+  ) {
+    throw new Error("authenticated Buzz reply authorization set is invalid");
   }
   return context;
 }
@@ -41,13 +47,38 @@ async function run(
 ) {
   return await new Promise((resolve, reject) => {
     let timer;
-    const child = spawn(command, args, {
-      env,
-      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-    });
-    let stdout = Buffer.alloc(0);
-    let stderr = Buffer.alloc(0);
+    let child;
     let settled = false;
+    let spawned = false;
+    let abortRequested = false;
+    const abortError = (preSpawn = false) => {
+      const error = new Error("tool execution aborted");
+      if (preSpawn) error.code = "PI_ACP_SAFE_UNSTARTED";
+      return error;
+    };
+    const terminate = (signalName) => {
+      if (!child) return;
+      try {
+        if (process.platform === "win32" && child.pid) {
+          const killed = spawnSync(
+            "taskkill",
+            ["/PID", String(child.pid), "/T", "/F"],
+            { stdio: "ignore", windowsHide: true },
+          );
+          if (killed.status !== 0) child.kill(signalName);
+        } else if (child.pid) {
+          process.kill(-child.pid, signalName);
+        } else {
+          child.kill(signalName);
+        }
+      } catch {
+        // The broker command group has already exited.
+      }
+    };
+    const abort = () => {
+      abortRequested = true;
+      terminate("SIGKILL");
+    };
     const finish = (error, result) => {
       if (settled) return;
       settled = true;
@@ -56,22 +87,53 @@ async function run(
       if (error) reject(error);
       else resolve(result);
     };
+    if (signal?.aborted) {
+      finish(abortError(true));
+      return;
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    if (abortRequested) {
+      finish(abortError(true));
+      return;
+    }
+    child = spawn(command, args, {
+      env,
+      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    if (abortRequested) {
+      terminate("SIGKILL");
+      finish(abortError());
+      return;
+    }
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
     const append = (current, chunk) => {
       const next = Buffer.concat([current, chunk]);
       if (next.length > MAX_OUTPUT_BYTES) {
-        child.kill("SIGKILL");
+        terminate("SIGKILL");
         finish(new Error(`tool output exceeds ${MAX_OUTPUT_BYTES} bytes`));
       }
       return next;
     };
+    child.once("spawn", () => {
+      spawned = true;
+    });
     child.stdout.on("data", (chunk) => {
       stdout = append(stdout, chunk);
     });
     child.stderr.on("data", (chunk) => {
       stderr = append(stderr, chunk);
     });
-    child.on("error", (error) => finish(error));
+    child.on("error", (error) => {
+      if (!spawned) error.code = "PI_ACP_SAFE_UNSTARTED";
+      finish(error);
+    });
     child.on("exit", (code, exitSignal) => {
+      // A wrapper may exit after backgrounding the real publisher. Always
+      // reap the whole broker tree before accepting the leader's result.
+      terminate("SIGKILL");
       const result = {
         code,
         signal: exitSignal,
@@ -84,10 +146,8 @@ async function run(
           new Error(result.stderr || `${command} exited with code ${code}`),
         );
     });
-    const abort = () => child.kill("SIGTERM");
-    signal?.addEventListener("abort", abort, { once: true });
     timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      terminate("SIGKILL");
       finish(new Error(`${command} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
     if (input !== undefined) child.stdin.end(input);
@@ -190,22 +250,30 @@ export function createBuzzTools({
         });
       }
       const command = env.PI_ACP_BUZZ_COMMAND || "buzz";
-      const result = await runCommand(
-        command,
-        [
-          "--format",
-          "compact",
-          "messages",
-          "send",
-          "--channel",
-          context.channelId,
-          "--reply-to",
-          context.replyTo,
-          "--content",
-          "-",
-        ],
-        { input: content, signal, env },
-      );
+      let result;
+      try {
+        result = await runCommand(
+          command,
+          [
+            "--format",
+            "compact",
+            "messages",
+            "send",
+            "--channel",
+            context.channelId,
+            "--reply-to",
+            context.replyTo,
+            "--content",
+            "-",
+          ],
+          { input: content, signal, env },
+        );
+      } catch (error) {
+        if (error.code === "PI_ACP_SAFE_UNSTARTED") {
+          await fs.rm(reservation.directory, { recursive: true, force: true });
+        }
+        throw error;
+      }
       let response;
       try {
         response = JSON.parse(result.stdout);
@@ -278,4 +346,4 @@ export function createBuzzTools({
   return [buzzReply, kanbanTasks];
 }
 
-export const testOnly = { validateContext, reservationKey };
+export const testOnly = { validateContext, reservationKey, run };

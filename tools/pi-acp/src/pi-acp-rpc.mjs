@@ -3,8 +3,14 @@
 import { PiAcpAdapter } from "./adapter.mjs";
 
 if (process.argv.includes("--version") || process.argv.includes("-V")) {
-  process.stdout.write("pi-acp 0.2.0\n");
+  process.stdout.write("pi-acp 0.2.1\n");
   process.exit(0);
+}
+if (process.platform === "win32") {
+  process.stderr.write(
+    "pi-acp: this internal pilot supports macOS and Linux only\n",
+  );
+  process.exit(1);
 }
 
 const adapter = new PiAcpAdapter({

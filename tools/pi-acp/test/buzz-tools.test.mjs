@@ -8,6 +8,7 @@ import { createBuzzTools, testOnly } from "../src/buzz-tools.mjs";
 const context = {
   channelId: "4dcab690-a2ca-4a56-9e5d-d901d12f83c3",
   triggeringEventIds: ["a".repeat(64)],
+  allowedReplyEventIds: ["a".repeat(64)],
   replyTo: "a".repeat(64),
 };
 const eventId = "b".repeat(64);
@@ -109,7 +110,7 @@ test("buzz_reply fails closed after an ambiguous reserved publication", async (t
 test("buzz_reply rejects unbound reply targets", async () => {
   const invalid = {
     ...context,
-    triggeringEventIds: ["c".repeat(64)],
+    allowedReplyEventIds: ["c".repeat(64)],
   };
   const [reply] = createBuzzTools({
     getContext: () => invalid,
@@ -118,8 +119,81 @@ test("buzz_reply rejects unbound reply targets", async () => {
   });
   await assert.rejects(
     reply.execute("call", { content: "answer" }),
-    /triggering event set is invalid/,
+    /reply authorization set is invalid/,
   );
+});
+
+test("pre-spawn abort releases the safe publication reservation", async (t) => {
+  const f = await fixture(t, testOnly.run);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    f.reply.execute("call", { content: "safe to retry" }, controller.signal),
+    /aborted/,
+  );
+  assert.deepEqual(await fs.readdir(f.receiptDir), []);
+});
+
+test("missing publisher executables release the unstarted reservation", async (t) => {
+  const f = await fixture(t, testOnly.run);
+  await assert.rejects(
+    f.reply.execute("call", { content: "retry after install" }),
+    (error) => error.code === "PI_ACP_SAFE_UNSTARTED",
+  );
+  assert.deepEqual(await fs.readdir(f.receiptDir), []);
+});
+
+test("pre-aborted command signals never spawn a publication process", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-abort-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const marker = path.join(dir, "spawned");
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    testOnly.run(
+      process.execPath,
+      ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, '')`],
+      { signal: controller.signal },
+    ),
+    (error) =>
+      error.message.includes("aborted") &&
+      error.code === "PI_ACP_SAFE_UNSTARTED",
+  );
+  await assert.rejects(fs.access(marker));
+});
+
+test("aborting a wrapper terminates its publication process group", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-group-abort-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const marker = path.join(dir, "descendant-published");
+  const childCode = `process.on('SIGTERM', () => {}); setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, ''), 600)`;
+  const controller = new AbortController();
+  const running = testOnly.run(
+    "/bin/sh",
+    ["-c", `${process.execPath} -e ${JSON.stringify(childCode)} & wait`],
+    { signal: controller.signal },
+  );
+  setTimeout(() => controller.abort(), 100);
+  await assert.rejects(running);
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  await assert.rejects(fs.access(marker));
+});
+
+test("an exited wrapper cannot leave a background publisher alive", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-wrapper-exit-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const marker = path.join(dir, "background-published");
+  const childCode = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, ''), 500)`;
+  await testOnly.run("/bin/sh", [
+    "-c",
+    `${process.execPath} -e ${JSON.stringify(childCode)} >/dev/null 2>&1 &`,
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  await assert.rejects(fs.access(marker));
 });
 
 test("kanban_tasks emits one bounded filtered compact query", async (t) => {

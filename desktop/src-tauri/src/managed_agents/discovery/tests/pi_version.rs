@@ -1,12 +1,13 @@
 use super::super::{known_acp_runtime_exact, normalize_agent_args};
 
+#[cfg(not(windows))]
 #[test]
 fn pilot_runtime_uses_managed_adapter_without_legacy_acp_args() {
     let runtime = known_acp_runtime_exact("pi").expect("Pi pilot runtime should exist");
     assert_eq!(runtime.commands, &["pi-acp"]);
     assert_eq!(runtime.underlying_cli, Some("pi"));
     assert_eq!(runtime.adapter_install_commands.len(), 1);
-    assert!(runtime.adapter_install_commands[0].contains("buzz-pi-acp-0.2.0.tgz"));
+    assert!(runtime.adapter_install_commands[0].contains("buzz-pi-acp-0.2.1.tgz"));
     assert_eq!(
         normalize_agent_args("pi-acp", vec!["acp".into()]),
         Vec::<String>::new()
@@ -31,7 +32,7 @@ fn rejects_stale_and_accepts_brokered_release() {
         AcpAvailabilityStatus::AdapterOutdated
     );
 
-    std::fs::write(&bin, "#!/bin/sh\necho 'pi-acp 0.2.0'\n").expect("write current script");
+    std::fs::write(&bin, "#!/bin/sh\necho 'pi-acp 0.2.1'\n").expect("write current script");
     assert_eq!(
         pi_adapter_availability(&bin),
         AcpAvailabilityStatus::Available

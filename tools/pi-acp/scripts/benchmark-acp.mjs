@@ -131,6 +131,7 @@ try {
         buzz: {
           channelId: "4dcab690-a2ca-4a56-9e5d-d901d12f83c3",
           triggeringEventIds: [eventId],
+          allowedReplyEventIds: [eventId],
           replyTo: eventId,
         },
       },

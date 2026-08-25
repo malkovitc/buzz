@@ -6,6 +6,8 @@ routing, identity, deadlines, deduplication, and NIP-AM publication.
 
 Status: live production canary validated on Caliper; not the default runtime and not approved for fleet rollout. See [`../../docs/pi-acp-production-canary-2026-08-25.md`](../../docs/pi-acp-production-canary-2026-08-25.md).
 
+The internal pilot supports macOS and Linux. Windows is rejected fail-closed and is not listed in the Desktop runtime catalog.
+
 ## Implemented
 
 - ACP `initialize`, `session/new`, `session/prompt`, `_session/steering`, and `session/cancel`;
@@ -40,7 +42,7 @@ From a reviewed exact Buzz commit:
 
 ```bash
 npm install --global ./tools/pi-acp
-pi-acp --version  # pi-acp 0.2.0 or newer
+pi-acp --version  # pi-acp 0.2.1 or newer
 ```
 
 The adapter uses Pi's existing provider authentication. Run Pi interactively once if the host has
