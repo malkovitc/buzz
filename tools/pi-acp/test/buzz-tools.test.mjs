@@ -159,6 +159,21 @@ test("aborting a wrapper terminates its publication process group", {
   await assert.rejects(fs.access(marker));
 });
 
+test("an exited wrapper cannot leave a background publisher alive", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-wrapper-exit-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const marker = path.join(dir, "background-published");
+  const childCode = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, ''), 500)`;
+  await testOnly.run("/bin/sh", [
+    "-c",
+    `${process.execPath} -e ${JSON.stringify(childCode)} >/dev/null 2>&1 &`,
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  await assert.rejects(fs.access(marker));
+});
+
 test("kanban_tasks emits one bounded filtered compact query", async (t) => {
   const calls = [];
   const f = await fixture(t, async (command, args) => {

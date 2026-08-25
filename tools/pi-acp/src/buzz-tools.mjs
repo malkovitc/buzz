@@ -120,6 +120,9 @@ async function run(
     });
     child.on("error", (error) => finish(error));
     child.on("exit", (code, exitSignal) => {
+      // A wrapper may exit after backgrounding the real publisher. Always
+      // reap the whole broker tree before accepting the leader's result.
+      terminate("SIGKILL");
       const result = {
         code,
         signal: exitSignal,
