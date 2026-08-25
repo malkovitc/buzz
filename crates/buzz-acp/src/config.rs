@@ -369,13 +369,13 @@ pub struct CliArgs {
 
     /// Maximum number of context messages to include for thread replies and DMs.
     /// Set to 0 to disable automatic context fetching. Max 100.
-    #[arg(long, env = "BUZZ_ACP_CONTEXT_MESSAGE_LIMIT", default_value_t = 6,
+    #[arg(long, env = "BUZZ_ACP_CONTEXT_MESSAGE_LIMIT", default_value_t = 12,
           value_parser = clap::value_parser!(u32).range(0..=100))]
     pub context_message_limit: u32,
 
     /// Maximum turns per session before proactive rotation. 0 = disabled
     /// (rotate only on MaxTokens / MaxTurnRequests).
-    #[arg(long, env = "BUZZ_ACP_MAX_TURNS_PER_SESSION", default_value_t = 8,
+    #[arg(long, env = "BUZZ_ACP_MAX_TURNS_PER_SESSION", default_value_t = 0,
           value_parser = clap::value_parser!(u32))]
     pub max_turns_per_session: u32,
 
@@ -2247,11 +2247,23 @@ channels = "ALL"
     }
 
     #[test]
-    fn context_defaults_bound_history_and_rotate_sessions() {
+    fn autonomous_bounds_remain_opt_in_product_defaults() {
         let key = "0".repeat(64);
-        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
-        assert_eq!(args.context_message_limit, 6);
-        assert_eq!(args.max_turns_per_session, 8);
+        let defaults = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert_eq!(defaults.context_message_limit, 12);
+        assert_eq!(defaults.max_turns_per_session, 0);
+
+        let bounded = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--context-message-limit",
+            "6",
+            "--max-turns-per-session",
+            "8",
+        ]);
+        assert_eq!(bounded.context_message_limit, 6);
+        assert_eq!(bounded.max_turns_per_session, 8);
     }
 
     #[test]

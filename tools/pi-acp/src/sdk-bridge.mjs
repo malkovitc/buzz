@@ -3,10 +3,11 @@
 import {
   createAgentSession,
   DefaultResourceLoader,
+  defineTool,
   getAgentDir,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { createBuzzTools } from "./buzz-tools.mjs";
+import { Type } from "typebox";
 import { EventBudget } from "./event-budget.mjs";
 import { attachJsonlReader, writeJsonl } from "./jsonl.mjs";
 
@@ -29,7 +30,21 @@ const budget = new EventBudget(limits);
 let session;
 let streaming = false;
 let disposed = false;
-let buzzContext = null;
+let brokerRequestId = 0;
+const brokerResponses = new Map();
+
+function callBroker(toolName, args) {
+  const id = `broker-${++brokerRequestId}`;
+  return new Promise((resolve, reject) => {
+    brokerResponses.set(id, { resolve, reject });
+    writeJsonl(process.stdout, {
+      type: "broker_tool_request",
+      id,
+      toolName,
+      args,
+    });
+  });
+}
 
 const budgetExtension = {
   name: "buzz-event-budget",
@@ -42,7 +57,39 @@ const builtInTools = (option("--tools") || process.env.PI_ACP_TOOLS || "read")
   .split(",")
   .map((value) => value.trim())
   .filter(Boolean);
-const customTools = createBuzzTools({ getContext: () => buzzContext });
+const customTools = [
+  defineTool({
+    name: "buzz_reply",
+    label: "Reply in Buzz",
+    description:
+      "Publish exactly one non-empty reply through the trusted Buzz broker. Routing is fixed by the harness.",
+    parameters: Type.Object({
+      content: Type.String({ minLength: 1, maxLength: 64 * 1024 }),
+    }),
+    execute: async (_toolCallId, params) =>
+      await callBroker("buzz_reply", params),
+  }),
+  defineTool({
+    name: "kanban_tasks",
+    label: "Read compact Kanban tasks",
+    description: "Read one bounded, filtered compact Kanban AI task list.",
+    parameters: Type.Object({
+      sprint: Type.Optional(Type.Integer({ minimum: 1 })),
+      status: Type.Optional(
+        Type.Union([
+          Type.Literal("todo"),
+          Type.Literal("in-progress"),
+          Type.Literal("done"),
+        ]),
+      ),
+      channel: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+      search: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+    }),
+    execute: async (_toolCallId, params) =>
+      await callBroker("kanban_tasks", params),
+  }),
+];
 const tools = [...builtInTools, ...customTools.map((tool) => tool.name)];
 const resourceLoader = new DefaultResourceLoader({
   cwd: process.cwd(),
@@ -69,10 +116,7 @@ const ready = (async () => {
   session.subscribe((event) => {
     writeJsonl(process.stdout, event);
     if (event.type === "agent_start") streaming = true;
-    if (event.type === "agent_settled") {
-      streaming = false;
-      buzzContext = null;
-    }
+    if (event.type === "agent_settled") streaming = false;
     if (event.type === "turn_start" && budget.onTurnStart() === "abort") {
       void session.abort();
     }
@@ -114,13 +158,16 @@ async function handle(command) {
           break;
         }
         budget.reset();
-        buzzContext = command.buzzContext;
         response(command, true);
         void session.prompt(command.message).catch((error) => {
           process.stderr.write(
             `[pi-acp-sdk] prompt failed: ${error.message}\n`,
           );
-          writeJsonl(process.stdout, { type: "agent_settled" });
+          streaming = false;
+          writeJsonl(process.stdout, {
+            type: "prompt_failed",
+            error: error.message,
+          });
         });
         break;
       case "steer":
@@ -146,7 +193,17 @@ async function handle(command) {
 
 attachJsonlReader(
   process.stdin,
-  (command) => void handle(command),
+  (command) => {
+    if (command?.type === "broker_tool_response") {
+      const pending = brokerResponses.get(command.id);
+      if (!pending) return;
+      brokerResponses.delete(command.id);
+      if (command.success) pending.resolve(command.result);
+      else pending.reject(new Error(command.error || "brokered tool failed"));
+      return;
+    }
+    void handle(command);
+  },
   (error) => process.stderr.write(`[pi-acp-sdk] ${error.message}\n`),
 );
 

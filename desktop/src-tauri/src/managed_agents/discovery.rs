@@ -197,11 +197,11 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         underlying_cli: Some("pi"),
         cli_install_commands: &["npm install -g @earendil-works/pi-coding-agent@0.84.2"],
         cli_install_commands_windows: &["npm install -g @earendil-works/pi-coding-agent@0.84.2"],
-        adapter_install_commands: &[],
+        adapter_install_commands: &["npm install -g https://github.com/malkovitc/buzz/releases/download/linza-patched-pi-v0.5.18/buzz-pi-acp-0.2.0.tgz"],
         cli_install_instructions_url: "https://github.com/badlogic/pi-mono",
-        adapter_install_instructions_url: "https://github.com/block/buzz/tree/main/tools/pi-acp",
+        adapter_install_instructions_url: "https://github.com/malkovitc/buzz/tree/linza-patched-pi-v0.5.18/tools/pi-acp",
         cli_install_hint: "Install Pi 0.84.2; the pi-acp pilot adapter is packaged separately.",
-        adapter_install_hint: "Install the reviewed pi-acp pilot package before selecting this runtime.",
+        adapter_install_hint: "Install the reviewed pi-acp 0.2.0 pilot package before selecting this runtime.",
         skill_dir: None,
         supports_acp_model_switching: false,
         model_env_var: None,
@@ -1006,6 +1006,8 @@ pub(crate) fn classify_runtime(
 /// agents, and only to a version already published on npm — every user below the floor is
 /// offered a reinstall on their next discovery pass.
 pub(crate) const MIN_CODEX_ACP_VERSION: (u64, u64, u64) = (1, 1, 7);
+/// Old Pi pilot adapters lack task isolation and the trusted publication broker.
+pub(crate) const MIN_PI_ACP_VERSION: (u64, u64, u64) = (0, 2, 0);
 
 /// Probe the full version of a `codex-acp` binary by running `--version`.
 ///
@@ -1120,6 +1122,13 @@ pub(crate) fn codex_adapter_availability(path: &Path) -> AcpAvailabilityStatus {
     }
 }
 
+pub(crate) fn pi_adapter_availability(path: &Path) -> AcpAvailabilityStatus {
+    match probe_codex_acp_version(path) {
+        Some(version) if version >= MIN_PI_ACP_VERSION => AcpAvailabilityStatus::Available,
+        _ => AcpAvailabilityStatus::AdapterOutdated,
+    }
+}
+
 /// Returns `true` when the codex-acp binary at `path` is below
 /// [`MIN_CODEX_ACP_VERSION`] or cannot be probed using `augmented_path`. Thin wrapper
 /// around [`codex_adapter_is_outdated_with_path`].
@@ -1182,6 +1191,16 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             }
         } else if let Some(cached) = adapter_availability_cached() {
             availability = cached;
+        }
+    }
+    // Pi is an internal pilot: always fail closed on an unprobed, stale, or
+    // unrelated adapter rather than advertising it as selectable.
+    if runtime.id == "pi"
+        && availability == AcpAvailabilityStatus::Available
+        && command.as_deref() == Some("pi-acp")
+    {
+        if let Some(path_str) = &binary_path {
+            availability = pi_adapter_availability(&PathBuf::from(path_str));
         }
     }
 

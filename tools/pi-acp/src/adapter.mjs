@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createBuzzTools } from "./buzz-tools.mjs";
 import { attachJsonlReader, writeJsonl } from "./jsonl.mjs";
 
 const SDK_BRIDGE_PATH = fileURLToPath(
@@ -76,13 +77,18 @@ export class PiAcpAdapter {
     this.output = output;
     this.errorOutput = errorOutput;
     this.env = env;
-    this.session = null;
+    this.sessions = new Map();
     this.pi = null;
     this.piRequestId = 0;
     this.piResponses = new Map();
     this.currentPrompt = null;
-    this.cumulative = emptyUsage();
     this.shuttingDown = false;
+    this.brokerTools = new Map(
+      createBuzzTools({
+        getContext: () => this.currentPrompt?.buzzContext,
+        env: this.env,
+      }).map((tool) => [tool.name, tool]),
+    );
   }
 
   start() {
@@ -97,6 +103,10 @@ export class PiAcpAdapter {
   async shutdown() {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.#stopPi();
+  }
+
+  #stopPi() {
     if (!this.pi) return;
     const child = this.pi;
     this.pi = null;
@@ -183,7 +193,7 @@ export class PiAcpAdapter {
           },
           mcpCapabilities: { http: false, sse: false },
         },
-        agentInfo: { name: "pi-acp", version: "0.1.0" },
+        agentInfo: { name: "pi-acp", version: "0.2.0" },
         _meta: {
           steering: { supported: true },
           pilot: { liveCanaryValidated: true, fleetApproved: false },
@@ -196,16 +206,6 @@ export class PiAcpAdapter {
     const cwd = message.params?.cwd;
     const systemPrompt = message.params?.systemPrompt;
     const mcpServers = message.params?.mcpServers;
-    if (this.session) {
-      this.#send(
-        rpcError(
-          message.id,
-          INVALID_PARAMS,
-          "session/new: RPC spike supports one task session per process",
-        ),
-      );
-      return;
-    }
     if (typeof cwd !== "string" || !path.isAbsolute(cwd)) {
       this.#send(
         rpcError(
@@ -260,8 +260,12 @@ export class PiAcpAdapter {
     }
 
     const sessionId = `pi_${crypto.randomUUID()}`;
-    await this.#spawnPi(cwd, systemPrompt);
-    this.session = { id: sessionId, cwd };
+    this.sessions.set(sessionId, {
+      id: sessionId,
+      cwd,
+      systemPrompt,
+      cumulative: emptyUsage(),
+    });
     this.#send(rpcResult(message.id, { sessionId }));
   }
 
@@ -287,9 +291,14 @@ export class PiAcpAdapter {
     args.push("--tools", this.env.PI_ACP_TOOLS || "read");
     if (systemPrompt?.trim()) args.push("--system-prompt", systemPrompt);
 
+    // The Pi SDK and its dependencies never receive the Buzz signing key.
+    // Publication is brokered by this trusted adapter process instead.
+    const childEnv = { ...this.env };
+    delete childEnv.BUZZ_PRIVATE_KEY;
+    delete childEnv.BUZZ_AUTH_TAG;
     const child = spawn(command, args, {
       cwd,
-      env: this.env,
+      env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
@@ -320,20 +329,25 @@ export class PiAcpAdapter {
     }
   }
 
-  #assertSession(params, id, stage) {
-    if (!this.session || params?.sessionId !== this.session.id) {
+  #sessionFor(params, id, stage) {
+    const session = this.sessions.get(params?.sessionId);
+    if (!session) {
       this.#send(rpcError(id, INVALID_PARAMS, `${stage}: unknown session`));
-      return false;
+      return null;
     }
-    return true;
+    return session;
   }
 
   async #sessionPrompt(message) {
-    if (!this.#assertSession(message.params, message.id, "session/prompt"))
-      return;
+    const session = this.#sessionFor(
+      message.params,
+      message.id,
+      "session/prompt",
+    );
+    if (!session) return;
     if (this.currentPrompt) {
       this.#send(
-        rpcError(message.id, INVALID_PARAMS, "session/prompt: session is busy"),
+        rpcError(message.id, INVALID_PARAMS, "session/prompt: adapter is busy"),
       );
       return;
     }
@@ -348,34 +362,43 @@ export class PiAcpAdapter {
       );
       return;
     }
-    this.currentPrompt = {
-      acpId: message.id,
-      cancelled: false,
-      usage: emptyUsage(),
-      finalStopReason: "end_turn",
-    };
-    const buzzContext = message.params?._meta?.buzz;
+    const buzzContext = message.params?._meta?.buzz ?? null;
     if (
-      !buzzContext ||
-      typeof buzzContext.channelId !== "string" ||
-      !Array.isArray(buzzContext.triggeringEventIds) ||
-      typeof buzzContext.replyTo !== "string"
+      buzzContext !== null &&
+      (typeof buzzContext.channelId !== "string" ||
+        !Array.isArray(buzzContext.triggeringEventIds) ||
+        typeof buzzContext.replyTo !== "string")
     ) {
-      this.currentPrompt = null;
       this.#send(
         rpcError(
           message.id,
           INVALID_PARAMS,
-          "session/prompt: authenticated _meta.buzz routing context is required",
+          "session/prompt: malformed authenticated _meta.buzz routing context",
         ),
       );
       return;
     }
+    this.currentPrompt = {
+      acpId: message.id,
+      sessionId: session.id,
+      buzzContext,
+      cancelled: false,
+      usage: emptyUsage(),
+      finalStopReason: "end_turn",
+    };
     try {
-      await this.#sendPiCommand("prompt", { message: text, buzzContext });
+      // A fresh SDK process/session for every task prevents history and cached
+      // context from crossing inbound event boundaries.
+      await this.#spawnPi(session.cwd, session.systemPrompt);
+      if (this.currentPrompt?.cancelled) {
+        this.#settlePrompt();
+        return;
+      }
+      await this.#sendPiCommand("prompt", { message: text });
     } catch (error) {
       const prompt = this.currentPrompt;
       this.currentPrompt = null;
+      this.#stopPi();
       if (prompt)
         this.#send(
           rpcError(
@@ -389,9 +412,8 @@ export class PiAcpAdapter {
 
   async #sessionCancel(params) {
     if (
-      !this.session ||
-      params?.sessionId !== this.session.id ||
-      !this.currentPrompt
+      !this.sessions.has(params?.sessionId) ||
+      this.currentPrompt?.sessionId !== params?.sessionId
     )
       return;
     this.currentPrompt.cancelled = true;
@@ -403,7 +425,8 @@ export class PiAcpAdapter {
   }
 
   async #steer(message) {
-    if (!this.#assertSession(message.params, message.id, "steering")) return;
+    const session = this.#sessionFor(message.params, message.id, "steering");
+    if (!session) return;
     const text = promptText(message.params?.prompt);
     if (!text) {
       this.#send(
@@ -415,7 +438,7 @@ export class PiAcpAdapter {
       );
       return;
     }
-    if (!this.currentPrompt) {
+    if (!this.currentPrompt || this.currentPrompt.sessionId !== session.id) {
       this.#send(
         rpcError(message.id, INVALID_PARAMS, "steering: no active prompt"),
       );
@@ -446,6 +469,10 @@ export class PiAcpAdapter {
         pending.reject(new Error(event.error || `${pending.command} failed`));
       return;
     }
+    if (event?.type === "broker_tool_request") {
+      void this.#brokerTool(event);
+      return;
+    }
     const prompt = this.currentPrompt;
     if (!prompt) return;
     switch (event?.type) {
@@ -467,6 +494,9 @@ export class PiAcpAdapter {
       case "agent_settled":
         this.#settlePrompt();
         break;
+      case "prompt_failed":
+        this.#failPrompt(new Error(event.error || "Pi prompt failed"));
+        break;
       case "extension_ui_request":
         if (["select", "confirm", "input", "editor"].includes(event.method)) {
           writeJsonl(this.pi.stdin, {
@@ -481,11 +511,46 @@ export class PiAcpAdapter {
     }
   }
 
+  async #brokerTool(event) {
+    const tool = this.brokerTools.get(event.toolName);
+    if (!tool || !this.currentPrompt) {
+      writeJsonl(this.pi?.stdin, {
+        type: "broker_tool_response",
+        id: event.id,
+        success: false,
+        error: "brokered tool is unavailable outside an active prompt",
+      });
+      return;
+    }
+    try {
+      const result = await tool.execute(
+        String(event.id),
+        event.args ?? {},
+        new AbortController().signal,
+      );
+      writeJsonl(this.pi?.stdin, {
+        type: "broker_tool_response",
+        id: event.id,
+        success: true,
+        result,
+      });
+    } catch (error) {
+      writeJsonl(this.pi?.stdin, {
+        type: "broker_tool_response",
+        id: event.id,
+        success: false,
+        error: error.message,
+      });
+    }
+  }
+
   #update(update) {
+    const sessionId = this.currentPrompt?.sessionId;
+    if (!sessionId) return;
     this.#send({
       jsonrpc: "2.0",
       method: "session/update",
-      params: { sessionId: this.session.id, update },
+      params: { sessionId, update },
     });
   }
 
@@ -564,6 +629,12 @@ export class PiAcpAdapter {
     if (!prompt) return;
     this.currentPrompt = null;
     const usage = prompt.usage;
+    const session = this.sessions.get(prompt.sessionId);
+    if (!session) {
+      this.#stopPi();
+      return;
+    }
+    const cumulative = session.cumulative;
     for (const key of [
       "input",
       "output",
@@ -572,40 +643,48 @@ export class PiAcpAdapter {
       "totalTokens",
       "cost",
     ]) {
-      this.cumulative[key] += usage[key];
+      cumulative[key] += usage[key];
     }
-    this.cumulative.totalReliable &&= usage.totalReliable;
-    this.cumulative.model = usage.model || this.cumulative.model;
+    cumulative.totalReliable &&= usage.totalReliable;
+    cumulative.model = usage.model || cumulative.model;
     const update = {
       sessionUpdate: "usage_update",
       used: 0,
       contextLimit: 0,
       accumulatedInputTokens:
-        this.cumulative.input +
-        this.cumulative.cacheRead +
-        this.cumulative.cacheWrite,
-      accumulatedOutputTokens: this.cumulative.output,
-      accumulatedCachedInputTokens: this.cumulative.cacheRead,
-      accumulatedCacheWriteTokens: this.cumulative.cacheWrite,
-      accumulatedCost: this.cumulative.cost,
-      model: this.cumulative.model,
+        cumulative.input + cumulative.cacheRead + cumulative.cacheWrite,
+      accumulatedOutputTokens: cumulative.output,
+      accumulatedCachedInputTokens: cumulative.cacheRead,
+      accumulatedCacheWriteTokens: cumulative.cacheWrite,
+      accumulatedCost: cumulative.cost,
+      model: cumulative.model,
     };
-    if (this.cumulative.totalReliable)
-      update.accumulatedTotalTokens = this.cumulative.totalTokens;
+    if (cumulative.totalReliable)
+      update.accumulatedTotalTokens = cumulative.totalTokens;
     this.#send({
       jsonrpc: "2.0",
       method: "_goose/unstable/session/update",
-      params: { sessionId: this.session.id, update },
+      params: { sessionId: prompt.sessionId, update },
     });
     this.#send(
       rpcResult(prompt.acpId, {
         stopReason: prompt.cancelled ? "cancelled" : prompt.finalStopReason,
       }),
     );
+    this.#stopPi();
+  }
+
+  #failPrompt(error) {
+    const prompt = this.currentPrompt;
+    if (!prompt) return;
+    this.currentPrompt = null;
+    this.#send(rpcError(prompt.acpId, INTERNAL_ERROR, error.message));
+    this.#stopPi();
   }
 
   #failPi(error) {
     this.#log(error.message);
+    this.pi = null;
     for (const pending of this.piResponses.values()) pending.reject(error);
     this.piResponses.clear();
     if (this.currentPrompt) {

@@ -10,11 +10,12 @@ Status: live production canary validated on Caliper; not the default runtime and
 
 - ACP `initialize`, `session/new`, `session/prompt`, `_session/steering`, and `session/cancel`;
 - strict LF-only JSONL framing, preserving U+2028/U+2029 inside JSON strings;
-- isolated in-memory Pi session per adapter process;
+- multiple ACP sessions per pooled adapter process, with a fresh in-memory Pi SDK process/session for every task;
 - extension, skill, template, theme, and context-file discovery disabled;
 - explicit built-in tool allowlist (`read` by default);
 - per-inbound-event turn, tool, and processed-token budgets with checkpoint steering and abort;
-- authoritative Buzz routing metadata supplied by `buzz-acp` under `_meta.buzz`;
+- authoritative Buzz routing metadata supplied by `buzz-acp` under `_meta.buzz` when publication is allowed;
+- trusted parent-side publication broker: the Pi SDK subprocess never receives `BUZZ_PRIVATE_KEY`;
 - typed `buzz_reply` with non-empty validation, fixed routing, connected stdin, atomic reservation,
   durable receipt replay, and fail-closed crash/network ambiguity handling;
 - typed bounded `kanban_tasks` that cannot download the full board;
@@ -39,7 +40,7 @@ From a reviewed exact Buzz commit:
 
 ```bash
 npm install --global ./tools/pi-acp
-pi-acp --version
+pi-acp --version  # pi-acp 0.2.0 or newer
 ```
 
 The adapter uses Pi's existing provider authentication. Run Pi interactively once if the host has

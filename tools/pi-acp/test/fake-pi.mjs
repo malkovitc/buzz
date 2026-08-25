@@ -75,6 +75,43 @@ attachJsonlReader(
         if (mode === "complete") timer = setTimeout(() => complete(), 10);
         else if (mode === "steer")
           timer = setTimeout(() => complete("unsteered"), 500);
+        else if (mode === "pid")
+          timer = setTimeout(() => complete(`pid:${process.pid}`), 10);
+        else if (mode === "key-check")
+          timer = setTimeout(
+            () =>
+              complete(
+                process.env.BUZZ_PRIVATE_KEY === undefined
+                  ? "key:missing"
+                  : "key:exposed",
+              ),
+            10,
+          );
+        else if (mode === "prompt-fail") {
+          active = false;
+          setTimeout(
+            () =>
+              writeJsonl(process.stdout, {
+                type: "prompt_failed",
+                error: "provider unavailable",
+              }),
+            5,
+          );
+        } else if (mode === "broker") {
+          writeJsonl(process.stdout, {
+            type: "broker_tool_request",
+            id: "broker-test",
+            toolName: "buzz_reply",
+            args: { content: "brokered reply" },
+          });
+        }
+        break;
+      case "broker_tool_response":
+        if (mode === "broker")
+          setTimeout(
+            () => complete(`broker:${command.success ? "ok" : command.error}`),
+            5,
+          );
         break;
       case "steer":
         clearTimeout(timer);
