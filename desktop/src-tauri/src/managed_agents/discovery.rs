@@ -11,6 +11,7 @@ use crate::managed_agents::{
 };
 mod auth_status_cache;
 mod login_shell;
+mod pi_runtime;
 mod presets;
 mod runtime_metadata;
 #[macro_use]
@@ -26,6 +27,7 @@ pub(crate) use presets::{
     preset_harness_ids,
 };
 use presets::{preset_catalog_entry, PRESET_HARNESSES};
+pub use runtime_metadata::missing_command_message;
 pub(crate) use runtime_metadata::KnownAcpRuntime;
 
 const GOOSE_AVATAR_URL: &str = "https://goose-docs.ai/img/logo_dark.png";
@@ -186,39 +188,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         // Verified: `codex login status` exits 0 when logged in, non-zero otherwise.
         auth_probe_args: Some(&["codex", "login", "status"]),
     },
-    KnownAcpRuntime {
-        id: "pi",
-        label: "Pi (pilot)",
-        commands: &["pi-acp"],
-        aliases: &[],
-        avatar_url: BUZZ_AGENT_AVATAR_URL,
-        mcp_command: None,
-        mcp_hooks: false,
-        underlying_cli: Some("pi"),
-        cli_install_commands: &["npm install -g @earendil-works/pi-coding-agent@0.84.2"],
-        cli_install_commands_windows: &["npm install -g @earendil-works/pi-coding-agent@0.84.2"],
-        adapter_install_commands: &["npm install -g https://github.com/malkovitc/buzz/releases/download/linza-patched-pi-v0.5.18.1/buzz-pi-acp-0.2.0.tgz"],
-        cli_install_instructions_url: "https://github.com/badlogic/pi-mono",
-        adapter_install_instructions_url: "https://github.com/malkovitc/buzz/tree/linza-patched-pi-v0.5.18.1/tools/pi-acp",
-        cli_install_hint: "Install Pi 0.84.2; the pi-acp pilot adapter is packaged separately.",
-        adapter_install_hint: "Install the reviewed pi-acp 0.2.0 pilot package before selecting this runtime.",
-        skill_dir: None,
-        supports_acp_model_switching: false,
-        model_env_var: None,
-        provider_env_var: None,
-        provider_locked: true,
-        default_env: &[],
-        config_file_path: Some("~/.pi/agent/settings.json"),
-        config_file_format: Some("json"),
-        supports_acp_native_config: false,
-        thinking_env_var: None,
-        max_tokens_env_var: None,
-        context_limit_env_var: None,
-        max_rounds_env_var: None,
-        required_normalized_fields: &[],
-        login_hint: Some("Run Pi interactively once to configure provider authentication."),
-        auth_probe_args: None,
-    },
+    pi_runtime::PI_RUNTIME,
     KnownAcpRuntime {
         id: "buzz-agent",
         label: "Buzz Agent",
@@ -961,16 +931,6 @@ pub fn command_availability(command: &str) -> CommandAvailabilityInfo {
     }
 }
 
-pub fn missing_command_message(command: &str, role: &str) -> String {
-    if command_looks_like_path(command) {
-        return format!("{role} `{command}` does not exist.");
-    }
-
-    format!(
-        "{role} `{command}` was not found. Make sure it is installed and on your PATH. Antivirus software can quarantine bundled binaries — if that happened, restore the file or reinstall Buzz. (Source builds: see TESTING.md.)"
-    )
-}
-
 pub(crate) fn classify_runtime(
     adapter_result: Option<(&str, PathBuf)>,
     underlying_cli: Option<&str>,
@@ -1006,8 +966,6 @@ pub(crate) fn classify_runtime(
 /// agents, and only to a version already published on npm — every user below the floor is
 /// offered a reinstall on their next discovery pass.
 pub(crate) const MIN_CODEX_ACP_VERSION: (u64, u64, u64) = (1, 1, 7);
-/// Old Pi pilot adapters lack task isolation and the trusted publication broker.
-pub(crate) const MIN_PI_ACP_VERSION: (u64, u64, u64) = (0, 2, 0);
 
 /// Probe the full version of a `codex-acp` binary by running `--version`.
 ///
@@ -1122,13 +1080,6 @@ pub(crate) fn codex_adapter_availability(path: &Path) -> AcpAvailabilityStatus {
     }
 }
 
-pub(crate) fn pi_adapter_availability(path: &Path) -> AcpAvailabilityStatus {
-    match probe_codex_acp_version(path) {
-        Some(version) if version >= MIN_PI_ACP_VERSION => AcpAvailabilityStatus::Available,
-        _ => AcpAvailabilityStatus::AdapterOutdated,
-    }
-}
-
 /// Returns `true` when the codex-acp binary at `path` is below
 /// [`MIN_CODEX_ACP_VERSION`] or cannot be probed using `augmented_path`. Thin wrapper
 /// around [`codex_adapter_is_outdated_with_path`].
@@ -1193,15 +1144,9 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             availability = cached;
         }
     }
-    // Pi is an internal pilot: always fail closed on an unprobed, stale, or
-    // unrelated adapter rather than advertising it as selectable.
-    if runtime.id == "pi"
-        && availability == AcpAvailabilityStatus::Available
-        && command.as_deref() == Some("pi-acp")
-    {
-        if let Some(path_str) = &binary_path {
-            availability = pi_adapter_availability(&PathBuf::from(path_str));
-        }
+    if runtime.id == "pi" {
+        availability =
+            pi_runtime::gate_adapter(availability, command.as_deref(), binary_path.as_deref());
     }
 
     // Warm the adapter-availability cache for the badge fallback.

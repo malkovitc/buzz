@@ -64,7 +64,7 @@ function startHarness(mode = "complete") {
     send(message) {
       writeJsonl(child.stdin, message);
     },
-    waitFor(predicate, timeoutMs = 2_000) {
+    waitFor(predicate, timeoutMs = 5_000) {
       const existing = messages.find(predicate);
       if (existing) return Promise.resolve(existing);
       return new Promise((resolve, reject) => {

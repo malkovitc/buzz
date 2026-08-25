@@ -5,10 +5,9 @@ use super::{
     apply_agent_command_update, classify_runtime, codex_adapter_availability,
     codex_adapter_is_outdated, create_time_agent_command_override, default_agent_command,
     effective_agent_command, find_nvm_default_bin, is_login_shell_path_uninit, is_safe_nvm_tag,
-    known_acp_runtime_exact, managed_agent_avatar_url, normalize_agent_args, parse_semver_tag,
-    pi_adapter_availability, probe_codex_acp_version, record_agent_command,
-    refresh_login_shell_path, try_record_agent_command, BUZZ_AGENT_AVATAR_URL,
-    CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL,
+    managed_agent_avatar_url, normalize_agent_args, parse_semver_tag, probe_codex_acp_version,
+    record_agent_command, refresh_login_shell_path, try_record_agent_command,
+    BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL,
 };
 use crate::managed_agents::AcpAvailabilityStatus;
 
@@ -40,11 +39,6 @@ fn resolves_known_avatar_for_command_paths_and_aliases() {
 }
 
 #[test]
-fn returns_none_for_unknown_commands() {
-    assert!(managed_agent_avatar_url("custom-agent").is_none());
-}
-
-#[test]
 fn default_agent_command_resolves_bundled_buzz_agent() {
     // The default must be bundled buzz-agent, never bare `goose` on a stock Windows install.
     assert_eq!(default_agent_command(), "buzz-agent");
@@ -66,19 +60,6 @@ fn normalizes_claude_and_codex_args_to_empty() {
     );
     assert_eq!(
         normalize_agent_args("codex-acp", vec!["acp".into()]),
-        Vec::<String>::new()
-    );
-}
-
-#[test]
-fn pi_pilot_runtime_uses_managed_adapter_without_legacy_acp_args() {
-    let runtime = known_acp_runtime_exact("pi").expect("Pi pilot runtime should exist");
-    assert_eq!(runtime.commands, &["pi-acp"]);
-    assert_eq!(runtime.underlying_cli, Some("pi"));
-    assert_eq!(runtime.adapter_install_commands.len(), 1);
-    assert!(runtime.adapter_install_commands[0].contains("buzz-pi-acp-0.2.0.tgz"));
-    assert_eq!(
-        normalize_agent_args("pi-acp", vec!["acp".into()]),
         Vec::<String>::new()
     );
 }
@@ -663,6 +644,7 @@ fn apply_agent_command_update_concrete_pin_keeps_materialized_runtime() {
 
 // ── probe_codex_acp_version ───────────────────────────────────────────────────
 
+mod basic;
 mod forced_discovery;
 mod managed_path_resolution;
 #[cfg(unix)]
@@ -692,29 +674,7 @@ fn probe_codex_acp_version_parses_full_semver_output() {
 }
 
 mod codex_version;
-
-#[cfg(unix)]
-#[test]
-fn pi_adapter_version_gate_rejects_stale_and_accepts_brokered_release() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = std::env::temp_dir().join(format!("buzz-probe-pi-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let bin = dir.join("pi-acp");
-    std::fs::write(&bin, "#!/bin/sh\necho 'pi-acp 0.1.0'\n").expect("write stale script");
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod script");
-    assert_eq!(
-        pi_adapter_availability(&bin),
-        AcpAvailabilityStatus::AdapterOutdated
-    );
-
-    std::fs::write(&bin, "#!/bin/sh\necho 'pi-acp 0.2.0'\n").expect("write current script");
-    assert_eq!(
-        pi_adapter_availability(&bin),
-        AcpAvailabilityStatus::Available
-    );
-    let _ = std::fs::remove_dir_all(dir);
-}
+mod pi_version;
 
 #[cfg(unix)]
 #[test]
