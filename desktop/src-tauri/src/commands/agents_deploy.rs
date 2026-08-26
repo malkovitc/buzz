@@ -113,9 +113,12 @@ pub(super) fn build_launch_block(
         policy_env.insert(SESSION_TITLE_ENV_VAR.into(), value.clone());
         policy_env.insert(DISPLAY_NAME_ENV_VAR.into(), value);
     }
-    if let Some(value) =
-        crate::managed_agents::spawn_snapshot::effective_team_instructions(record, teams)
-    {
+    let team_instructions = crate::managed_agents::spawn_snapshot::team_instructions_for_env(
+        record,
+        teams,
+        &descriptor.env,
+    );
+    if let Some(value) = team_instructions {
         policy_env.insert("BUZZ_ACP_TEAM_INSTRUCTIONS".into(), value);
     }
 
@@ -343,6 +346,30 @@ mod tests {
         assert_eq!(launch["policy_env"]["BUZZ_ACP_MAX_TURN_DURATION"], "23");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_AGENTS"], "4");
         assert_eq!(launch["owner_pubkey"], "owner-hex");
+    }
+
+    #[test]
+    fn launch_block_file_instructions_suppress_conflicting_inline_policy() {
+        let record = record();
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "goose".into(),
+            args: vec!["acp".into()],
+            env: BTreeMap::from([(
+                "BUZZ_ACP_TEAM_INSTRUCTIONS_FILE".into(),
+                "/srv/team.md".into(),
+            )]),
+        };
+        let teams: Vec<TeamRecord> = serde_json::from_value(serde_json::json!([{
+            "id": "team-1", "name": "Team", "instructions": "Coordinate", "persona_ids": [], "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }])).unwrap();
+
+        let launch = build_launch_block(&record, &descriptor, &teams, None, None, "owner-hex");
+
+        assert!(launch["policy_env"]["BUZZ_ACP_TEAM_INSTRUCTIONS"].is_null());
+        assert_eq!(
+            launch["env"]["BUZZ_ACP_TEAM_INSTRUCTIONS_FILE"],
+            "/srv/team.md"
+        );
     }
 
     #[test]
