@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use buzz_core::kind::is_ephemeral;
 use tracing::{error, warn};
 
 /// Errors that can occur during filter expression evaluation.
@@ -373,6 +374,12 @@ pub async fn match_event(
 ) -> Option<MatchedRule> {
     let filter_ctx = FilterContext::from_event(event, channel_id);
 
+    // Ephemeral kinds (typing/presence/etc.) never match a subscription rule.
+    // Wildcard (`kinds = []`) must not wake agents on empty kind-20002 pings.
+    if is_ephemeral(event.kind.as_u16() as u32) {
+        return None;
+    }
+
     for (index, rule) in rules.iter().enumerate() {
         // 1. Channel scope check.
         if !rule.channels.matches(&channel_id) {
@@ -607,6 +614,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_match_event_rejects_ephemeral_typing_even_on_wildcard() {
+        // Subscribe-all / empty kinds must still never match kind-20002.
+        let rules = [make_rule(
+            "all",
+            ChannelScope::All("all".into()),
+            vec![],
+            false,
+            None,
+            None,
+        )];
+        let event = make_event(20002, "");
+        let channel_id = any_channel();
+        let result = match_event(&event, channel_id, &rules, "").await;
+        assert!(result.is_none(), "typing indicators must never match");
+    }
+
+    #[tokio::test]
     async fn test_match_event_kind_filter() {
         let event = make_event(9, "hello");
         let channel_id = any_channel();
@@ -661,6 +685,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(matched.prompt_tag, "mentioned");
+    }
+
+    #[tokio::test]
+    async fn test_forum_defaults_still_require_a_real_p_tag() {
+        let agent_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let channel_id = any_channel();
+        let rules = [make_rule(
+            "forum-mentions",
+            ChannelScope::All("all".into()),
+            crate::config::default_mentions_kinds(),
+            true,
+            None,
+            None,
+        )];
+
+        for kind in [
+            buzz_core::kind::KIND_FORUM_POST,
+            buzz_core::kind::KIND_FORUM_COMMENT,
+        ] {
+            assert!(
+                match_event(&make_event(kind, "hello"), channel_id, &rules, agent_pubkey)
+                    .await
+                    .is_none(),
+                "forum kind {kind} must not match without a p tag"
+            );
+            assert!(
+                match_event(
+                    &make_event_with_p_tag(kind, "hello", agent_pubkey),
+                    channel_id,
+                    &rules,
+                    agent_pubkey,
+                )
+                .await
+                .is_some(),
+                "forum kind {kind} must match with the agent p tag"
+            );
+        }
+
+        assert!(
+            match_event(
+                &make_event_with_p_tag(buzz_core::kind::KIND_FORUM_VOTE, "vote", agent_pubkey,),
+                channel_id,
+                &rules,
+                agent_pubkey,
+            )
+            .await
+            .is_none(),
+            "forum votes are never in the default summon set"
+        );
     }
 
     #[tokio::test]
