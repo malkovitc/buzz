@@ -14,7 +14,10 @@ import {
   REPLAY_BATCH_SIZE,
   shouldPageReconnectReplay,
 } from "./relayReconnectReplay.ts";
-import { buildChannelFilter } from "./relayChannelFilters.ts";
+import {
+  buildChannelFilter,
+  buildChannelLiveFilter,
+} from "./relayChannelFilters.ts";
 import {
   flushEvents,
   markReconnectLiveEose,
@@ -131,7 +134,7 @@ test("native and E2E repair kinds stay coupled to the live channel filter", asyn
     readFile("src-tauri/src/commands/channel_reconnect_repair.rs", "utf8"),
     readFile("src/testing/e2eBridge.ts", "utf8"),
   ]);
-  const expectedKinds = [...buildChannelFilter("channel-1", 50).kinds].sort(
+  const expectedKinds = [...buildChannelLiveFilter("channel-1").kinds].sort(
     (left, right) => left - right,
   );
   assert.deepEqual(

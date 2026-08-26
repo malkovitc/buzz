@@ -4,7 +4,9 @@ import test from "node:test";
 import {
   handleRelayClosed,
   handleSubscriptionEose,
+  markReconnectLiveEose,
   prepareBufferedSubscriptionEvent,
+  shouldDispatchSubscriptionEvent,
 } from "./relayClosedRecovery.ts";
 import {
   requestFirstEventGated,
@@ -562,6 +564,62 @@ test("failed CLOSED repair retries only the repair and keeps the restored live R
     3_000 - RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS,
   );
   assert.equal(subscriptions.get("live-repair-failure"), subscription);
+});
+
+test("exhausted partial CLOSED repairs flush before releasing replay dedupe", async () => {
+  resetAll(0);
+  const channelId = "ch-partial-repair";
+  const delivered = [];
+  const queued = [];
+  const page = Array.from({ length: 500 }, (_, index) => ({
+    id: index.toString(16).padStart(64, "0"),
+    pubkey: "a".repeat(64),
+    created_at: 2_000 - index,
+    kind: 9,
+    tags: [["h", channelId]],
+    content: `partial ${index}`,
+    sig: "b".repeat(128),
+  }));
+  const subscription = {
+    mode: "live",
+    filter: buildChannelLiveFilter(channelId),
+    onEvent: (event) => delivered.push(event.id),
+    lastSeenCreatedAt: 1_000,
+  };
+  const subscriptions = new Map([["live-partial", subscription]]);
+  let repairCalls = 0;
+
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-partial",
+    message: "error: temporary relay failure",
+    sendReq: async () => {
+      markReconnectLiveEose(subscription, 9);
+    },
+    requestRepair: async () => {
+      repairCalls += 1;
+      if (repairCalls % 2 === 1) return page;
+      throw new Error("later repair page unavailable");
+    },
+    replaySubscriptionEvent: (_subId, event) => queued.push(event),
+    flushReplayEvents: () => {
+      for (const event of queued.splice(0)) {
+        if (shouldDispatchSubscriptionEvent(subscription, event)) {
+          subscription.onEvent(event);
+        }
+      }
+    },
+    generation: 9,
+  });
+
+  tickTo(1_001);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(repairCalls, PAGE_REPLAY_MAX_ATTEMPTS * 2);
+  assert.equal(delivered.length, page.length);
+  assert.equal(new Set(delivered).size, page.length);
+  assert.equal(subscription.reconnectReplay, undefined);
+  assert.notEqual(subscription.pendingReplaySince, undefined);
 });
 
 test("CLOSED retry repairs more than the live limit from accepted author time", async () => {

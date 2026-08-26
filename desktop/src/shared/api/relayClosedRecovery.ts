@@ -228,8 +228,10 @@ function recoverLiveSubscriptionFromClosed({
             error,
           );
           if (attempt === PAGE_REPLAY_MAX_ATTEMPTS) {
-            // The live REQ is already healthy. Keep its unresolved floor for
-            // the next reconnect, but release this generation's dedupe state.
+            // Partial attempts may have queued rows. Dispatch them while the
+            // cross-attempt/live dedupe set still exists, then release this
+            // generation without clearing the unresolved floor.
+            flushReplayEvents?.();
             markReconnectRepairDone(subscription, generation);
             return;
           }
