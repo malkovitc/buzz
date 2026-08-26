@@ -945,7 +945,7 @@ test("disposed subscription receives no repair events after an in-flight page", 
   assert.deepEqual(delivered, []);
 });
 
-test("stale repair cannot clear the successor generation dedupe state", async () => {
+test("overlapping repair cannot mutate successor dedupe in the same generation", async () => {
   resetGate();
   const duplicate = event("successor-seen", 1001);
   const subscription = {
@@ -955,7 +955,6 @@ test("stale repair cannot clear the successor generation dedupe state", async ()
     lastSeenCreatedAt: 1000,
   };
   const subscriptions = new Map([["live-1", subscription]]);
-  let generationActive = true;
   let startRepair;
   const repairStarted = new Promise((resolve) => {
     startRepair = resolve;
@@ -968,7 +967,6 @@ test("stale repair cannot clear the successor generation dedupe state", async ()
   const replayPromise = replayLiveSubscriptions({
     subscriptions,
     generation: 10,
-    isActive: () => generationActive,
     sendRaw: async () => {},
     requestRepair: async () => {
       startRepair();
@@ -977,21 +975,19 @@ test("stale repair cannot clear the successor generation dedupe state", async ()
   });
 
   await repairStarted;
-  generationActive = false;
-  subscription.reconnectReplay = {
-    generation: 11,
+  const successorOwner = {
+    generation: 10,
     seenEventIds: new Set([duplicate.id]),
     liveEose: false,
     repairDone: false,
   };
+  subscription.reconnectReplay = successorOwner;
   finishRepair([duplicate]);
   await replayPromise;
 
-  assert.equal(subscription.reconnectReplay.generation, 11);
-  assert.deepEqual(
-    [...subscription.reconnectReplay.seenEventIds],
-    [duplicate.id],
-  );
+  assert.equal(subscription.reconnectReplay, successorOwner);
+  assert.deepEqual([...successorOwner.seenEventIds], [duplicate.id]);
+  assert.equal(successorOwner.repairDone, false);
   assert.equal(shouldDispatchSubscriptionEvent(subscription, duplicate), false);
 });
 
@@ -1389,17 +1385,18 @@ test("replay dedupe clears only after both completions and never from stale gene
         repairDone: false,
       },
     };
-    markReconnectRepairDone(subscription, 11);
+    const repairOwner = subscription.reconnectReplay;
+    markReconnectRepairDone(subscription, 11, repairOwner);
     markReconnectLiveEose(subscription, 11);
     assert.equal(subscription.reconnectReplay.generation, 12);
     if (repairFirst) {
-      markReconnectRepairDone(subscription, 12);
+      markReconnectRepairDone(subscription, 12, repairOwner);
       assert.ok(subscription.reconnectReplay);
       markReconnectLiveEose(subscription, 12);
     } else {
       markReconnectLiveEose(subscription, 12);
       assert.ok(subscription.reconnectReplay);
-      markReconnectRepairDone(subscription, 12);
+      markReconnectRepairDone(subscription, 12, repairOwner);
     }
     assert.equal(subscription.reconnectReplay, undefined);
   }

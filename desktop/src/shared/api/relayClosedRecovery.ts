@@ -171,14 +171,16 @@ function recoverLiveSubscriptionFromClosed({
       requestRepair !== undefined &&
       shouldPageReplay;
 
+    let repairOwner: LiveSubscription["reconnectReplay"];
     if (shouldRepair) {
       subscription.pendingReplaySince = replaySince;
-      subscription.reconnectReplay = {
+      repairOwner = {
         generation,
         seenEventIds: new Set(),
         liveEose: false,
         repairDone: false,
       };
+      subscription.reconnectReplay = repairOwner;
     }
 
     void (async () => {
@@ -218,16 +220,18 @@ function recoverLiveSubscriptionFromClosed({
             since: subscription.pendingReplaySince ?? replaySince,
             until: undefined,
             isActive: () =>
-              isActive() && subscriptions.get(subId) === subscription,
+              isActive() &&
+              subscriptions.get(subId) === subscription &&
+              subscription.reconnectReplay === repairOwner,
             requestRepair,
             replaySubscriptionEvent: replaySubscriptionEvent
               ? (event) => replaySubscriptionEvent(subId, event)
               : undefined,
           });
-          if (completed) {
+          if (completed && subscription.reconnectReplay === repairOwner) {
             flushReplayEvents?.();
             subscription.pendingReplaySince = undefined;
-            markReconnectRepairDone(subscription, generation);
+            markReconnectRepairDone(subscription, generation, repairOwner);
             notifyClosedRepairSettled(subscription);
           }
           return;
@@ -240,13 +244,20 @@ function recoverLiveSubscriptionFromClosed({
             // Partial attempts may have queued rows. Dispatch them while the
             // cross-attempt/live dedupe set still exists, then release this
             // generation without clearing the unresolved floor.
-            flushReplayEvents?.();
-            markReconnectRepairDone(subscription, generation);
-            notifyClosedRepairSettled(subscription);
+            if (subscription.reconnectReplay === repairOwner) {
+              flushReplayEvents?.();
+              markReconnectRepairDone(subscription, generation, repairOwner);
+              notifyClosedRepairSettled(subscription);
+            }
             return;
           }
           if (isRateLimited()) await waitForRateLimit();
-          if (!isActive() || subscriptions.get(subId) !== subscription) return;
+          if (
+            !isActive() ||
+            subscriptions.get(subId) !== subscription ||
+            subscription.reconnectReplay !== repairOwner
+          )
+            return;
         }
       }
     })();
@@ -326,9 +337,11 @@ export function markReconnectLiveEose(
 export function markReconnectRepairDone(
   subscription: Extract<RelaySubscription, { mode: "live" }>,
   generation: number,
+  repairOwner: Extract<RelaySubscription, { mode: "live" }>["reconnectReplay"],
 ) {
   const replay = subscription.reconnectReplay;
-  if (!replay || replay.generation !== generation) return;
+  if (!replay || replay.generation !== generation || replay !== repairOwner)
+    return;
   replay.repairDone = true;
   if (replay.liveEose) subscription.reconnectReplay = undefined;
 }

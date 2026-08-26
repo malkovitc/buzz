@@ -280,14 +280,16 @@ export async function replayLiveSubscriptions({
         shouldPageReplay,
       );
       const willRepair = shouldPageReplay && replaySince !== undefined;
+      let repairOwner: typeof subscription.reconnectReplay;
       if (willRepair) {
         // Install before the restored live REQ: a live frame may beat page one.
-        subscription.reconnectReplay = {
+        repairOwner = {
           generation,
           seenEventIds: new Set(),
           liveEose: false,
           repairDone: false,
         };
+        subscription.reconnectReplay = repairOwner;
       }
 
       return {
@@ -296,6 +298,7 @@ export async function replayLiveSubscriptions({
         channelId,
         replaySince,
         shouldPageReplay: willRepair,
+        repairOwner,
       };
     });
 
@@ -372,7 +375,7 @@ export async function replayLiveSubscriptions({
         request.replaySince !== undefined,
     ),
     pageReplayConcurrency,
-    async ({ subId, subscription, channelId, replaySince }) => {
+    async ({ subId, subscription, channelId, replaySince, repairOwner }) => {
       // Backfill is best-effort: a failure here (typically a `rate-limited:`
       // CLOSED on a history REQ) must never escape to the session and tear
       // down the healthy, authenticated socket carrying the live REQs — that
@@ -401,7 +404,9 @@ export async function replayLiveSubscriptions({
             // alone stays true and a stale pass could complete and clear the
             // floor the superseding connection needs.
             isActive: () =>
-              isActive() && subscriptions.get(subId) === subscription,
+              isActive() &&
+              subscriptions.get(subId) === subscription &&
+              subscription.reconnectReplay === repairOwner,
             requestRepair,
             replaySubscriptionEvent: replaySubscriptionEvent
               ? (event) => replaySubscriptionEvent(subId, event)
@@ -412,10 +417,10 @@ export async function replayLiveSubscriptions({
           // pinned floor for its own replay. Only a genuinely completed
           // window may release it. Flush queued repair rows first so dispatch
           // dedupe still exists when the buffer processes them.
-          if (completed) {
+          if (completed && subscription.reconnectReplay === repairOwner) {
             flushReplayEvents?.();
             subscription.pendingReplaySince = undefined;
-            markReconnectRepairDone(subscription, generation);
+            markReconnectRepairDone(subscription, generation, repairOwner);
           }
           return;
         } catch (error) {
@@ -427,15 +432,22 @@ export async function replayLiveSubscriptions({
             // Every failed attempt may already have queued complete pages.
             // Drain them while reconnect dedupe still spans live and repair
             // delivery, then release repair completion.
-            flushReplayEvents?.();
-            markReconnectRepairDone(subscription, generation);
+            if (subscription.reconnectReplay === repairOwner) {
+              flushReplayEvents?.();
+              markReconnectRepairDone(subscription, generation, repairOwner);
+            }
             return;
           }
           // The failed REQ's CLOSED handler arms the rate-limit gate before
           // rejecting; wait for it (no-op when the failure wasn't back-pressure)
           // and re-check that this replay's connection is still current.
           if (isRateLimited()) await waitForRateLimit();
-          if (subscriptions.get(subId) !== subscription || !isActive()) return;
+          if (
+            subscriptions.get(subId) !== subscription ||
+            !isActive() ||
+            subscription.reconnectReplay !== repairOwner
+          )
+            return;
         }
       }
     },
