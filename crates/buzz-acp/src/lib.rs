@@ -4507,6 +4507,15 @@ fn dispatch_heartbeat(
 #[cfg(test)]
 mod agent_draft_prompt_tests {
     #[test]
+    fn shared_base_prompt_explains_fetched_thread_root_kind() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("Thread root kind"));
+        assert!(prompt.contains("Kind `45001` identifies a Forum root"));
+        assert!(prompt.contains("replies are kind `45003`"));
+        assert!(prompt.contains("automatic `--reply-to` classification"));
+    }
+
+    #[test]
     fn shared_base_prompt_teaches_portable_agent_drafts() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("buzz agents draft-create"));

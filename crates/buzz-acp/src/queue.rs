@@ -994,6 +994,8 @@ pub enum ConversationContext {
         messages: Vec<ContextMessage>,
         total: usize,
         truncated: bool,
+        /// Kind reported by the fetched root event, when available.
+        root_kind: Option<u32>,
     },
     /// DM conversation history.
     Dm {
@@ -1303,10 +1305,15 @@ fn format_context_hints(
     channel_info: Option<&PromptChannelInfo>,
     thread_tags: &ThreadTags,
     is_dm: bool,
-    has_conversation_context: bool,
+    conversation_context: Option<&ConversationContext>,
     conversation_context_had_delivered_events: bool,
     reply_anchor: Option<&str>,
 ) -> String {
+    let has_conversation_context = conversation_context.is_some();
+    let thread_root_kind = match conversation_context {
+        Some(ConversationContext::Thread { root_kind, .. }) => *root_kind,
+        _ => None,
+    };
     let channel_display = match channel_info {
         Some(ci) => format!("{} (#{channel_id})", ci.name),
         None => channel_id.to_string(),
@@ -1340,6 +1347,9 @@ fn format_context_hints(
         // If this is a DM reply, include thread structural info as supplementary.
         if let Some(ref root) = thread_tags.root_event_id {
             s.push_str(&format!("\nThread root: {root}"));
+            if let Some(kind) = thread_root_kind {
+                s.push_str(&format!("\nThread root kind: {kind}"));
+            }
             if let Some(ref parent) = thread_tags.parent_event_id {
                 if parent != root {
                     s.push_str(&format!("\nParent: {parent}"));
@@ -1365,6 +1375,9 @@ fn format_context_hints(
         );
         append_channel_description(&mut s, channel_info);
         s.push_str(&format!("\nThread root: {root}"));
+        if let Some(kind) = thread_root_kind {
+            s.push_str(&format!("\nThread root kind: {kind}"));
+        }
         if let Some(ref parent) = thread_tags.parent_event_id {
             if parent != root {
                 s.push_str(&format!("\nParent: {parent}"));
@@ -1402,6 +1415,7 @@ fn format_conversation_context(
             messages,
             total,
             truncated,
+            ..
         } => ("Thread Context", messages, total, truncated),
         ConversationContext::Dm {
             messages,
@@ -1613,7 +1627,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         args.channel_info,
         &thread_tags,
         is_dm,
-        args.conversation_context.is_some(),
+        args.conversation_context,
         args.conversation_context_had_delivered_events,
         reply_anchor.as_deref(),
     ));
@@ -2734,6 +2748,7 @@ mod tests {
             }],
             total: 1,
             truncated: false,
+            root_kind: None,
         };
 
         let core = "[Agent Memory — core]\nbe helpful";
@@ -3384,6 +3399,7 @@ mod tests {
             ],
             total: 5,
             truncated: true,
+            root_kind: Some(buzz_core::kind::KIND_FORUM_POST),
         };
 
         let prompt = format_prompt(
@@ -3397,6 +3413,7 @@ mod tests {
         assert!(prompt.contains("[Thread Context (2 of 5 messages, truncated)]"));
         assert!(prompt.contains("Let's refactor auth"));
         assert!(prompt.contains("Thread context included below"));
+        assert!(prompt.contains("Thread root kind: 45001"));
     }
 
     #[test]
@@ -3473,6 +3490,7 @@ mod tests {
             }],
             total: 1,
             truncated: false,
+            root_kind: None,
         };
         let profiles = HashMap::from([
             (
@@ -3687,6 +3705,7 @@ mod tests {
             }],
             total: 1,
             truncated: false,
+            root_kind: None,
         };
 
         let prompt = format_prompt(

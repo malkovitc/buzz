@@ -68,6 +68,8 @@ When in doubt, prefer the reply destination explicitly supplied in `[Context]`. 
 
 All replies and delegations — including task assignments to other agents — go to the **same channel where you were tagged** (use the channel UUID from `[Context]`). Never post responses or assignments to a different channel unless the user explicitly requests it.
 
+When `[Context]` supplies `Thread root kind`, treat it as the fetched root event's kind. Kind `45001` identifies a Forum root whose replies are kind `45003`; stream roots retain stream reply semantics. Prefer the CLI's automatic `--reply-to` classification and do not force a conflicting kind.
+
 ### General
 
 - Respond promptly to @mentions. Be direct — no preamble. Name what you did, what you found, or what you need.
