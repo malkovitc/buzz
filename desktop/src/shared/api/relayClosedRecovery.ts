@@ -36,6 +36,7 @@ export function handleRelayClosed({
   sendReq,
   requestRepair,
   replaySubscriptionEvent,
+  flushReplayEvents,
   generation = 0,
   isActive = () => true,
 }: {
@@ -47,6 +48,7 @@ export function handleRelayClosed({
     request: ChannelReconnectRepairRequest,
   ) => Promise<RelayEvent[]>;
   replaySubscriptionEvent?: (subId: string, event: RelayEvent) => void;
+  flushReplayEvents?: () => void;
   generation?: number;
   isActive?: () => boolean;
 }) {
@@ -76,6 +78,7 @@ export function handleRelayClosed({
     sendReq,
     requestRepair,
     replaySubscriptionEvent,
+    flushReplayEvents,
     generation,
     isActive,
   });
@@ -89,6 +92,7 @@ function recoverLiveSubscriptionFromClosed({
   sendReq,
   requestRepair,
   replaySubscriptionEvent,
+  flushReplayEvents,
   generation,
   isActive,
 }: {
@@ -101,6 +105,7 @@ function recoverLiveSubscriptionFromClosed({
     request: ChannelReconnectRepairRequest,
   ) => Promise<RelayEvent[]>;
   replaySubscriptionEvent?: (subId: string, event: RelayEvent) => void;
+  flushReplayEvents?: () => void;
   generation: number;
   isActive: () => boolean;
 }) {
@@ -199,6 +204,7 @@ function recoverLiveSubscriptionFromClosed({
           : undefined,
       });
       if (completed) {
+        flushReplayEvents?.();
         subscription.pendingReplaySince = undefined;
         markReconnectRepairDone(subscription, generation);
       }
@@ -213,11 +219,22 @@ function recoverLiveSubscriptionFromClosed({
         sendReq,
         requestRepair,
         replaySubscriptionEvent,
+        flushReplayEvents,
         generation,
         isActive,
       });
     });
   }, delayMs);
+}
+
+export function prepareBufferedSubscriptionEvent(
+  subscription: RelaySubscription,
+  event: RelayEvent,
+  isRepair: boolean,
+) {
+  return isRepair
+    ? subscription.mode === "live"
+    : prepareSubscriptionEvent(subscription, event);
 }
 
 export function prepareSubscriptionEvent(

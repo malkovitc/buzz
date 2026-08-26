@@ -1267,6 +1267,43 @@ test("dense-second repair advances by event id without gaps", async () => {
   );
 });
 
+test("repair buffer flushes before reconnect dedupe is released", async () => {
+  resetGate(0);
+  const shared = event("a".repeat(64), 1_000);
+  const delivered = [];
+  const queued = [];
+  const subscription = {
+    mode: "live",
+    filter: buildChannelFilter("channel-1", 50),
+    onEvent: (value) => delivered.push(value.id),
+    lastSeenCreatedAt: 1_001,
+  };
+  const subscriptions = new Map([["live-1", subscription]]);
+
+  await replayLiveSubscriptions({
+    subscriptions,
+    generation: 4,
+    sendRaw: async (payload) => {
+      if (payload[0] !== "REQ") return;
+      assert.equal(shouldDispatchSubscriptionEvent(subscription, shared), true);
+      subscription.onEvent(shared);
+      markReconnectLiveEose(subscription, 4);
+    },
+    requestRepair: async () => [shared],
+    replaySubscriptionEvent: (_subId, value) => queued.push(value),
+    flushReplayEvents: () => {
+      for (const value of queued.splice(0)) {
+        if (shouldDispatchSubscriptionEvent(subscription, value)) {
+          subscription.onEvent(value);
+        }
+      }
+    },
+  });
+
+  assert.deepEqual(delivered, [shared.id]);
+  assert.equal(subscription.reconnectReplay, undefined);
+});
+
 test("replay dedupe clears only after both completions and never from stale generation", () => {
   for (const repairFirst of [true, false]) {
     const subscription = {

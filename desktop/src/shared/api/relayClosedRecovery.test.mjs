@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   handleRelayClosed,
   handleSubscriptionEose,
+  prepareBufferedSubscriptionEvent,
 } from "./relayClosedRecovery.ts";
 import {
   requestFirstEventGated,
@@ -454,6 +455,38 @@ test("non-rate-limited retryable CLOSED still schedules a retry", () => {
     true,
     "subscription must survive retryable CLOSED",
   );
+});
+
+test("buffering a repair event does not cancel a pending CLOSED retry", () => {
+  resetAll(0);
+  const subscription = {
+    mode: "live",
+    filter: buildChannelLiveFilter("ch-repair"),
+    onEvent: () => {},
+    closedRetryTimeout: 42,
+    closedRetryAttempt: 3,
+    lastSeenCreatedAt: 1_000,
+  };
+
+  assert.equal(
+    prepareBufferedSubscriptionEvent(
+      subscription,
+      {
+        id: "a".repeat(64),
+        pubkey: "b".repeat(64),
+        created_at: 2_000,
+        kind: 9,
+        tags: [["h", "ch-repair"]],
+        content: "repair",
+        sig: "c".repeat(128),
+      },
+      true,
+    ),
+    true,
+  );
+  assert.equal(subscription.closedRetryTimeout, 42);
+  assert.equal(subscription.closedRetryAttempt, 3);
+  assert.equal(subscription.lastSeenCreatedAt, 1_000);
 });
 
 test("CLOSED retry repairs more than the live limit from accepted author time", async () => {

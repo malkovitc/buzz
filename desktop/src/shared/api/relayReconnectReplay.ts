@@ -187,6 +187,7 @@ export async function replayLiveSubscriptions({
   sendRaw,
   requestRepair,
   replaySubscriptionEvent,
+  flushReplayEvents,
   generation = 0,
   pageReplayConcurrency = RECONNECT_REPLAY_PAGE_CONCURRENCY,
   visibleChannelId = null,
@@ -202,6 +203,7 @@ export async function replayLiveSubscriptions({
     request: ChannelReconnectRepairRequest,
   ) => Promise<RelayEvent[]>;
   replaySubscriptionEvent?: (subId: string, event: RelayEvent) => void;
+  flushReplayEvents?: () => void;
   generation?: number;
   pageReplayConcurrency?: number;
   /** Channel currently visible in the UI — its subscriptions go in the first batch. */
@@ -395,8 +397,10 @@ export async function replayLiveSubscriptions({
           // A stale-connection abort is NOT completion: the superseding
           // connection shares this subscription object and still needs the
           // pinned floor for its own replay. Only a genuinely completed
-          // window may release it.
+          // window may release it. Flush queued repair rows first so dispatch
+          // dedupe still exists when the buffer processes them.
           if (completed) {
+            flushReplayEvents?.();
             subscription.pendingReplaySince = undefined;
             markReconnectRepairDone(subscription, generation);
           }
