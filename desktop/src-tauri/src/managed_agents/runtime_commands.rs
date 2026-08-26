@@ -730,7 +730,9 @@ mod tests {
     }
 
     #[test]
-    fn every_desktop_spawn_enables_lazy_pool_once() {
+    fn desktop_spawn_is_lazy_unless_heartbeat_requires_an_eager_pool() {
+        use std::collections::BTreeMap;
+
         let source = include_str!("runtime.rs");
         let writes: Vec<&str> = source
             .lines()
@@ -739,8 +741,15 @@ mod tests {
             .collect();
         assert_eq!(
             writes,
-            [r#"command.env("BUZZ_ACP_LAZY_POOL", "true");"#],
-            "all Desktop spawn paths must stay lazy"
+            [r#"command.env("BUZZ_ACP_LAZY_POOL", lazy_pool.to_string());"#],
+            "all Desktop spawn paths must share the heartbeat-aware policy"
         );
+
+        let mut env = BTreeMap::new();
+        assert!(super::super::agent_env::managed_agent_uses_lazy_pool(&env));
+        env.insert("BUZZ_ACP_HEARTBEAT_INTERVAL".into(), "0".into());
+        assert!(super::super::agent_env::managed_agent_uses_lazy_pool(&env));
+        env.insert("BUZZ_ACP_HEARTBEAT_INTERVAL".into(), "300".into());
+        assert!(!super::super::agent_env::managed_agent_uses_lazy_pool(&env));
     }
 }
