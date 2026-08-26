@@ -489,6 +489,38 @@ test("buffering a repair event does not cancel a pending CLOSED retry", () => {
   assert.equal(subscription.lastSeenCreatedAt, 1_000);
 });
 
+test("cursorless bounded channel CLOSED retry repairs from zero", async () => {
+  resetAll(0);
+  const channelId = "ch-empty-before-closed";
+  const liveFilter = buildChannelLiveFilter(channelId);
+  const repairRequests = [];
+  const subscription = {
+    mode: "live",
+    filter: liveFilter,
+    onEvent: () => {},
+    lastSeenCreatedAt: undefined,
+  };
+  const subscriptions = new Map([["live-cursorless", subscription]]);
+
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-cursorless",
+    message: "error: temporary relay failure",
+    sendReq: async () => {},
+    requestRepair: async (request) => {
+      repairRequests.push(request);
+      return [];
+    },
+  });
+
+  tickTo(1_001);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(repairRequests.length, 1);
+  assert.equal(repairRequests[0].since, 0);
+  assert.equal(subscription.pendingReplaySince, undefined);
+});
+
 test("CLOSED retry repairs more than the live limit from accepted author time", async () => {
   resetAll(9_000_000);
   const channelId = "ch-clock-skew";

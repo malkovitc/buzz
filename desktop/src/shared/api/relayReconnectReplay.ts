@@ -110,6 +110,40 @@ export function shouldPageReconnectReplay(filter: RelaySubscriptionFilter) {
   );
 }
 
+export function resolveReconnectReplaySince(
+  subscription: Extract<RelaySubscription, { mode: "live" }>,
+  shouldPageReplay: boolean,
+) {
+  const cursorSince =
+    subscription.lastSeenCreatedAt === undefined
+      ? undefined
+      : Math.max(
+          0,
+          subscription.lastSeenCreatedAt -
+            (shouldPageReplay
+              ? RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS
+              : RECONNECT_REPLAY_SKEW_SECS),
+        );
+  // A page-capable bounded subscription with no accepted event still needs a
+  // repair floor: more than `limit` rows may have arrived while it was down.
+  // Zero is the only clock-independent safe fallback until a relay-authored
+  // event establishes the ordinary bounded cursor.
+  const fallbackSince = shouldPageReplay
+    ? (subscription.filter.since ?? 0)
+    : undefined;
+  // A pinned floor from a previously failed backfill takes precedence over the
+  // cursor because live events may have advanced while that older window was
+  // unresolved.
+  const replayFloor =
+    cursorSince === undefined
+      ? (subscription.pendingReplaySince ?? fallbackSince)
+      : Math.min(cursorSince, subscription.pendingReplaySince ?? Infinity);
+
+  return replayFloor === undefined
+    ? undefined
+    : Math.max(replayFloor, subscription.filter.since ?? 0);
+}
+
 /**
  * Page one subscription's missed-window history.
  *
@@ -241,31 +275,10 @@ export async function replayLiveSubscriptions({
       const shouldPageReplay =
         channelId !== undefined &&
         shouldPageReconnectReplay(subscription.filter);
-      const cursorSince =
-        subscription.lastSeenCreatedAt === undefined
-          ? undefined
-          : Math.max(
-              0,
-              subscription.lastSeenCreatedAt -
-                (shouldPageReplay
-                  ? RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS
-                  : RECONNECT_REPLAY_SKEW_SECS),
-            );
-      // A pinned floor from a previously failed backfill takes precedence
-      // over the cursor: live events kept advancing `lastSeenCreatedAt`
-      // while the older window stayed unresolved, and starting from the
-      // cursor would skip it permanently.
-      const replayFloor =
-        cursorSince === undefined
-          ? subscription.pendingReplaySince
-          : Math.min(cursorSince, subscription.pendingReplaySince ?? Infinity);
-      // Native repair bypasses the original WS filter, so preserve its lower
-      // bound explicitly. Otherwise a from-now subscription can replay older
-      // rows and surface stale unread or notification activity on reconnect.
-      const replaySince =
-        replayFloor === undefined
-          ? undefined
-          : Math.max(replayFloor, subscription.filter.since ?? 0);
+      const replaySince = resolveReconnectReplaySince(
+        subscription,
+        shouldPageReplay,
+      );
       const willRepair = shouldPageReplay && replaySince !== undefined;
       if (willRepair) {
         // Install before the restored live REQ: a live frame may beat page one.

@@ -12,8 +12,8 @@ import {
 } from "@/shared/api/relayClientShared";
 import type { ChannelReconnectRepairRequest } from "@/shared/api/channelReconnectRepair";
 import {
-  RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS,
   replayReconnectHistoryPages,
+  resolveReconnectReplaySince,
   shouldPageReconnectReplay,
 } from "@/shared/api/relayReconnectReplay";
 import type { RelayEvent } from "@/shared/api/types";
@@ -149,27 +149,16 @@ function recoverLiveSubscriptionFromClosed({
     if (!isActive() || subscriptions.get(subId) !== subscription) return;
 
     const channelId = subscription.filter["#h"]?.[0];
-    const cursorSince =
-      subscription.lastSeenCreatedAt === undefined
-        ? undefined
-        : Math.max(
-            0,
-            subscription.lastSeenCreatedAt -
-              RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS,
-          );
-    const replayFloor =
-      cursorSince === undefined
-        ? subscription.pendingReplaySince
-        : Math.min(cursorSince, subscription.pendingReplaySince ?? Infinity);
-    const replaySince =
-      replayFloor === undefined
-        ? undefined
-        : Math.max(replayFloor, subscription.filter.since ?? 0);
+    const shouldPageReplay = shouldPageReconnectReplay(subscription.filter);
+    const replaySince = resolveReconnectReplaySince(
+      subscription,
+      shouldPageReplay,
+    );
     const shouldRepair =
       channelId !== undefined &&
       replaySince !== undefined &&
       requestRepair !== undefined &&
-      shouldPageReconnectReplay(subscription.filter);
+      shouldPageReplay;
 
     if (shouldRepair) {
       subscription.pendingReplaySince = replaySince;

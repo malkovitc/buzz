@@ -580,6 +580,41 @@ test("stale replay sends no REQs when generation advances while gate was active"
 
 // ── Paged replay (existing behaviour) ────────────────────────────────────────
 
+test("cursorless bounded channel reconnect repairs from a clock-independent floor", async () => {
+  resetGate();
+  const filter = buildChannelFilter("channel-empty-before-outage", 50);
+  const repairRequests = [];
+  const delivered = [];
+  const missedWhileDown = eventRange("missed", 1_000, filter.limit + 1);
+  const subscription = {
+    mode: "live",
+    filter,
+    onEvent: (value) => delivered.push(value.id),
+    lastSeenCreatedAt: undefined,
+  };
+
+  await replayLiveSubscriptions({
+    subscriptions: new Map([["live-cursorless", subscription]]),
+    sendRaw: async () => {},
+    requestRepair: async (request) => {
+      repairRequests.push(request);
+      return missedWhileDown;
+    },
+  });
+
+  assert.deepEqual(repairRequests, [
+    {
+      channelId: "channel-empty-before-outage",
+      limit: 500,
+      since: 0,
+      until: undefined,
+      beforeId: undefined,
+    },
+  ]);
+  assert.equal(delivered.length, filter.limit + 1);
+  assert.equal(subscription.pendingReplaySince, undefined);
+});
+
 test("channel reconnect replay pages the missed window until a short page", async () => {
   resetGate();
   const delivered = [];
