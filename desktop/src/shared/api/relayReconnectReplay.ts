@@ -127,6 +127,7 @@ export async function replayReconnectHistoryPages({
   until,
   isActive,
   requestRepair,
+  replaySubscriptionEvent,
 }: {
   subscription: Extract<RelaySubscription, { mode: "live" }>;
   channelId: string;
@@ -136,6 +137,7 @@ export async function replayReconnectHistoryPages({
   requestRepair: (
     request: ChannelReconnectRepairRequest,
   ) => Promise<RelayEvent[]>;
+  replaySubscriptionEvent?: (event: RelayEvent) => void;
 }): Promise<boolean> {
   let pageUntil: number | undefined = until;
   let beforeId: string | undefined;
@@ -154,7 +156,9 @@ export async function replayReconnectHistoryPages({
     if (!isActive()) return false;
 
     for (const event of events) {
-      if (shouldDispatchSubscriptionEvent(subscription, event)) {
+      if (replaySubscriptionEvent) {
+        replaySubscriptionEvent(event);
+      } else if (shouldDispatchSubscriptionEvent(subscription, event)) {
         subscription.onEvent(event);
       }
     }
@@ -182,6 +186,7 @@ export async function replayLiveSubscriptions({
   subscriptions,
   sendRaw,
   requestRepair,
+  replaySubscriptionEvent,
   generation = 0,
   pageReplayConcurrency = RECONNECT_REPLAY_PAGE_CONCURRENCY,
   visibleChannelId = null,
@@ -196,6 +201,7 @@ export async function replayLiveSubscriptions({
   requestRepair: (
     request: ChannelReconnectRepairRequest,
   ) => Promise<RelayEvent[]>;
+  replaySubscriptionEvent?: (subId: string, event: RelayEvent) => void;
   generation?: number;
   pageReplayConcurrency?: number;
   /** Channel currently visible in the UI — its subscriptions go in the first batch. */
@@ -382,6 +388,9 @@ export async function replayLiveSubscriptions({
             isActive: () =>
               isActive() && subscriptions.get(subId) === subscription,
             requestRepair,
+            replaySubscriptionEvent: replaySubscriptionEvent
+              ? (event) => replaySubscriptionEvent(subId, event)
+              : undefined,
           });
           // A stale-connection abort is NOT completion: the superseding
           // connection shares this subscription object and still needs the

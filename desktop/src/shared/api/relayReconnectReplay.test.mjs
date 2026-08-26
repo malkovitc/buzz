@@ -1296,23 +1296,29 @@ test("replay dedupe clears only after both completions and never from stale gene
   }
 });
 
-test("buffer flush drops stale generations and removed subscriptions", () => {
+test("buffer flush drops stale generations and invokes onFlush once", () => {
   const delivered = [];
+  let flushes = 0;
   const subscription = {
     mode: "live",
     filter: buildChannelFilter("channel-1", 50),
     onEvent: (value) => delivered.push(value.id),
+    onFlush: () => {
+      flushes += 1;
+    },
   };
   flushEvents(
     [
       { subId: "live-1", event: event("stale", 100), generation: 6 },
       { subId: "removed", event: event("removed", 101), generation: 7 },
       { subId: "live-1", event: event("current", 102), generation: 7 },
+      { subId: "live-1", event: event("current-2", 103), generation: 7 },
     ],
     new Map([["live-1", subscription]]),
     7,
   );
-  assert.deepEqual(delivered, ["current"]);
+  assert.deepEqual(delivered, ["current", "current-2"]);
+  assert.equal(flushes, 1);
 });
 
 test("live-before-repair and repair-before-live dispatch once", async () => {

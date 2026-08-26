@@ -9,6 +9,8 @@ import {
   requestFirstEventGated,
   requestHistoryGated,
 } from "./relayGateBoundary.ts";
+import { buildChannelLiveFilter } from "./relayChannelFilters.ts";
+import { RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS } from "./relayReconnectReplay.ts";
 
 // ── Fake-timer setup ──────────────────────────────────────────────────────────
 // The rate-limit gate and closed-retry logic use window.setTimeout/clearTimeout.
@@ -452,6 +454,63 @@ test("non-rate-limited retryable CLOSED still schedules a retry", () => {
     true,
     "subscription must survive retryable CLOSED",
   );
+});
+
+test("CLOSED retry repairs more than the live limit from accepted author time", async () => {
+  resetAll(9_000_000);
+  const channelId = "ch-clock-skew";
+  const liveFilter = buildChannelLiveFilter(channelId);
+  const delivered = [];
+  const sentFilters = [];
+  const repairRequests = [];
+  const repairedEvents = Array.from(
+    { length: liveFilter.limit + 1 },
+    (_, index) => ({
+      id: String(index).padStart(64, "0"),
+      pubkey: "a".repeat(64),
+      created_at: 1_100 + index,
+      kind: 9,
+      tags: [["h", channelId]],
+      content: `recovered ${index}`,
+      sig: "b".repeat(128),
+    }),
+  );
+  const subscription = {
+    mode: "live",
+    filter: liveFilter,
+    onEvent: () => {},
+    lastSeenCreatedAt: 3_000,
+  };
+  const subscriptions = new Map([["live-closed", subscription]]);
+
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-closed",
+    message: "error: temporary relay failure",
+    sendReq: async (_subId, filter) => {
+      sentFilters.push(filter);
+    },
+    requestRepair: async (request) => {
+      repairRequests.push(request);
+      return repairedEvents;
+    },
+    replaySubscriptionEvent: (_subId, event) => delivered.push(event),
+    generation: 7,
+  });
+
+  tickTo(9_001_001);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(sentFilters, [liveFilter]);
+  assert.equal(repairRequests.length, 1);
+  assert.equal(
+    repairRequests[0].since,
+    3_000 - RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS,
+  );
+  assert.equal(repairRequests[0].until, undefined);
+  assert.equal(repairRequests[0].limit, 500);
+  assert.equal(delivered.length, liveFilter.limit + 1);
+  assert.equal(subscription.pendingReplaySince, undefined);
 });
 
 test("terminal CLOSED deletes subscription and does not retry", () => {

@@ -60,6 +60,8 @@ type LiveSubscription = {
   mode: "live";
   filter: RelaySubscriptionFilter;
   onEvent: (event: RelayEvent) => void;
+  /** Invoked once after each buffered delivery containing this subscription. */
+  onFlush?: () => void;
   resolveReady?: (readiness: LiveSubscriptionReadiness) => void;
   lastSeenCreatedAt?: number;
   /**

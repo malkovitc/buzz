@@ -9,8 +9,6 @@ import {
   KIND_STREAM_MESSAGE,
   KIND_TYPING_INDICATOR,
   KIND_USER_STATUS,
-  CHANNEL_EVENT_KINDS,
-  KIND_CHANNEL_THREAD_SUMMARY,
 } from "@/shared/constants/kinds";
 import {
   getTextPayload,
@@ -26,6 +24,7 @@ import {
   buildChannelAuxDeletionFilter,
   buildChannelFilter,
   buildChannelHistoryFilter,
+  buildChannelLiveFilter,
   buildChannelMentionFilter,
   buildGlobalStreamFilter,
 } from "@/shared/api/relayChannelFilters";
@@ -326,30 +325,20 @@ export class RelayClient {
     return this.subscribe(buildChannelFilter(channelId, 50), onEvent);
   }
 
-  /** Subscribe to channel rows and aux starting now, with no history replay. */
   async subscribeToChannelLive(
     channelId: string,
     onEvent: (event: RelayEvent) => void,
+    options?: { onFlush?: () => void },
   ) {
-    // 39005 rides only this window-store subscription — CHANNEL_EVENT_KINDS'
-    // other consumers (unread tracking, cache merges) must never see
-    // summary overlays.
     return this.subscribe(
-      {
-        kinds: [...CHANNEL_EVENT_KINDS, KIND_CHANNEL_THREAD_SUMMARY],
-        "#h": [channelId],
-        limit: 1000,
-        since: Math.floor(Date.now() / 1_000),
-      },
+      buildChannelLiveFilter(channelId),
       onEvent,
+      undefined,
+      250,
+      options?.onFlush,
     );
   }
-
-  /**
-   * Subscribe to huddle lifecycle events (kinds 48100–48103) for a channel,
-   * so HuddleIndicator detects active huddles without being drowned out by
-   * regular channel messages. Includes the last 10 historical events.
-   */
+  /** Huddle lifecycle subscription, isolated from regular channel traffic. */
   async subscribeToHuddleEvents(
     channelId: string,
     onEvent: (event: RelayEvent) => void,
@@ -601,6 +590,7 @@ export class RelayClient {
     onEvent: (event: RelayEvent) => void,
     onReady?: (readiness: LiveSubscriptionReadiness) => void,
     readinessTimeoutMs = 250,
+    onFlush?: () => void,
   ) {
     await this.ensureConnected();
 
@@ -622,6 +612,7 @@ export class RelayClient {
       mode: "live",
       filter,
       onEvent,
+      onFlush,
       resolveReady,
     });
 
@@ -824,6 +815,11 @@ export class RelayClient {
             ["REQ", subId, filter],
             "Failed to restore relay subscription after CLOSED.",
           ),
+        requestRepair: getChannelReconnectRepairEvents,
+        replaySubscriptionEvent: (subId, event) =>
+          this.handleEvent(subId, event, generation),
+        generation,
+        isActive: () => this.connectionGeneration === generation,
       });
       return;
     }
@@ -937,6 +933,8 @@ export class RelayClient {
         subscriptions: this.subscriptions,
         sendRaw: (payload) => this.sendRaw(payload),
         requestRepair: getChannelReconnectRepairEvents,
+        replaySubscriptionEvent: (subId, event) =>
+          this.handleEvent(subId, event, generation),
         generation,
         visibleChannelId: this.visibleChannelId,
         isActive: () => this.connectionGeneration === generation,

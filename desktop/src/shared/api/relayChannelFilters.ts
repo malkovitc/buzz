@@ -3,6 +3,7 @@ import {
   CHANNEL_EVENT_KINDS,
   CHANNEL_TIMELINE_CONTENT_KINDS,
   HOME_MENTION_EVENT_KINDS,
+  KIND_CHANNEL_THREAD_SUMMARY,
   KIND_DELETION,
   KIND_NIP29_DELETE_EVENT,
   KIND_REACTION,
@@ -18,6 +19,25 @@ import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 // a single reaction-heavy message can have many aux events.
 export const AUX_BACKFILL_CHUNK_SIZE = 100;
 export const MAX_HISTORICAL_LIMIT = 10_000;
+
+/**
+ * Live window-store subscription for an open channel.
+ *
+ * Deliberately omits `since`: Nostr timestamps are author-assigned, so a
+ * reader-clock lower bound can permanently drop valid live events. A positive
+ * limit bounds initial replay and keeps paged reconnect/CLOSED repair enabled.
+ */
+export function buildChannelLiveFilter(
+  channelId: string,
+): RelaySubscriptionFilter {
+  return {
+    // Thread summaries belong only to the window-store subscription; the
+    // broader CHANNEL_EVENT_KINDS consumers must not receive overlays.
+    kinds: [...CHANNEL_EVENT_KINDS, KIND_CHANNEL_THREAD_SUMMARY],
+    "#h": [channelId],
+    limit: 50,
+  };
+}
 
 /**
  * Live-subscription filter for an open channel: the broad
