@@ -458,6 +458,9 @@ export function useChannelSubscription(channel: Channel | null) {
             }
             shouldProjectOnFlush = false;
           },
+          // Thread summaries are synthesized only by the authoritative window
+          // endpoint, not stored as ordinary repair rows.
+          onClosedRepairSettled: () => refreshAfterSubscribe("CLOSED repair"),
         },
       )
       .then(

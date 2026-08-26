@@ -328,7 +328,7 @@ export class RelayClient {
   async subscribeToChannelLive(
     channelId: string,
     onEvent: (event: RelayEvent) => void,
-    options?: { onFlush?: () => void },
+    options?: { onFlush?: () => void; onClosedRepairSettled?: () => void },
   ) {
     return this.subscribe(
       buildChannelLiveFilter(channelId),
@@ -336,6 +336,7 @@ export class RelayClient {
       undefined,
       250,
       options?.onFlush,
+      options?.onClosedRepairSettled,
     );
   }
   /** Huddle lifecycle subscription, isolated from regular channel traffic. */
@@ -580,6 +581,7 @@ export class RelayClient {
     onReady?: (readiness: LiveSubscriptionReadiness) => void,
     readinessTimeoutMs = 250,
     onFlush?: () => void,
+    onClosedRepairSettled?: () => void,
   ) {
     await this.ensureConnected();
 
@@ -602,6 +604,7 @@ export class RelayClient {
       filter,
       onEvent,
       onFlush,
+      onClosedRepairSettled,
       resolveReady,
     });
 

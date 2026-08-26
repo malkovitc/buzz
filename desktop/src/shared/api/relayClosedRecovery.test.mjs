@@ -588,6 +588,10 @@ test("exhausted partial CLOSED repairs flush before releasing replay dedupe", as
   };
   const subscriptions = new Map([["live-partial", subscription]]);
   let repairCalls = 0;
+  let repairSettledCalls = 0;
+  subscription.onClosedRepairSettled = () => {
+    repairSettledCalls += 1;
+  };
 
   handleRelayClosed({
     subscriptions,
@@ -620,6 +624,7 @@ test("exhausted partial CLOSED repairs flush before releasing replay dedupe", as
   assert.equal(new Set(delivered).size, page.length);
   assert.equal(subscription.reconnectReplay, undefined);
   assert.notEqual(subscription.pendingReplaySince, undefined);
+  assert.equal(repairSettledCalls, 1);
 });
 
 test("CLOSED retry repairs more than the live limit from accepted author time", async () => {
@@ -641,10 +646,14 @@ test("CLOSED retry repairs more than the live limit from accepted author time", 
       sig: "b".repeat(128),
     }),
   );
+  let repairSettledCalls = 0;
   const subscription = {
     mode: "live",
     filter: liveFilter,
     onEvent: () => {},
+    onClosedRepairSettled: () => {
+      repairSettledCalls += 1;
+    },
     lastSeenCreatedAt: 3_000,
   };
   const subscriptions = new Map([["live-closed", subscription]]);
@@ -677,6 +686,7 @@ test("CLOSED retry repairs more than the live limit from accepted author time", 
   assert.equal(repairRequests[0].limit, 500);
   assert.equal(delivered.length, liveFilter.limit + 1);
   assert.equal(subscription.pendingReplaySince, undefined);
+  assert.equal(repairSettledCalls, 1);
 });
 
 test("terminal CLOSED deletes subscription and does not retry", () => {

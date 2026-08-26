@@ -32,6 +32,14 @@ export function clearClosedRetry(subscription: LiveSubscription) {
   subscription.closedRetryTimeout = undefined;
 }
 
+function notifyClosedRepairSettled(subscription: LiveSubscription) {
+  try {
+    subscription.onClosedRepairSettled?.();
+  } catch (error) {
+    console.error("Failed to refresh after CLOSED repair", error);
+  }
+}
+
 export function handleRelayClosed({
   subscriptions,
   subId,
@@ -220,6 +228,7 @@ function recoverLiveSubscriptionFromClosed({
             flushReplayEvents?.();
             subscription.pendingReplaySince = undefined;
             markReconnectRepairDone(subscription, generation);
+            notifyClosedRepairSettled(subscription);
           }
           return;
         } catch (error) {
@@ -233,6 +242,7 @@ function recoverLiveSubscriptionFromClosed({
             // generation without clearing the unresolved floor.
             flushReplayEvents?.();
             markReconnectRepairDone(subscription, generation);
+            notifyClosedRepairSettled(subscription);
             return;
           }
           if (isRateLimited()) await waitForRateLimit();

@@ -62,6 +62,8 @@ type LiveSubscription = {
   onEvent: (event: RelayEvent) => void;
   /** Invoked once after each buffered delivery containing this subscription. */
   onFlush?: () => void;
+  /** Invoked after CLOSED gap repair settles so derived windows can refresh. */
+  onClosedRepairSettled?: () => void;
   resolveReady?: (readiness: LiveSubscriptionReadiness) => void;
   lastSeenCreatedAt?: number;
   /**
