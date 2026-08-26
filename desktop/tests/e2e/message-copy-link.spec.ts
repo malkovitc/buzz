@@ -165,7 +165,9 @@ test("pending and huddle rows omit both copy-link surfaces", async ({
       content: JSON.stringify({
         ephemeral_channel_id: "10000000-0000-4000-8000-000000000001",
       }),
-      id: "d".repeat(64),
+      // Must not collide with the seeded reaction-target event (`d` × 64):
+      // initial live replay now correctly includes that persisted row.
+      id: "0123456789abcdef".repeat(4),
       kind: huddleKind,
     });
     return { huddleId: huddle.id, pendingId: pending.id };
