@@ -229,7 +229,7 @@ pub(crate) fn start_managed_agent_runtime_pair_lazy(
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    start_pair(pubkey, relay_url, true, None, app)
+    start_pair(pubkey, relay_url, None, app)
 }
 
 #[tauri::command]
@@ -244,7 +244,6 @@ pub fn start_managed_agent_runtime(
 fn start_pair(
     pubkey: String,
     relay_url: String,
-    lazy: bool,
     expected_updated_at: Option<&str>,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
@@ -288,7 +287,7 @@ fn start_pair(
         .lock()
         .ok()
         .map(|keys| keys.public_key().to_hex());
-    let mut process = spawn_agent_child(&app, record, &key.relay_url, lazy, owner.as_deref())?;
+    let mut process = spawn_agent_child(&app, record, &key.relay_url, owner.as_deref())?;
     let now = crate::util::now_iso();
     let receipt = ManagedAgentRuntimeReceipt {
         key: key.clone(),
@@ -388,7 +387,7 @@ pub fn restart_managed_agent_runtime(
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     stop_managed_agent_runtime(pubkey.clone(), relay_url.clone(), app.clone())?;
-    start_pair(pubkey, relay_url, true, None, app)
+    start_pair(pubkey, relay_url, None, app)
 }
 
 /// Probe whether this agent can operate on `requested_relay_url`.
@@ -510,7 +509,6 @@ pub async fn reconcile_managed_agent_runtimes(
                     match start_pair(
                         record.pubkey.clone(),
                         key.relay_url.clone(),
-                        true,
                         Some(&record.updated_at),
                         app.clone(),
                     ) {
@@ -729,5 +727,39 @@ mod tests {
             Some("unexpected"),
         );
         assert!(observer_lifecycle_key(&ready_with_error.pubkey, &ready_with_error).is_err());
+    }
+
+    #[test]
+    fn desktop_spawn_is_lazy_unless_heartbeat_requires_an_eager_pool() {
+        use std::collections::BTreeMap;
+
+        let source = include_str!("runtime.rs");
+        let writes: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("BUZZ_ACP_LAZY_POOL") && !line.starts_with("//"))
+            .collect();
+        assert_eq!(
+            writes,
+            [r#"command.env("BUZZ_ACP_LAZY_POOL", lazy_pool.to_string());"#],
+            "all Desktop spawn paths must share the heartbeat-aware policy"
+        );
+        let user_env_write = source
+            .find("for (key, value) in &descriptor.env")
+            .expect("spawn must apply resolved user env");
+        let pool_policy_write = source
+            .find(writes[0])
+            .expect("spawn must apply the computed pool policy");
+        assert!(
+            pool_policy_write > user_env_write,
+            "reserved pool policy must override conflicting user env"
+        );
+
+        let mut env = BTreeMap::new();
+        assert!(super::super::agent_env::managed_agent_uses_lazy_pool(&env));
+        env.insert("BUZZ_ACP_HEARTBEAT_INTERVAL".into(), "0".into());
+        assert!(super::super::agent_env::managed_agent_uses_lazy_pool(&env));
+        env.insert("BUZZ_ACP_HEARTBEAT_INTERVAL".into(), "300".into());
+        assert!(!super::super::agent_env::managed_agent_uses_lazy_pool(&env));
     }
 }

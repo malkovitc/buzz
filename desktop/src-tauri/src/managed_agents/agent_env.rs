@@ -27,6 +27,15 @@ pub(super) fn idle_pool_sleep_env(lazy: bool) -> &'static str {
     }
 }
 
+/// Reactive agents start lazily; heartbeat agents need an eager pool because
+/// ACP skips heartbeat ticks until the pool is ready.
+pub(super) fn managed_agent_uses_lazy_pool(env: &BTreeMap<String, String>) -> bool {
+    env.get("BUZZ_ACP_HEARTBEAT_INTERVAL")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        == 0
+}
+
 /// Return the baked-in build-time env pairs as a map.
 ///
 /// Internal builds (buzz-releases) bake provider/model defaults and arbitrary
