@@ -40,6 +40,17 @@ fn snap(record: &ManagedAgentRecord) -> serde_json::Value {
     snapshot(record, &[], &[], "wss://ws.example", &Default::default())
 }
 
+#[test]
+fn file_backed_team_instructions_detection_is_case_insensitive() {
+    let mut env = BTreeMap::from([("BUZZ_ACP_TEAM_INSTRUCTIONS_FILE".into(), "".into())]);
+    assert!(!uses_file_backed_team_instructions(&env));
+    env.insert(
+        "buzz_acp_team_instructions_file".into(),
+        "/srv/team.md".into(),
+    );
+    assert!(uses_file_backed_team_instructions(&env));
+}
+
 fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
         pubkey: "p".repeat(64),

@@ -46,6 +46,12 @@ pub(crate) use diff::{eligible_restart_diff, RestartDiffEntry, TrackedSpawnState
 
 /// Resolve the current instructions for this instance's deployment-time team binding.
 /// A deleted team deliberately degrades to no team section.
+pub(crate) fn uses_file_backed_team_instructions(env: &BTreeMap<String, String>) -> bool {
+    env.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("BUZZ_ACP_TEAM_INSTRUCTIONS_FILE") && !value.trim().is_empty()
+    })
+}
+
 pub(crate) fn effective_team_instructions(
     record: &ManagedAgentRecord,
     teams: &[TeamRecord],
@@ -57,6 +63,16 @@ pub(crate) fn effective_team_instructions(
         .map(str::trim)
         .filter(|instructions| !instructions.is_empty())
         .map(str::to_string)
+}
+
+pub(crate) fn team_instructions_for_env(
+    record: &ManagedAgentRecord,
+    teams: &[TeamRecord],
+    env: &BTreeMap<String, String>,
+) -> Option<String> {
+    (!uses_file_backed_team_instructions(env))
+        .then(|| effective_team_instructions(record, teams))
+        .flatten()
 }
 
 /// The already-resolved values a spawn feeds into its `Command`.
@@ -304,7 +320,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
         // Resolved, not stored: every record spawns on the workspace relay
         // (legacy pins ignored), so a workspace relay change must badge.
         relay_url: &crate::relay::effective_agent_relay_url(&record.relay_url, workspace_relay),
-        team_instructions: effective_team_instructions(record, teams).as_deref(),
+        team_instructions: team_instructions_for_env(record, teams, &descriptor.env).as_deref(),
         system_prompt: prompt.as_deref(),
         model: model.as_deref(),
         provider: provider.as_deref(),

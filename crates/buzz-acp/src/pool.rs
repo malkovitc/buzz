@@ -606,6 +606,8 @@ pub struct PromptContext {
     /// on `session/new`. Never part of the prompt.
     pub session_title: Option<String>,
     pub team_instructions: Option<String>,
+    /// Re-read for each new ACP session so changes do not require restart.
+    pub team_instructions_file: Option<std::path::PathBuf>,
     pub heartbeat_prompt: Option<String>,
     /// Base prompt content, or `None` if `--no-base-prompt` was passed.
     ///
@@ -1033,6 +1035,18 @@ async fn resolve_new_session_channel_context(
     (is_dm, title_channel, Some(info.channel_type))
 }
 
+fn current_team_instructions(ctx: &PromptContext) -> Result<Option<String>, AcpError> {
+    match ctx.team_instructions_file.as_deref() {
+        Some(path) => crate::config::read_team_instructions_file(path).map_err(|error| {
+            AcpError::Protocol(format!(
+                "failed to reload team instructions file {}: {error}",
+                path.display()
+            ))
+        }),
+        None => Ok(ctx.team_instructions.clone()),
+    }
+}
+
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
 /// on the agent (first session only), and apply `desired_model` if set.
 ///
@@ -1060,12 +1074,13 @@ async fn create_session_and_apply_model(
     // its own `[Agent Memory — core]` header, and canvas carries its own
     // `[Channel Canvas]` header; both are appended with a blank-line separator.
     let is_goose = agent.agent_name == "goose";
+    let team_instructions = current_team_instructions(ctx)?;
     let combined_system_prompt = with_canvas(
         with_huddle_instructions(
             with_core(
                 with_team(
                     framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
-                    ctx.team_instructions.as_deref(),
+                    team_instructions.as_deref(),
                 ),
                 agent_core,
             ),
@@ -2162,6 +2177,32 @@ pub async fn run_prompt_task(
         }),
     );
 
+    let legacy_team_instructions = if is_new_session && !agent.has_system_prompt_support() {
+        match current_team_instructions(&ctx) {
+            Ok(instructions) => instructions,
+            Err(error) => {
+                tracing::error!(
+                    target: "pool::prompt",
+                    "refusing prompt with unavailable team instructions: {error}"
+                );
+                // Session creation succeeded but legacy standing context did not.
+                // Invalidate it so retry cannot fall back to the startup snapshot.
+                agent.state.invalidate(&source);
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(error),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
+        }
+    } else {
+        ctx.team_instructions.clone()
+    };
+
     // Standing context is fixed for the life of a session. Agents with
     // systemPrompt support already hold it from session/new; legacy agents
     // receive it in the session's first user message and never again.
@@ -2172,7 +2213,7 @@ pub async fn run_prompt_task(
     let standing = crate::queue::StandingContext {
         base_prompt: ctx.base_prompt,
         system_prompt: ctx.system_prompt.as_deref(),
-        team_instructions: ctx.team_instructions.as_deref(),
+        team_instructions: legacy_team_instructions.as_deref(),
         agent_core: agent_core.as_deref(),
         huddle_instructions: huddle_instructions.as_deref(),
         agent_canvas: agent_canvas.as_deref(),
@@ -8023,6 +8064,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             system_prompt: None,
             session_title: None,
             team_instructions: None,
+            team_instructions_file: None,
             heartbeat_prompt: None,
             base_prompt: None,
             cwd: ".".to_string(),
@@ -8050,6 +8092,32 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
         }
+    }
+
+    // ── durable team instructions ───────────────────────────────────────────
+
+    #[test]
+    fn team_instructions_file_reloads_and_fails_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "buzz-acp-reload-team-instructions-{}.md",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "first rule").unwrap();
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.team_instructions = Some("startup snapshot".into());
+        ctx.team_instructions_file = Some(path.clone());
+
+        assert_eq!(
+            current_team_instructions(&ctx).unwrap().as_deref(),
+            Some("first rule")
+        );
+        std::fs::write(&path, "second rule").unwrap();
+        assert_eq!(
+            current_team_instructions(&ctx).unwrap().as_deref(),
+            Some("second rule")
+        );
+        std::fs::remove_file(path).unwrap();
+        assert!(current_team_instructions(&ctx).is_err());
     }
 
     // ── huddle instructions ─────────────────────────────────────────────────

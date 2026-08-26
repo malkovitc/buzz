@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use tauri::AppHandle;
 
 use super::agent_env::{build_buzz_agent_provider_defaults, idle_pool_sleep_env};
+use super::spawn_snapshot::team_instructions_for_env;
 
 use crate::{
     managed_agents::{
@@ -685,19 +686,18 @@ pub fn spawn_agent_child(
             }
         }
     }
-    let team_instructions = super::spawn_snapshot::effective_team_instructions(record, &teams);
+    command.env_remove("BUZZ_ACP_TEAM_INSTRUCTIONS_FILE");
+    let team_instructions = team_instructions_for_env(record, &teams, &descriptor.env);
     if let Some(instructions) = &team_instructions {
         command.env("BUZZ_ACP_TEAM_INSTRUCTIONS", instructions);
     } else {
         command.env_remove("BUZZ_ACP_TEAM_INSTRUCTIONS");
     }
-
     // Prompt, model, and provider all come from the single `effective_cfg`
     // resolved at the top of this function — the SAME resolve the spawn-config
     // snapshot reads, so env write and restart badge cannot disagree. Linked
     // instances never consult the record's own model/provider/prompt bytes;
     // definition-less instances fall back to their own fields, then global.
-    //
     // Derive the mesh decision BEFORE moving fields out — `relay_mesh_model_id`
     // is the single authoritative gate; the mesh-llm block below MUST use it
     // rather than re-deriving from `effective_provider` to keep preflight and

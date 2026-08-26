@@ -762,4 +762,16 @@ mod tests {
         env.insert("BUZZ_ACP_HEARTBEAT_INTERVAL".into(), "300".into());
         assert!(!super::super::agent_env::managed_agent_uses_lazy_pool(&env));
     }
+
+    #[test]
+    fn local_spawn_clears_inherited_instruction_file_before_user_env() {
+        let source = include_str!("runtime.rs");
+        let clear = source
+            .find(r#"command.env_remove("BUZZ_ACP_TEAM_INSTRUCTIONS_FILE");"#)
+            .expect("spawn must clear the Desktop process value");
+        let user_env = source
+            .find("for (key, value) in &descriptor.env")
+            .expect("spawn must apply resolved user env");
+        assert!(clear < user_env, "resolved file source must be applied last");
+    }
 }
