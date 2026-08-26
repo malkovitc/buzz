@@ -424,6 +424,10 @@ export async function replayLiveSubscriptions({
             error,
           );
           if (attempt === PAGE_REPLAY_MAX_ATTEMPTS) {
+            // Every failed attempt may already have queued complete pages.
+            // Drain them while reconnect dedupe still spans live and repair
+            // delivery, then release repair completion.
+            flushReplayEvents?.();
             markReconnectRepairDone(subscription, generation);
             return;
           }

@@ -1339,6 +1339,43 @@ test("repair buffer flushes before reconnect dedupe is released", async () => {
   assert.equal(subscription.reconnectReplay, undefined);
 });
 
+test("exhausted partial repairs flush before reconnect dedupe is released", async () => {
+  resetGate(0);
+  const repairPage = eventRange("partial", 1_000, REPLAY_BATCH_SIZE);
+  const delivered = [];
+  const queued = [];
+  const subscription = {
+    mode: "live",
+    filter: buildChannelFilter("channel-1", 50),
+    onEvent: (value) => delivered.push(value.id),
+    lastSeenCreatedAt: 1_001,
+  };
+
+  await replayLiveSubscriptions({
+    subscriptions: new Map([["live-1", subscription]]),
+    generation: 5,
+    sendRaw: async (payload) => {
+      if (payload[0] === "REQ") markReconnectLiveEose(subscription, 5);
+    },
+    requestRepair: async (request) => {
+      if (request.beforeId) throw new Error("next repair page unavailable");
+      return repairPage;
+    },
+    replaySubscriptionEvent: (_subId, value) => queued.push(value),
+    flushReplayEvents: () => {
+      for (const value of queued.splice(0)) {
+        if (shouldDispatchSubscriptionEvent(subscription, value)) {
+          subscription.onEvent(value);
+        }
+      }
+    },
+  });
+
+  assert.equal(delivered.length, REPLAY_BATCH_SIZE);
+  assert.equal(new Set(delivered).size, REPLAY_BATCH_SIZE);
+  assert.equal(subscription.reconnectReplay, undefined);
+});
+
 test("replay dedupe clears only after both completions and never from stale generation", () => {
   for (const repairFirst of [true, false]) {
     const subscription = {
