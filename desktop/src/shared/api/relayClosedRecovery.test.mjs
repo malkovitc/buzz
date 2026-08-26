@@ -11,7 +11,10 @@ import {
   requestHistoryGated,
 } from "./relayGateBoundary.ts";
 import { buildChannelLiveFilter } from "./relayChannelFilters.ts";
-import { RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS } from "./relayReconnectReplay.ts";
+import {
+  PAGE_REPLAY_MAX_ATTEMPTS,
+  RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS,
+} from "./relayReconnectReplay.ts";
 
 // ── Fake-timer setup ──────────────────────────────────────────────────────────
 // The rate-limit gate and closed-retry logic use window.setTimeout/clearTimeout.
@@ -519,6 +522,46 @@ test("cursorless bounded channel CLOSED retry repairs from zero", async () => {
   assert.equal(repairRequests.length, 1);
   assert.equal(repairRequests[0].since, 0);
   assert.equal(subscription.pendingReplaySince, undefined);
+});
+
+test("failed CLOSED repair retries only the repair and keeps the restored live REQ", async () => {
+  resetAll(0);
+  const subscription = {
+    mode: "live",
+    filter: buildChannelLiveFilter("ch-repair-failure"),
+    onEvent: () => {},
+    lastSeenCreatedAt: 3_000,
+  };
+  const subscriptions = new Map([["live-repair-failure", subscription]]);
+  let liveReqCalls = 0;
+  let repairCalls = 0;
+
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-repair-failure",
+    message: "error: temporary relay failure",
+    sendReq: async () => {
+      liveReqCalls += 1;
+    },
+    requestRepair: async () => {
+      repairCalls += 1;
+      throw new Error("repair IPC unavailable");
+    },
+    generation: 8,
+  });
+
+  tickTo(1_001);
+  await new Promise((resolve) => setImmediate(resolve));
+  tickTo(60_000);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(liveReqCalls, 1);
+  assert.equal(repairCalls, PAGE_REPLAY_MAX_ATTEMPTS);
+  assert.equal(
+    subscription.pendingReplaySince,
+    3_000 - RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS,
+  );
+  assert.equal(subscriptions.get("live-repair-failure"), subscription);
 });
 
 test("CLOSED retry repairs more than the live limit from accepted author time", async () => {

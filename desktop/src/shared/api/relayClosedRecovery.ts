@@ -1,8 +1,10 @@
 import { classifyRelayClosed } from "@/shared/api/relayClosedPolicy";
 import {
   activateRateLimit,
+  isRateLimited,
   parseRateLimitHint,
   rateLimitRemainingMs,
+  waitForRateLimit,
 } from "@/shared/api/relayRateLimitGate";
 import {
   sortEvents,
@@ -12,6 +14,7 @@ import {
 } from "@/shared/api/relayClientShared";
 import type { ChannelReconnectRepairRequest } from "@/shared/api/channelReconnectRepair";
 import {
+  PAGE_REPLAY_MAX_ATTEMPTS,
   replayReconnectHistoryPages,
   resolveReconnectReplaySince,
   shouldPageReconnectReplay,
@@ -171,7 +174,25 @@ function recoverLiveSubscriptionFromClosed({
     }
 
     void (async () => {
-      await sendReq(subId, subscription.filter);
+      try {
+        await sendReq(subId, subscription.filter);
+      } catch (error) {
+        if (subscriptions.get(subId) !== subscription) return;
+        console.error("Failed to restore closed relay subscription", error);
+        recoverLiveSubscriptionFromClosed({
+          subscriptions,
+          subId,
+          subscription,
+          message,
+          sendReq,
+          requestRepair,
+          replaySubscriptionEvent,
+          flushReplayEvents,
+          generation,
+          isActive,
+        });
+        return;
+      }
       if (
         !shouldRepair ||
         channelId === undefined ||
@@ -181,38 +202,42 @@ function recoverLiveSubscriptionFromClosed({
         return;
       }
 
-      const completed = await replayReconnectHistoryPages({
-        subscription,
-        channelId,
-        since: subscription.pendingReplaySince ?? replaySince,
-        until: undefined,
-        isActive: () => isActive() && subscriptions.get(subId) === subscription,
-        requestRepair,
-        replaySubscriptionEvent: replaySubscriptionEvent
-          ? (event) => replaySubscriptionEvent(subId, event)
-          : undefined,
-      });
-      if (completed) {
-        flushReplayEvents?.();
-        subscription.pendingReplaySince = undefined;
-        markReconnectRepairDone(subscription, generation);
+      for (let attempt = 1; attempt <= PAGE_REPLAY_MAX_ATTEMPTS; attempt++) {
+        try {
+          const completed = await replayReconnectHistoryPages({
+            subscription,
+            channelId,
+            since: subscription.pendingReplaySince ?? replaySince,
+            until: undefined,
+            isActive: () =>
+              isActive() && subscriptions.get(subId) === subscription,
+            requestRepair,
+            replaySubscriptionEvent: replaySubscriptionEvent
+              ? (event) => replaySubscriptionEvent(subId, event)
+              : undefined,
+          });
+          if (completed) {
+            flushReplayEvents?.();
+            subscription.pendingReplaySince = undefined;
+            markReconnectRepairDone(subscription, generation);
+          }
+          return;
+        } catch (error) {
+          console.warn(
+            `[CLOSED recovery] history backfill attempt ${attempt}/${PAGE_REPLAY_MAX_ATTEMPTS} failed for ${subId}:`,
+            error,
+          );
+          if (attempt === PAGE_REPLAY_MAX_ATTEMPTS) {
+            // The live REQ is already healthy. Keep its unresolved floor for
+            // the next reconnect, but release this generation's dedupe state.
+            markReconnectRepairDone(subscription, generation);
+            return;
+          }
+          if (isRateLimited()) await waitForRateLimit();
+          if (!isActive() || subscriptions.get(subId) !== subscription) return;
+        }
       }
-    })().catch((error) => {
-      if (subscriptions.get(subId) !== subscription) return;
-      console.error("Failed to restore closed relay subscription", error);
-      recoverLiveSubscriptionFromClosed({
-        subscriptions,
-        subId,
-        subscription,
-        message,
-        sendReq,
-        requestRepair,
-        replaySubscriptionEvent,
-        flushReplayEvents,
-        generation,
-        isActive,
-      });
-    });
+    })();
   }, delayMs);
 }
 
