@@ -47,6 +47,37 @@ pub enum ConfigError {
     ConfigFile(String),
 }
 
+const MAX_TEAM_INSTRUCTIONS_BYTES: usize = 65_536;
+
+fn normalize_team_instructions(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+pub(crate) fn read_team_instructions_file(
+    path: &std::path::Path,
+) -> Result<Option<String>, ConfigError> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    let mut content = Vec::with_capacity(MAX_TEAM_INSTRUCTIONS_BYTES.min(8192));
+    file.take((MAX_TEAM_INSTRUCTIONS_BYTES + 1) as u64)
+        .read_to_end(&mut content)?;
+    if content.len() > MAX_TEAM_INSTRUCTIONS_BYTES {
+        return Err(ConfigError::ConfigFile(format!(
+            "team instructions file {} exceeds 64 KiB limit",
+            path.display()
+        )));
+    }
+    let content = String::from_utf8(content).map_err(|_| {
+        ConfigError::ConfigFile(format!(
+            "team instructions file {} is not valid UTF-8",
+            path.display()
+        ))
+    })?;
+    Ok(normalize_team_instructions(content))
+}
+
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum SubscribeMode {
     Mentions,
@@ -480,9 +511,21 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_ALLOWED_RESPOND_TO", value_delimiter = ',')]
     pub allowed_respond_to: Option<Vec<String>>,
 
-    /// Team-owned instructions layered after `[Agent Instructions]` and before agent memory.
-    #[arg(long, env = "BUZZ_ACP_TEAM_INSTRUCTIONS")]
+    /// Inline team-owned instructions layered after `[Agent Instructions]` and before agent memory.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_TEAM_INSTRUCTIONS",
+        conflicts_with = "team_instructions_file"
+    )]
     pub team_instructions: Option<String>,
+
+    /// Read team-owned instructions from a bounded UTF-8 file.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_TEAM_INSTRUCTIONS_FILE",
+        conflicts_with = "team_instructions"
+    )]
+    pub team_instructions_file: Option<PathBuf>,
 
     /// Publish encrypted ACP observer frames over the relay.
     #[arg(long, env = "BUZZ_ACP_RELAY_OBSERVER", default_value_t = false)]
@@ -533,6 +576,8 @@ pub struct Config {
     pub system_prompt: Option<String>,
     /// Team-owned instructions layered separately from the agent system prompt.
     pub team_instructions: Option<String>,
+    /// Validated file source, re-read for each new ACP session.
+    pub team_instructions_file: Option<PathBuf>,
     pub initial_message: Option<String>,
     pub subscribe_mode: SubscribeMode,
     pub dedup_mode: DedupMode,
@@ -1107,6 +1152,15 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
+        let team_instructions_file = args.team_instructions_file.clone();
+        let team_instructions = if let Some(text) = args.team_instructions {
+            normalize_team_instructions(text)
+        } else if let Some(ref path) = team_instructions_file {
+            read_team_instructions_file(path)?
+        } else {
+            None
+        };
+
         let config = Config {
             keys,
             relay_url: args.relay_url,
@@ -1120,12 +1174,8 @@ impl Config {
             turn_liveness_secs,
             heartbeat_prompt,
             system_prompt,
-            team_instructions: args
-                .team_instructions
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
+            team_instructions,
+            team_instructions_file,
             initial_message: args.initial_message,
             subscribe_mode: args.subscribe,
             dedup_mode: args.dedup,
@@ -1510,6 +1560,7 @@ mod tests {
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
+            team_instructions_file: None,
             initial_message: None,
             subscribe_mode: mode,
             dedup_mode: DedupMode::Queue,
@@ -2883,6 +2934,74 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    fn team_instructions_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "buzz-acp-{label}-team-instructions-{}.md",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn team_instructions_args(path: &std::path::Path) -> CliArgs {
+        CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--team-instructions-file",
+            path.to_str().unwrap(),
+        ])
+        .expect("file option should parse")
+    }
+
+    #[test]
+    fn team_instructions_file_loads_and_trims_content() {
+        let path = team_instructions_path("valid");
+        std::fs::write(&path, "\n  Add members when creating a channel.  \n").unwrap();
+        let config = Config::from_args(team_instructions_args(&path)).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            config.team_instructions.as_deref(),
+            Some("Add members when creating a channel.")
+        );
+        assert!(config.team_instructions_file.is_some());
+    }
+
+    #[test]
+    fn team_instructions_file_conflicts_with_inline_value() {
+        let result = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--team-instructions",
+            "inline",
+            "--team-instructions-file",
+            "/tmp/team-instructions.md",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_team_instructions_files_fail_startup() {
+        let missing = team_instructions_path("missing");
+        assert!(Config::from_args(team_instructions_args(&missing)).is_err());
+
+        let oversized = team_instructions_path("oversized");
+        std::fs::write(&oversized, vec![b'x'; MAX_TEAM_INSTRUCTIONS_BYTES + 1]).unwrap();
+        let error = Config::from_args(team_instructions_args(&oversized))
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(oversized).unwrap();
+        assert!(error.contains("exceeds 64 KiB limit"), "got: {error}");
+
+        let invalid_utf8 = team_instructions_path("invalid-utf8");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        let error = Config::from_args(team_instructions_args(&invalid_utf8))
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(invalid_utf8).unwrap();
+        assert!(error.contains("not valid UTF-8"), "got: {error}");
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {

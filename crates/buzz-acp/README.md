@@ -111,6 +111,8 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_AGENT_COMMAND` | no | `goose` | Agent binary to spawn. |
 | `BUZZ_ACP_AGENT_ARGS` | no | `acp` | Agent arguments (comma-separated). |
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
+| `BUZZ_ACP_TEAM_INSTRUCTIONS` | no | — | Inline team-owned instructions. Conflicts with the file source. |
+| `BUZZ_ACP_TEAM_INSTRUCTIONS_FILE` | no | — | UTF-8 team instructions file, capped at 64 KiB and re-read for each new ACP session. Conflicts with the inline source. |
 | `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
 | `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
@@ -118,6 +120,8 @@ All configuration is via environment variables (or CLI flags — every env var h
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
 
 **Legacy env vars:** `BUZZ_ACP_PRIVATE_KEY`, `BUZZ_ACP_API_TOKEN`, and `BUZZ_ACP_TURN_TIMEOUT` (replaced by `BUZZ_ACP_IDLE_TIMEOUT`) are still accepted as fallbacks.
+
+File-backed team instructions are validated at startup and read again when a new ACP session is created, allowing long-running harnesses to pick up changes without restart. If the file later becomes missing, unreadable, oversized, or invalid UTF-8, the affected session creation fails without sending stale or partial instructions.
 
 ### Parallel Agents & Heartbeat
 
