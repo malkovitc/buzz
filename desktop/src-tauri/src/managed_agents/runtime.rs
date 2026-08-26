@@ -686,6 +686,7 @@ pub fn spawn_agent_child(
             }
         }
     }
+    command.env_remove("BUZZ_ACP_TEAM_INSTRUCTIONS_FILE");
     let team_instructions = team_instructions_for_env(record, &teams, &descriptor.env);
     if let Some(instructions) = &team_instructions {
         command.env("BUZZ_ACP_TEAM_INSTRUCTIONS", instructions);
@@ -697,7 +698,6 @@ pub fn spawn_agent_child(
     // snapshot reads, so env write and restart badge cannot disagree. Linked
     // instances never consult the record's own model/provider/prompt bytes;
     // definition-less instances fall back to their own fields, then global.
-    //
     // Derive the mesh decision BEFORE moving fields out — `relay_mesh_model_id`
     // is the single authoritative gate; the mesh-llm block below MUST use it
     // rather than re-deriving from `effective_provider` to keep preflight and
