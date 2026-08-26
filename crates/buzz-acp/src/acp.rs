@@ -48,27 +48,23 @@ const REDACTED_PLACEHOLDER: &str = "<redacted>";
 /// Copy of a wire message with every MCP-server env *value* masked, safe to log
 /// or publish to the observer feed.
 ///
-/// The harness injects the agent's Nostr secret key as `BUZZ_PRIVATE_KEY` in the
-/// `session/new` MCP config; it must never hit the `acp::wire` log or the observer
-/// stream in cleartext. Every `env[].value` is masked wherever it appears in the
-/// tree — this covers the outbound config (`params.mcpServers`) and any inbound
-/// message that echoes the request back. Env names and all other fields are
-/// preserved, and the input (the message delivered to the agent) is never mutated.
-///
-/// Borrows when there is no env to mask (the common case — only `session/new`
-/// carries env), so per-turn prompts and notifications aren't cloned just to be
-/// logged.
-fn redact_wire(value: &serde_json::Value) -> std::borrow::Cow<'_, serde_json::Value> {
-    if contains_env(value) {
+/// Structured `env[].value` fields are always masked. Values remembered from an
+/// outbound MCP configuration are also replaced wherever an adapter echoes them
+/// inside a JSON string, including valid JSON-RPC error messages. The input sent
+/// to the adapter is never mutated.
+fn redact_wire<'a>(
+    value: &'a serde_json::Value,
+    known_env_values: &[String],
+) -> std::borrow::Cow<'a, serde_json::Value> {
+    if contains_env(value) || contains_known_env_value(value, known_env_values) {
         let mut redacted = value.clone();
-        redact_env_values(&mut redacted);
+        redact_env_values(&mut redacted, known_env_values);
         std::borrow::Cow::Owned(redacted)
     } else {
         std::borrow::Cow::Borrowed(value)
     }
 }
 
-/// Whether any `env` array appears anywhere in the tree.
 fn contains_env(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => map
@@ -79,8 +75,49 @@ fn contains_env(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Recursively mask the `value` of every entry in any `env` array, in place.
-fn redact_env_values(value: &mut serde_json::Value) {
+fn contains_known_env_value(value: &serde_json::Value, known_env_values: &[String]) -> bool {
+    match value {
+        serde_json::Value::String(text) => known_env_values
+            .iter()
+            .any(|known| !known.is_empty() && text.contains(known)),
+        serde_json::Value::Object(map) => map
+            .values()
+            .any(|child| contains_known_env_value(child, known_env_values)),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|child| contains_known_env_value(child, known_env_values)),
+        _ => false,
+    }
+}
+
+fn collect_env_values(value: &serde_json::Value, values: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if key == "env" {
+                    if let Some(env) = child.as_array() {
+                        for var in env {
+                            if let Some(value) = var.get("value").and_then(|item| item.as_str()) {
+                                if !value.is_empty() && !values.iter().any(|known| known == value) {
+                                    values.push(value.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+                collect_env_values(child, values);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_env_values(child, values);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_env_values(value: &mut serde_json::Value, known_env_values: &[String]) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map.iter_mut() {
@@ -93,10 +130,19 @@ fn redact_env_values(value: &mut serde_json::Value) {
                         }
                     }
                 }
-                redact_env_values(child);
+                redact_env_values(child, known_env_values);
             }
         }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_env_values),
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|child| redact_env_values(child, known_env_values)),
+        serde_json::Value::String(text) => {
+            for known in known_env_values.iter().filter(|known| !known.is_empty()) {
+                if text.contains(known) {
+                    *text = text.replace(known, REDACTED_PLACEHOLDER);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -234,6 +280,9 @@ pub struct AcpClient {
     observer_agent_index: Option<usize>,
     /// Best-effort context attached to raw ACP wire events.
     observer_context: ObserverContext,
+    /// Non-empty MCP env values sent to this adapter, retained only so an
+    /// adapter echoing one inside an error string cannot leak it to telemetry.
+    wire_env_values: Vec<String>,
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
     ///
@@ -612,6 +661,7 @@ impl AcpClient {
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
+            wire_env_values: Vec::new(),
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
@@ -630,6 +680,21 @@ impl AcpClient {
     /// Update metadata that will be attached to subsequent raw wire events.
     pub fn set_observer_context(&mut self, context: ObserverContext) {
         self.observer_context = context;
+    }
+
+    fn redact_outbound_wire<'a>(
+        &mut self,
+        value: &'a serde_json::Value,
+    ) -> std::borrow::Cow<'a, serde_json::Value> {
+        collect_env_values(value, &mut self.wire_env_values);
+        redact_wire(value, &self.wire_env_values)
+    }
+
+    fn redact_inbound_wire<'a>(
+        &self,
+        value: &'a serde_json::Value,
+    ) -> std::borrow::Cow<'a, serde_json::Value> {
+        redact_wire(value, &self.wire_env_values)
     }
 
     /// Return a clone of the observer handle, if attached.
@@ -880,7 +945,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", serde_json::to_string(redact_wire(&msg).as_ref()).unwrap_or_default());
+        tracing::debug!(target: "acp::wire", "→ {}", serde_json::to_string(self.redact_outbound_wire(&msg).as_ref()).unwrap_or_default());
         if let Err(e) = self.write_ndjson(&msg).await {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
@@ -1158,7 +1223,8 @@ impl AcpClient {
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
-        self.observe("acp_write", redact_wire(value).into_owned());
+        let redacted = self.redact_outbound_wire(value).into_owned();
+        self.observe("acp_write", redacted);
         Ok(())
     }
 
@@ -1189,7 +1255,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", serde_json::to_string(redact_wire(&msg).as_ref()).unwrap_or_default());
+        tracing::debug!(target: "acp::wire", "→ {}", serde_json::to_string(self.redact_outbound_wire(&msg).as_ref()).unwrap_or_default());
 
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
@@ -1254,7 +1320,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ (notification) {}", serde_json::to_string(redact_wire(&msg).as_ref()).unwrap_or_default());
+        tracing::debug!(target: "acp::wire", "→ (notification) {}", serde_json::to_string(self.redact_outbound_wire(&msg).as_ref()).unwrap_or_default());
         self.write_ndjson(&msg).await?;
         Ok(())
     }
@@ -1318,7 +1384,7 @@ impl AcpClient {
             // Log and observe a redacted copy: an agent can echo its injected
             // mcpServers config (with BUZZ_PRIVATE_KEY) back in a reply. Dispatch
             // below still uses the original `msg`.
-            let redacted = redact_wire(&msg);
+            let redacted = self.redact_inbound_wire(&msg);
             tracing::debug!(target: "acp::wire", "← {}", serde_json::to_string(redacted.as_ref()).unwrap_or_default());
             self.observe("acp_read", redacted.into_owned());
 
@@ -1549,7 +1615,7 @@ impl AcpClient {
                             tracing::debug!(
                                 target: "acp::wire",
                                 "→ {}",
-                                serde_json::to_string(redact_wire(&msg).as_ref()).unwrap_or_default()
+                                serde_json::to_string(self.redact_outbound_wire(&msg).as_ref()).unwrap_or_default()
                             );
                             match self.write_ndjson(&msg).await {
                                 Ok(()) => {
@@ -1653,7 +1719,7 @@ impl AcpClient {
                     // Log and observe a redacted copy: an agent can echo its
                     // injected mcpServers config (with BUZZ_PRIVATE_KEY) back in a
                     // reply. Dispatch below still uses the original `msg`.
-                    let redacted = redact_wire(&msg);
+                    let redacted = self.redact_inbound_wire(&msg);
                     tracing::debug!(target: "acp::wire", "← {}", serde_json::to_string(redacted.as_ref()).unwrap_or_default());
                     self.observe("acp_read", redacted.into_owned());
 
@@ -3932,6 +3998,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_new_redacts_env_value_echoed_in_json_rpc_error_string() {
+        const SECRET: &str = "nsec1fake0secret0testkey00000000000000000000000000000000000000";
+
+        let script = r#"
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -t 2 _req
+            echo '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid BUZZ_PRIVATE_KEY __SECRET__"}}'
+            sleep 1
+        "#
+        .replace("__SECRET__", SECRET);
+
+        let mut client = spawn_script(&script).await;
+        let observer = ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+
+        let result = client
+            .session_new_full(
+                "/tmp",
+                vec![McpServer {
+                    name: "buzz".into(),
+                    command: "buzz".into(),
+                    args: vec![],
+                    env: vec![EnvVar {
+                        name: "BUZZ_PRIVATE_KEY".into(),
+                        value: SECRET.into(),
+                    }],
+                }],
+                None,
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "adapter error must reach the caller");
+
+        let events = observer.snapshot();
+        let read = events
+            .iter()
+            .find(|event| event.kind == "acp_read" && event.payload.get("error").is_some())
+            .expect("observer should record the JSON-RPC error");
+        let payload = serde_json::to_string(&read.payload).unwrap();
+        assert!(!payload.contains(SECRET), "observer leaked: {payload}");
+        assert!(payload.contains(REDACTED_PLACEHOLDER));
+    }
+
     /// A malformed line that echoes the secret must not reach the observer feed
     /// via the parse-error path either — that line can't be structurally redacted,
     /// so its content is never published.
@@ -4011,7 +4126,9 @@ mod tests {
             }
         });
 
-        let out = redact_wire(&msg).into_owned();
+        let mut known_env_values = Vec::new();
+        collect_env_values(&msg, &mut known_env_values);
+        let out = redact_wire(&msg, &known_env_values).into_owned();
         let env = &out["params"]["mcpServers"][0]["env"];
         // Values masked, names + other fields intact.
         assert_eq!(env[0]["value"], REDACTED_PLACEHOLDER);
@@ -4035,7 +4152,7 @@ mod tests {
             "method": "session/prompt",
             "params": {"sessionId": "ses_1", "prompt": [{"type": "text", "text": "hi"}]}
         });
-        let out = redact_wire(&msg);
+        let out = redact_wire(&msg, &[]);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(*out, msg);
     }
