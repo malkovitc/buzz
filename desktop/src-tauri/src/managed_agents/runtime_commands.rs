@@ -744,6 +744,16 @@ mod tests {
             [r#"command.env("BUZZ_ACP_LAZY_POOL", lazy_pool.to_string());"#],
             "all Desktop spawn paths must share the heartbeat-aware policy"
         );
+        let user_env_write = source
+            .find("for (key, value) in &descriptor.env")
+            .expect("spawn must apply resolved user env");
+        let pool_policy_write = source
+            .find(writes[0])
+            .expect("spawn must apply the computed pool policy");
+        assert!(
+            pool_policy_write > user_env_write,
+            "reserved pool policy must override conflicting user env"
+        );
 
         let mut env = BTreeMap::new();
         assert!(super::super::agent_env::managed_agent_uses_lazy_pool(&env));
