@@ -3364,12 +3364,14 @@ fn conversation_context_delta(
             messages,
             total,
             truncated,
+            root_kind,
         } => {
             let messages = filter(messages);
             (!messages.is_empty()).then_some(ConversationContext::Thread {
                 messages,
                 total,
                 truncated,
+                root_kind,
             })
         }
         ConversationContext::Dm {
@@ -3649,6 +3651,8 @@ where
         .kinds([
             nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
             nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_DIFF as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_FORUM_COMMENT as u16),
         ])
         .custom_tags(e_tag, [root_event_id])
         .custom_tags(h_tag, [ch_str.as_str()])
@@ -3839,6 +3843,7 @@ fn parse_thread_response(json: serde_json::Value) -> Option<ConversationContext>
         messages,
         total,
         truncated,
+        root_kind: None,
     })
 }
 
@@ -3945,6 +3950,7 @@ fn parse_nostr_thread_response_with_meta(
     let events = json.as_array()?;
     let agent_pubkey_hex = agent_pubkey.to_hex();
     let mut root_msg = None;
+    let mut root_kind = None;
     let mut reply_msgs = Vec::new();
     let mut seen_reply_ids = HashSet::new();
 
@@ -3952,6 +3958,10 @@ fn parse_nostr_thread_response_with_meta(
         let ev_id = ev.get("id").and_then(|v| v.as_str()).unwrap_or("");
         if let Some(msg) = json_to_context_message(ev) {
             if ev_id == root_event_id {
+                root_kind = ev
+                    .get("kind")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|kind| u32::try_from(kind).ok());
                 root_msg = Some(msg);
             } else if seen_reply_ids.insert(ev_id.to_string()) {
                 let is_agent = msg.pubkey.eq_ignore_ascii_case(&agent_pubkey_hex);
@@ -4017,6 +4027,7 @@ fn parse_nostr_thread_response_with_meta(
             messages,
             total,
             truncated,
+            root_kind,
         },
         root_present,
     })
@@ -5189,6 +5200,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert_eq!(messages.len(), 2); // root + 1 reply
                 assert_eq!(total, 2); // 1 reply + 1 root
@@ -5226,6 +5238,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert_eq!(messages.len(), 2);
                 assert_eq!(total, 11); // 10 replies + 1 root
@@ -5363,6 +5376,33 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_nostr_thread_response_captures_forum_and_stream_root_kinds() {
+        let root_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let agent = Keys::generate();
+
+        for kind in [
+            buzz_core::kind::KIND_FORUM_POST,
+            buzz_core::kind::KIND_STREAM_MESSAGE,
+        ] {
+            let json = json!([{
+                "id": root_id,
+                "kind": kind,
+                "pubkey": "pub1",
+                "content": "thread root",
+                "created_at": 1710518400
+            }]);
+            let ctx = parse_nostr_thread_response(json, root_id, 10, &agent.public_key())
+                .expect("root should parse");
+            match ctx {
+                ConversationContext::Thread { root_kind, .. } => {
+                    assert_eq!(root_kind, Some(kind));
+                }
+                _ => panic!("expected Thread context"),
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_nostr_thread_response_marks_query_window_truncated() {
         let agent = Keys::generate();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -5401,6 +5441,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert_eq!(messages.len(), 3); // root + 2 displayed replies
                 assert_eq!(total, 4); // root + displayed replies + sentinel
@@ -5442,6 +5483,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert_eq!(messages.len(), 2);
                 assert_eq!(total, 2);
@@ -5562,6 +5604,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(messages.len(), 3);
@@ -5613,6 +5656,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(messages.len(), 2);
@@ -5665,6 +5709,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(messages.len(), 3);
@@ -5717,6 +5762,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(messages.len(), 3);
@@ -5778,6 +5824,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(total, 4);
@@ -5851,6 +5898,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(messages.len(), 3);
@@ -5893,14 +5941,14 @@ mod tests {
         assert!(root.get("limit").is_none());
 
         let replies = serde_json::to_value(&filters[1]).expect("serialize replies filter");
-        assert_eq!(replies.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(replies.get("kinds"), Some(&json!([9, 40002, 40008, 45003])));
         assert_eq!(replies.get("#e"), Some(&json!([root_id])));
         assert_eq!(replies.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(replies.get("limit"), Some(&json!(reply_limit)));
         assert!(replies.get("authors").is_none());
 
         let agent = serde_json::to_value(&filters[2]).expect("serialize agent filter");
-        assert_eq!(agent.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(agent.get("kinds"), Some(&json!([9, 40002, 40008, 45003])));
         assert_eq!(agent.get("#e"), Some(&json!([root_id])));
         assert_eq!(agent.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(agent.get("authors"), Some(&json!([agent_pubkey.to_hex()])));
@@ -5911,7 +5959,7 @@ mod tests {
         assert_eq!(filters.len(), 1, "count should query only matching replies");
 
         let count = serde_json::to_value(&filters[0]).expect("serialize count filter");
-        assert_eq!(count.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(count.get("kinds"), Some(&json!([9, 40002, 40008, 45003])));
         assert_eq!(count.get("#e"), Some(&json!([root_id])));
         assert_eq!(count.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(count.get("limit"), Some(&json!(0)));
@@ -5990,6 +6038,7 @@ mod tests {
             }],
             total: 1,
             truncated: false,
+            root_kind: None,
         };
 
         let pubkeys = collect_prompt_pubkeys(&batch, Some(&context));
@@ -6660,6 +6709,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             ],
             total: 3,
             truncated: false,
+            root_kind: Some(buzz_core::kind::KIND_FORUM_POST),
         };
 
         let delta = conversation_context_delta(Some(context), &delivered, &triggering)
@@ -6669,11 +6719,13 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 messages,
                 total,
                 truncated,
+                root_kind,
             } => {
                 assert_eq!(messages.len(), 1);
                 assert_eq!(messages[0].event_id, "new");
                 assert_eq!(total, 3);
                 assert!(!truncated);
+                assert_eq!(root_kind, Some(buzz_core::kind::KIND_FORUM_POST));
             }
             _ => panic!("expected thread context"),
         }
