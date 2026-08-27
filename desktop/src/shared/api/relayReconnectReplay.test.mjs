@@ -15,6 +15,7 @@ import {
   shouldPageReconnectReplay,
 } from "./relayReconnectReplay.ts";
 import { buildChannelFilter } from "./relayChannelFilters.ts";
+import { hasActiveLiveReq } from "./relayClientShared.ts";
 import {
   flushEvents,
   handleSubscriptionEose,
@@ -976,6 +977,7 @@ test("same-generation replay does not overlap an active same-ID REQ", async () =
     closeSubscription: async () => {},
     generation: 10,
   });
+  assert.equal(hasActiveLiveReq(["REQ", "live-1"], subscriptions, 10), true);
   await replay();
 
   assert.equal(reqCalls, 1);

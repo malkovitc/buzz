@@ -91,6 +91,21 @@ type LiveSubscription = {
   closedRetryTimeout?: number;
 };
 
+export function hasActiveLiveReq(
+  payload: unknown[],
+  subscriptions: Map<string, RelaySubscription>,
+  generation: number,
+) {
+  const subId = payload[0] === "REQ" ? payload[1] : undefined;
+  const subscription =
+    typeof subId === "string" ? subscriptions.get(subId) : undefined;
+  return (
+    subscription?.mode === "live" &&
+    subscription.liveReqGeneration === generation &&
+    subscription.liveReqActive === true
+  );
+}
+
 export type PendingEvent = {
   event: RelayEvent;
   resolve: (event: RelayEvent) => void;

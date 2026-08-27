@@ -12,6 +12,7 @@ import {
 } from "@/shared/constants/kinds";
 import {
   getTextPayload,
+  hasActiveLiveReq,
   toRelayFrames,
   type ConnectionState,
   type LiveSubscriptionReadiness,
@@ -647,11 +648,9 @@ export class RelayClient {
       },
     });
   }
-
   private normalizeRelayError(error: unknown, fallbackMessage: string) {
     return error instanceof Error ? error : new Error(fallbackMessage);
   }
-
   private recoverFromSocketFailure(
     error: unknown,
     fallbackMessage: string,
@@ -660,7 +659,6 @@ export class RelayClient {
     this.resetConnection(normalizedError);
     return normalizedError;
   }
-
   private async sendRawWithReconnectRetry(
     payload: unknown[],
     fallbackMessage: string,
@@ -674,6 +672,9 @@ export class RelayClient {
       );
       try {
         await this.ensureConnected();
+        const { subscriptions, connectionGeneration } = this;
+        if (hasActiveLiveReq(payload, subscriptions, connectionGeneration))
+          return;
         await this.sendRaw(payload);
       } catch (retryError) {
         throw this.recoverFromSocketFailure(
@@ -683,7 +684,6 @@ export class RelayClient {
       }
     }
   }
-
   private async closeSubscription(subId: string) {
     if (this.wsId === null) {
       return;
