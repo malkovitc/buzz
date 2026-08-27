@@ -17,6 +17,7 @@ import {
 import { buildChannelFilter } from "./relayChannelFilters.ts";
 import {
   flushEvents,
+  handleSubscriptionEose,
   markReconnectLiveEose,
   markReconnectRepairDone,
   prepareSubscriptionEvent,
@@ -969,12 +970,16 @@ test("same-generation replay does not overlap an active same-ID REQ", async () =
     });
 
   await replay();
-  const repairOwner = subscription.reconnectReplay;
+  handleSubscriptionEose({
+    subscriptions,
+    subId: "live-1",
+    closeSubscription: async () => {},
+    generation: 10,
+  });
   await replay();
 
   assert.equal(reqCalls, 1);
   assert.equal(repairCalls, 1);
-  assert.equal(subscription.reconnectReplay, repairOwner);
 });
 
 test("overlapping repair cannot mutate successor dedupe in the same generation", async () => {

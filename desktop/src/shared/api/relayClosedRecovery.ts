@@ -396,10 +396,12 @@ export function handleSubscriptionEose({
   const subscription = subscriptions.get(subId);
   if (!subscription) return;
   if (subscription.mode === "live") {
+    // EOSE ends only the initial history stream; the live REQ remains active.
+    // Only CLOSED (or a new socket generation) releases its same-ID send slot.
     if (
       generation !== undefined &&
       subscription.liveReqGeneration !== undefined &&
-      !finishLiveReq(subscription, generation)
+      subscription.liveReqGeneration !== generation
     ) {
       return;
     }
