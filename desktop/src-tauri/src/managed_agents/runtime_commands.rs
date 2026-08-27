@@ -772,6 +772,9 @@ mod tests {
         let user_env = source
             .find("for (key, value) in &descriptor.env")
             .expect("spawn must apply resolved user env");
-        assert!(clear < user_env, "resolved file source must be applied last");
+        assert!(
+            clear < user_env,
+            "resolved file source must be applied last"
+        );
     }
 }
