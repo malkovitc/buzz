@@ -13,12 +13,14 @@ pub mod outcomes;
 
 pub use args::{
     ActionArgs, AgentTarget, AgentsCreateArgs, AgentsDeleteArgs, AgentsUpdateArgs, ChannelReadArgs,
-    MessagePostArgs, MessageReplyArgs, ProfileSetArgs, ReactionAddArgs, StorageAddressArgs,
-    StorageGetArgs, StoragePutArgs,
+    LivenessPingArgs, MessagePostArgs, MessageReplyArgs, ObserverEmitArgs, ObserverFrame,
+    PresenceSetArgs, ProfileSetArgs, ReactionAddArgs, StorageAddressArgs, StorageGetArgs,
+    StoragePutArgs, TypingSetArgs,
 };
+pub use buzz_core::presence::PresenceStatus;
 pub use outcomes::{
     ActionOutcome, AgentsCreateOutcome, AgentsDeleteOutcome, AgentsUpdateOutcome, BrokerMessage,
-    EventPublished, MessagePage, StorageAddress, StorageRecord,
+    EventPublished, MessagePage, ObserverReceipt, StorageAddress, StorageRecord,
 };
 
 /// Maximum characters in a display name or agent name.
@@ -56,6 +58,19 @@ pub const DEFAULT_PAGE_LIMIT: u32 = 100;
 
 /// Maximum accepted length of a read cursor, in bytes.
 pub const MAX_CURSOR_LEN: usize = 256;
+
+/// Maximum observer frames a single `observer.emit` may carry.
+///
+/// Trajectory is high-volume, so a client batches frames per call; the host
+/// re-batches and paces publication. This bounds one call, not the stream.
+pub const MAX_OBSERVER_FRAMES: usize = 256;
+
+/// Maximum bytes of one observer frame's opaque payload.
+///
+/// The payload is passed through and encrypted host-side without being parsed,
+/// so it is bounded but not interpreted. Matches the runtime's per-frame
+/// plaintext budget.
+pub const MAX_OBSERVER_FRAME_BYTES: usize = 64 * 1024;
 
 /// Inbound author gate modes a requester may ask for.
 ///
@@ -149,6 +164,14 @@ pub enum Action {
     StorageGet,
     /// Write one encrypted-memory record by slug.
     StoragePut,
+    /// Publish the requester's presence status.
+    PresenceSet,
+    /// Signal the requester is composing in a channel.
+    TypingSet,
+    /// Publish a batch of the requester's owner-scoped observer frames.
+    ObserverEmit,
+    /// Signal a turn is still alive.
+    LivenessPing,
     /// Mint a managed agent owned by the requester.
     AgentsCreate,
     /// Patch a managed agent the requester owns.
@@ -159,18 +182,22 @@ pub enum Action {
 
 impl Action {
     /// Every action in this protocol version, in wire-name order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 15] = [
         Self::AgentsCreate,
         Self::AgentsDelete,
         Self::AgentsUpdate,
         Self::ChannelRead,
+        Self::LivenessPing,
         Self::MessagePost,
         Self::MessageReply,
+        Self::ObserverEmit,
+        Self::PresenceSet,
         Self::ProfileSet,
         Self::ReactionAdd,
         Self::StorageAddress,
         Self::StorageGet,
         Self::StoragePut,
+        Self::TypingSet,
     ];
 
     /// Stable wire name.
@@ -185,6 +212,10 @@ impl Action {
             Self::StorageAddress => "storage.address",
             Self::StorageGet => "storage.get",
             Self::StoragePut => "storage.put",
+            Self::PresenceSet => "presence.set",
+            Self::TypingSet => "typing.set",
+            Self::ObserverEmit => "observer.emit",
+            Self::LivenessPing => "liveness.ping",
             Self::AgentsCreate => "agents.create",
             Self::AgentsUpdate => "agents.update",
             Self::AgentsDelete => "agents.delete",
@@ -204,7 +235,14 @@ impl Action {
     /// [`super::BrokerErrorCode::Unsupported`] for how a caller reacts.
     #[must_use]
     pub fn is_best_effort(self) -> bool {
-        matches!(self, Self::ReactionAdd)
+        matches!(
+            self,
+            Self::ReactionAdd
+                | Self::PresenceSet
+                | Self::TypingSet
+                | Self::ObserverEmit
+                | Self::LivenessPing
+        )
     }
 
     /// Resolve a wire name.

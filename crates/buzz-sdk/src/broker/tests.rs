@@ -86,6 +86,22 @@ fn action_fixtures() -> Vec<ActionArgs> {
             slug: "mem/broker-foundation".into(),
             value: "a remembered fact".into(),
         }),
+        ActionArgs::PresenceSet(PresenceSetArgs {
+            status: PresenceStatus::Online,
+        }),
+        ActionArgs::TypingSet(TypingSetArgs {
+            channel_id: CHANNEL.into(),
+        }),
+        ActionArgs::ObserverEmit(ObserverEmitArgs {
+            frames: vec![ObserverFrame {
+                kind: "acp_write".into(),
+                payload: r#"{"jsonrpc":"2.0","method":"session/update"}"#.into(),
+            }],
+        }),
+        ActionArgs::LivenessPing(LivenessPingArgs {
+            channel_id: CHANNEL.into(),
+            turn_id: "turn-7f3a".into(),
+        }),
         ActionArgs::AgentsCreate(AgentsCreateArgs {
             channel_id: CHANNEL.into(),
             display_name: "Research helper".into(),
@@ -135,7 +151,11 @@ fn outcome_fixtures(keys: &Keys) -> Vec<ActionOutcome> {
         ActionOutcome::StorageGet(StorageRecord {
             value: Some("a remembered fact".into()),
         }),
-        ActionOutcome::StoragePut(published),
+        ActionOutcome::StoragePut(published.clone()),
+        ActionOutcome::PresenceSet(published.clone()),
+        ActionOutcome::TypingSet(published.clone()),
+        ActionOutcome::ObserverEmit(ObserverReceipt { accepted: 1 }),
+        ActionOutcome::LivenessPing(published),
         ActionOutcome::AgentsCreate(AgentsCreateOutcome {
             agent_pubkey: pubkey(),
             display_name: "Research helper".into(),
@@ -717,8 +737,6 @@ fn only_declared_action_names_resolve() {
         "nip98.auth",
         "keys.export",
         "identity.nsec",
-        "presence.set",
-        "typing.set",
     ] {
         assert!(
             Action::parse(rejected).is_err(),
@@ -963,6 +981,10 @@ fn every_payload_has_an_exact_and_secret_free_wire_schema() {
         ("storage.address/args", vec!["slug"]),
         ("storage.get/args", vec!["slug"]),
         ("storage.put/args", vec!["slug", "value"]),
+        ("presence.set/args", vec!["status"]),
+        ("typing.set/args", vec!["channelId"]),
+        ("observer.emit/args", vec!["frames"]),
+        ("liveness.ping/args", vec!["channelId", "turnId"]),
         (
             "agents.create/args",
             vec![
@@ -1003,6 +1025,13 @@ fn every_payload_has_an_exact_and_secret_free_wire_schema() {
         ),
         ("storage.get/outcome", vec!["value"]),
         ("storage.put/outcome", vec!["createdAt", "eventId", "kind"]),
+        ("presence.set/outcome", vec!["createdAt", "eventId", "kind"]),
+        ("typing.set/outcome", vec!["createdAt", "eventId", "kind"]),
+        ("observer.emit/outcome", vec!["accepted"]),
+        (
+            "liveness.ping/outcome",
+            vec!["createdAt", "eventId", "kind"],
+        ),
         (
             "agents.create/outcome",
             vec!["agentPubkey", "channelId", "displayName"],
@@ -1398,6 +1427,61 @@ fn validators_accept_and_reject_at_their_boundaries() {
         SdkError::ContentTooLarge { .. }
     ));
     assert!(put("Core", "v".into()).is_err());
+
+    // Live signals: presence needs a known status, typing and liveness a real
+    // channel, and observer.emit a non-empty, bounded batch of non-empty frames.
+    assert!(PresenceSetArgs {
+        status: PresenceStatus::Away
+    }
+    .validated()
+    .is_ok());
+    assert!(serde_json::from_value::<PresenceSetArgs>(
+        serde_json::json!({ "status": "invisible" })
+    )
+    .is_err());
+    assert!(TypingSetArgs {
+        channel_id: CHANNEL.into()
+    }
+    .validated()
+    .is_ok());
+    assert!(TypingSetArgs {
+        channel_id: "not-a-uuid".into()
+    }
+    .validated()
+    .is_err());
+    let ping = |channel: &str, turn: &str| {
+        LivenessPingArgs {
+            channel_id: channel.into(),
+            turn_id: turn.into(),
+        }
+        .validated()
+    };
+    assert!(ping(CHANNEL, "turn-1").is_ok());
+    assert!(ping(CHANNEL, "  ").is_err());
+    assert!(ping("not-a-uuid", "turn-1").is_err());
+
+    let frame = |payload: String| ObserverFrame {
+        kind: "acp_write".into(),
+        payload,
+    };
+    let emit = |frames: Vec<ObserverFrame>| ObserverEmitArgs { frames }.validated();
+    assert!(emit(vec![frame("{}".into())]).is_ok());
+    assert!(emit(vec![]).is_err());
+    assert!(emit(vec![ObserverFrame {
+        kind: String::new(),
+        payload: "{}".into()
+    }])
+    .is_err());
+    assert!(emit(vec![frame("   ".into())]).is_err());
+    assert!(matches!(
+        emit(vec![frame(
+            "x".repeat(actions::MAX_OBSERVER_FRAME_BYTES + 1)
+        )])
+        .unwrap_err(),
+        SdkError::ContentTooLarge { .. }
+    ));
+    assert!(emit(vec![frame("{}".into()); actions::MAX_OBSERVER_FRAMES]).is_ok());
+    assert!(emit(vec![frame("{}".into()); actions::MAX_OBSERVER_FRAMES + 1]).is_err());
 
     // Patch-shaped writes must change something, and reject unknown modes.
     let profile_error = ProfileSetArgs {

@@ -43,13 +43,29 @@
 //! nothing stops a host from *holding* keys — that is the point. It stops one
 //! from handing them over.
 //!
+//! # Live signals
+//!
+//! The ephemeral signals a running agent emits so an owner and channel can see
+//! it work are actions too, so a keyless agent keeps parity with a local one:
+//! `presence.set` (status), `typing.set` (composing in a channel),
+//! `observer.emit` (a batch of owner-scoped trajectory frames), and
+//! `liveness.ping` (a turn keepalive). The host derives owner, key, encryption,
+//! and Nostr metadata; the agent supplies only content. All four are
+//! [best-effort][Action::is_best_effort] — a host that does not offer one
+//! refuses it and the agent carries on.
+//!
+//! `observer.emit`'s payload is opaque to this contract: the host encrypts it
+//! and never parses it. `liveness.ping` overlaps `observer.emit` on the wire (a
+//! keepalive could be one more frame) but is its own action so a host can attach
+//! meaning to it — resetting a stall watchdog — rather than only forward it.
+//!
 //! # Deferred operations
 //!
-//! Not in v1, all purely additive later: `presence.set`, `typing.set`, and
-//! streaming reads (waking on a mention is `channel.read` with `mentionsOnly`,
-//! polled). Memory read/write graduated into v1 as `storage.get`/`storage.put`,
-//! both slug-addressed; the host encrypts and decrypts, so the key holder stays
-//! the only party that ever sees the record's key.
+//! Not in v1, purely additive later: streaming reads (waking on a mention is
+//! `channel.read` with `mentionsOnly`, polled). Memory read/write graduated into
+//! v1 as `storage.get`/`storage.put`, both slug-addressed; the host encrypts and
+//! decrypts, so the key holder stays the only party that ever sees the record's
+//! key.
 //!
 //! # Non-goals
 //!
@@ -71,9 +87,10 @@ use actions::absent_or_valued;
 pub use actions::{
     Action, ActionArgs, ActionOutcome, AgentTarget, AgentsCreateArgs, AgentsCreateOutcome,
     AgentsDeleteArgs, AgentsDeleteOutcome, AgentsUpdateArgs, AgentsUpdateOutcome, BrokerMessage,
-    ChannelReadArgs, EventPublished, MessagePage, MessagePostArgs, MessageReplyArgs,
-    ProfileSetArgs, PubkeyHex, ReactionAddArgs, StorageAddress, StorageAddressArgs, StorageGetArgs,
-    StoragePutArgs, StorageRecord,
+    ChannelReadArgs, EventPublished, LivenessPingArgs, MessagePage, MessagePostArgs,
+    MessageReplyArgs, ObserverEmitArgs, ObserverFrame, ObserverReceipt, PresenceSetArgs,
+    PresenceStatus, ProfileSetArgs, PubkeyHex, ReactionAddArgs, StorageAddress, StorageAddressArgs,
+    StorageGetArgs, StoragePutArgs, StorageRecord, TypingSetArgs,
 };
 pub use client::{
     BrokerClient, BrokerClientExt, BrokerFuture, BrokerTransportError, Dispatch, ValidatedFuture,

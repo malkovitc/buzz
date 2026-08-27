@@ -87,6 +87,10 @@ pub(super) fn correlate_identities(
         | (ActionArgs::StorageAddress(_), _)
         | (ActionArgs::StorageGet(_), _)
         | (ActionArgs::StoragePut(_), _)
+        | (ActionArgs::PresenceSet(_), _)
+        | (ActionArgs::TypingSet(_), _)
+        | (ActionArgs::ObserverEmit(_), _)
+        | (ActionArgs::LivenessPing(_), _)
         | (ActionArgs::AgentsCreate(_), _)
         | (ActionArgs::AgentsUpdate(_), _)
         | (ActionArgs::AgentsDelete(_), _) => Ok(()),

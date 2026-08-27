@@ -182,6 +182,18 @@ pub struct StorageRecord {
     pub value: Option<String>,
 }
 
+/// Outcome of `observer.emit`.
+///
+/// A batch acknowledgement, not per-frame receipts: the host re-batches and
+/// paces publication, so individual frames have no stable published id to echo.
+/// `accepted` is how many frames the host took for publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObserverReceipt {
+    /// Frames accepted for publication from this batch.
+    pub accepted: u32,
+}
+
 /// Outcome of a successful `agents.create`.
 ///
 /// Carries the new agent's **public** identity only — there is no field for
@@ -249,6 +261,18 @@ pub enum ActionOutcome {
     /// `storage.put` succeeded.
     #[serde(rename = "storage.put")]
     StoragePut(EventPublished),
+    /// `presence.set` succeeded.
+    #[serde(rename = "presence.set")]
+    PresenceSet(EventPublished),
+    /// `typing.set` succeeded.
+    #[serde(rename = "typing.set")]
+    TypingSet(EventPublished),
+    /// `observer.emit` succeeded.
+    #[serde(rename = "observer.emit")]
+    ObserverEmit(ObserverReceipt),
+    /// `liveness.ping` succeeded.
+    #[serde(rename = "liveness.ping")]
+    LivenessPing(EventPublished),
     /// `agents.create` succeeded.
     #[serde(rename = "agents.create")]
     AgentsCreate(AgentsCreateOutcome),
@@ -273,6 +297,10 @@ impl ActionOutcome {
             Self::StorageAddress(_) => Action::StorageAddress,
             Self::StorageGet(_) => Action::StorageGet,
             Self::StoragePut(_) => Action::StoragePut,
+            Self::PresenceSet(_) => Action::PresenceSet,
+            Self::TypingSet(_) => Action::TypingSet,
+            Self::ObserverEmit(_) => Action::ObserverEmit,
+            Self::LivenessPing(_) => Action::LivenessPing,
             Self::AgentsCreate(_) => Action::AgentsCreate,
             Self::AgentsUpdate(_) => Action::AgentsUpdate,
             Self::AgentsDelete(_) => Action::AgentsDelete,
@@ -304,14 +332,18 @@ impl ActionOutcome {
             | Self::MessageReply(published)
             | Self::ReactionAdd(published)
             | Self::ProfileSet(published)
-            | Self::StoragePut(published) => {
+            | Self::StoragePut(published)
+            | Self::PresenceSet(published)
+            | Self::TypingSet(published)
+            | Self::LivenessPing(published) => {
                 event_id(&published.event_id, "eventId")?;
             }
             Self::StorageAddress(address) => {
                 event_id(&address.d_tag, "dTag")?;
             }
-            // A record body has no identifier or cursor to check.
-            Self::StorageGet(_) => {}
+            // Neither a record body nor a batch receipt carries an identifier or
+            // cursor to check.
+            Self::StorageGet(_) | Self::ObserverEmit(_) => {}
             Self::AgentsCreate(outcome) => {
                 channel(&outcome.channel_id)?;
                 required(&outcome.display_name, "display name", MAX_NAME_CHARS)?;

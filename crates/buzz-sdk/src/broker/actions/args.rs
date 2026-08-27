@@ -9,9 +9,11 @@ use super::{
     absent_or_valued, absent_or_valued_hex64, channel, channel_id, content, cursor, event_id,
     hex64_field, is_false, limit, mentions, optional, required, respond_to, validate_slug, Action,
     PubkeyHex, DEFAULT_PAGE_LIMIT, MAX_ABOUT_CHARS, MAX_CONTENT_BYTES, MAX_EMOJI_CHARS,
-    MAX_NAME_CHARS, MAX_PROMPT_CHARS, MAX_SCALAR_CHARS,
+    MAX_NAME_CHARS, MAX_OBSERVER_FRAMES, MAX_OBSERVER_FRAME_BYTES, MAX_PROMPT_CHARS,
+    MAX_SCALAR_CHARS,
 };
 use crate::SdkError;
+use buzz_core::presence::PresenceStatus;
 
 /// Arguments for `channel.read` — the one read action.
 ///
@@ -352,6 +354,180 @@ impl StoragePutArgs {
     }
 }
 
+// ── Live-signal arguments ───────────────────────────────────────────────────
+
+/// Arguments for `presence.set`.
+///
+/// The status is the whole payload; there is no subject, since presence is
+/// always the requester's own. The host publishes it as the ephemeral presence
+/// kind on the requester's behalf.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PresenceSetArgs {
+    /// Presence to publish.
+    pub status: PresenceStatus,
+}
+
+impl PresenceSetArgs {
+    /// Validate and normalize.
+    ///
+    /// The status enum is closed, so an unknown value is already rejected at
+    /// deserialization; there is nothing further to normalize.
+    ///
+    /// # Errors
+    ///
+    /// Never fails today; the signature matches its siblings so a future
+    /// invariant has a place to live.
+    pub fn validated(&self) -> Result<Self, SdkError> {
+        Ok(Self {
+            status: self.status,
+        })
+    }
+}
+
+/// Arguments for `typing.set`.
+///
+/// A momentary "composing" signal scoped to one channel. There is no stop
+/// counterpart: the indicator is ephemeral and lapses on its own, so a client
+/// signals by re-sending and stops by falling silent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TypingSetArgs {
+    /// Channel the requester is composing in.
+    #[serde(deserialize_with = "channel_id")]
+    pub channel_id: String,
+}
+
+impl TypingSetArgs {
+    /// Validate and normalize.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdkError::InvalidInput`] for a malformed channel UUID.
+    pub fn validated(&self) -> Result<Self, SdkError> {
+        Ok(Self {
+            channel_id: channel(&self.channel_id)?,
+        })
+    }
+}
+
+/// One observer frame the host publishes on the requester's behalf.
+///
+/// The payload is **opaque to this contract**: the host encrypts it to the
+/// owner and wraps it in the observer kind without parsing it, so its structure
+/// is the runtime's concern, not the wire's. `kind` stays a top-level field so a
+/// host can apply per-kind policy (pacing, dropping liveness under load) without
+/// decrypting anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObserverFrame {
+    /// Frame kind — the runtime's telemetry discriminator (`acp_write`,
+    /// `turn_started`, …), not a Nostr kind.
+    pub kind: String,
+    /// Opaque serialized frame body the host encrypts verbatim.
+    pub payload: String,
+}
+
+impl ObserverFrame {
+    /// Validate and normalize one frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdkError::InvalidInput`] for an empty `kind` or `payload`, and
+    /// [`SdkError::ContentTooLarge`] past [`super::MAX_OBSERVER_FRAME_BYTES`].
+    pub fn validated(&self) -> Result<Self, SdkError> {
+        let kind = required(&self.kind, "frame kind", MAX_SCALAR_CHARS)?;
+        if self.payload.trim().is_empty() {
+            return Err(SdkError::InvalidInput(
+                "frame payload must not be empty".into(),
+            ));
+        }
+        if self.payload.len() > MAX_OBSERVER_FRAME_BYTES {
+            return Err(SdkError::ContentTooLarge {
+                max: MAX_OBSERVER_FRAME_BYTES,
+                got: self.payload.len(),
+            });
+        }
+        Ok(Self {
+            kind,
+            payload: self.payload.clone(),
+        })
+    }
+}
+
+/// Arguments for `observer.emit`.
+///
+/// A batch of frames, since trajectory is high-volume; the host re-batches and
+/// paces publication. Frames carry no owner, key, or Nostr metadata — those are
+/// host-derived, the same separation the rest of this contract keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObserverEmitArgs {
+    /// Frames to publish, in order.
+    pub frames: Vec<ObserverFrame>,
+}
+
+impl ObserverEmitArgs {
+    /// Validate and normalize.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdkError::InvalidInput`] for an empty batch or one past
+    /// [`super::MAX_OBSERVER_FRAMES`], and propagates each frame's own
+    /// validation error.
+    pub fn validated(&self) -> Result<Self, SdkError> {
+        if self.frames.is_empty() {
+            return Err(SdkError::InvalidInput(
+                "observer.emit requires at least one frame".into(),
+            ));
+        }
+        if self.frames.len() > MAX_OBSERVER_FRAMES {
+            return Err(SdkError::InvalidInput(format!(
+                "observer.emit carries {} frames, over the {MAX_OBSERVER_FRAMES} cap",
+                self.frames.len()
+            )));
+        }
+        Ok(Self {
+            frames: self
+                .frames
+                .iter()
+                .map(ObserverFrame::validated)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+/// Arguments for `liveness.ping`.
+///
+/// A turn-scoped keepalive: it tells the host a turn is still running, which a
+/// host can act on (resetting a stall watchdog) rather than merely forward.
+/// That host-side meaning is what distinguishes it from an `observer.emit` frame
+/// carrying the same context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LivenessPingArgs {
+    /// Channel the turn belongs to.
+    #[serde(deserialize_with = "channel_id")]
+    pub channel_id: String,
+    /// Opaque, process-local turn identifier the keepalive refers to.
+    pub turn_id: String,
+}
+
+impl LivenessPingArgs {
+    /// Validate and normalize.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdkError::InvalidInput`] for a malformed channel UUID or an
+    /// empty or over-long turn id.
+    pub fn validated(&self) -> Result<Self, SdkError> {
+        Ok(Self {
+            channel_id: channel(&self.channel_id)?,
+            turn_id: required(&self.turn_id, "turnId", MAX_SCALAR_CHARS)?,
+        })
+    }
+}
+
 // ── Agent arguments ─────────────────────────────────────────────────────────
 
 /// Which agent an update or delete targets — exactly one selector, so a host
@@ -584,6 +760,18 @@ pub enum ActionArgs {
     /// Write an encrypted-memory record.
     #[serde(rename = "storage.put")]
     StoragePut(StoragePutArgs),
+    /// Set the requester's presence.
+    #[serde(rename = "presence.set")]
+    PresenceSet(PresenceSetArgs),
+    /// Signal the requester is composing.
+    #[serde(rename = "typing.set")]
+    TypingSet(TypingSetArgs),
+    /// Publish a batch of observer frames.
+    #[serde(rename = "observer.emit")]
+    ObserverEmit(ObserverEmitArgs),
+    /// Signal a turn is still alive.
+    #[serde(rename = "liveness.ping")]
+    LivenessPing(LivenessPingArgs),
     /// Mint a managed agent.
     #[serde(rename = "agents.create")]
     AgentsCreate(AgentsCreateArgs),
@@ -608,6 +796,10 @@ impl ActionArgs {
             Self::StorageAddress(_) => Action::StorageAddress,
             Self::StorageGet(_) => Action::StorageGet,
             Self::StoragePut(_) => Action::StoragePut,
+            Self::PresenceSet(_) => Action::PresenceSet,
+            Self::TypingSet(_) => Action::TypingSet,
+            Self::ObserverEmit(_) => Action::ObserverEmit,
+            Self::LivenessPing(_) => Action::LivenessPing,
             Self::AgentsCreate(_) => Action::AgentsCreate,
             Self::AgentsUpdate(_) => Action::AgentsUpdate,
             Self::AgentsDelete(_) => Action::AgentsDelete,
@@ -632,6 +824,10 @@ impl ActionArgs {
             Self::StorageAddress(args) => Self::StorageAddress(args.validated()?),
             Self::StorageGet(args) => Self::StorageGet(args.validated()?),
             Self::StoragePut(args) => Self::StoragePut(args.validated()?),
+            Self::PresenceSet(args) => Self::PresenceSet(args.validated()?),
+            Self::TypingSet(args) => Self::TypingSet(args.validated()?),
+            Self::ObserverEmit(args) => Self::ObserverEmit(args.validated()?),
+            Self::LivenessPing(args) => Self::LivenessPing(args.validated()?),
             Self::AgentsCreate(args) => Self::AgentsCreate(args.validated()?),
             Self::AgentsUpdate(args) => Self::AgentsUpdate(args.validated()?),
             Self::AgentsDelete(args) => Self::AgentsDelete(args.validated()?),
