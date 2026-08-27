@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use super::{
     absent_or_valued, absent_or_valued_hex64, channel, channel_id, content, cursor, event_id,
     hex64_field, is_false, limit, mentions, optional, required, respond_to, validate_slug, Action,
-    PubkeyHex, DEFAULT_PAGE_LIMIT, MAX_ABOUT_CHARS, MAX_EMOJI_CHARS, MAX_NAME_CHARS,
-    MAX_PROMPT_CHARS, MAX_SCALAR_CHARS,
+    PubkeyHex, DEFAULT_PAGE_LIMIT, MAX_ABOUT_CHARS, MAX_CONTENT_BYTES, MAX_EMOJI_CHARS,
+    MAX_NAME_CHARS, MAX_PROMPT_CHARS, MAX_SCALAR_CHARS,
 };
 use crate::SdkError;
 
@@ -285,6 +285,73 @@ impl StorageAddressArgs {
     }
 }
 
+/// Arguments for `storage.get`.
+///
+/// Slug-addressed like [`StorageAddressArgs`]: the host derives the record's
+/// address from the slug and the secret, fetches it, and decrypts. The keyless
+/// caller sends a name and receives plaintext — never a key or a relay filter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageGetArgs {
+    /// Memory slug — `core` or `mem/…`, per NIP-AE.
+    pub slug: String,
+}
+
+impl StorageGetArgs {
+    /// Validate and normalize.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdkError::InvalidInput`] when the slug fails the NIP-AE
+    /// grammar.
+    pub fn validated(&self) -> Result<Self, SdkError> {
+        let slug = required(&self.slug, "slug", 255)?;
+        validate_slug(&slug).map_err(|e| SdkError::InvalidInput(e.to_string()))?;
+        Ok(Self { slug })
+    }
+}
+
+/// Arguments for `storage.put`.
+///
+/// The caller supplies plaintext; the host encrypts it under the record's key
+/// and publishes it. Encryption stays host-side for the same reason addressing
+/// does — the secret is the thing this contract exists to avoid handing over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoragePutArgs {
+    /// Memory slug — `core` or `mem/…`, per NIP-AE.
+    pub slug: String,
+    /// Plaintext record body; the host encrypts it before publishing.
+    pub value: String,
+}
+
+impl StoragePutArgs {
+    /// Validate and normalize.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdkError::InvalidInput`] when the slug fails the NIP-AE grammar
+    /// or the value is empty, and [`SdkError::ContentTooLarge`] past
+    /// [`super::MAX_CONTENT_BYTES`].
+    pub fn validated(&self) -> Result<Self, SdkError> {
+        let slug = required(&self.slug, "slug", 255)?;
+        validate_slug(&slug).map_err(|e| SdkError::InvalidInput(e.to_string()))?;
+        if self.value.trim().is_empty() {
+            return Err(SdkError::InvalidInput("value must not be empty".into()));
+        }
+        if self.value.len() > MAX_CONTENT_BYTES {
+            return Err(SdkError::ContentTooLarge {
+                max: MAX_CONTENT_BYTES,
+                got: self.value.len(),
+            });
+        }
+        Ok(Self {
+            slug,
+            value: self.value.clone(),
+        })
+    }
+}
+
 // ── Agent arguments ─────────────────────────────────────────────────────────
 
 /// Which agent an update or delete targets — exactly one selector, so a host
@@ -511,6 +578,12 @@ pub enum ActionArgs {
     /// Derive an encrypted-memory address.
     #[serde(rename = "storage.address")]
     StorageAddress(StorageAddressArgs),
+    /// Read an encrypted-memory record.
+    #[serde(rename = "storage.get")]
+    StorageGet(StorageGetArgs),
+    /// Write an encrypted-memory record.
+    #[serde(rename = "storage.put")]
+    StoragePut(StoragePutArgs),
     /// Mint a managed agent.
     #[serde(rename = "agents.create")]
     AgentsCreate(AgentsCreateArgs),
@@ -533,6 +606,8 @@ impl ActionArgs {
             Self::ReactionAdd(_) => Action::ReactionAdd,
             Self::ProfileSet(_) => Action::ProfileSet,
             Self::StorageAddress(_) => Action::StorageAddress,
+            Self::StorageGet(_) => Action::StorageGet,
+            Self::StoragePut(_) => Action::StoragePut,
             Self::AgentsCreate(_) => Action::AgentsCreate,
             Self::AgentsUpdate(_) => Action::AgentsUpdate,
             Self::AgentsDelete(_) => Action::AgentsDelete,
@@ -555,6 +630,8 @@ impl ActionArgs {
             Self::ReactionAdd(args) => Self::ReactionAdd(args.validated()?),
             Self::ProfileSet(args) => Self::ProfileSet(args.validated()?),
             Self::StorageAddress(args) => Self::StorageAddress(args.validated()?),
+            Self::StorageGet(args) => Self::StorageGet(args.validated()?),
+            Self::StoragePut(args) => Self::StoragePut(args.validated()?),
             Self::AgentsCreate(args) => Self::AgentsCreate(args.validated()?),
             Self::AgentsUpdate(args) => Self::AgentsUpdate(args.validated()?),
             Self::AgentsDelete(args) => Self::AgentsDelete(args.validated()?),

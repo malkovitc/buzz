@@ -45,11 +45,11 @@
 //!
 //! # Deferred operations
 //!
-//! Not in v1, all purely additive later: memory read/write (intent-level
-//! operations over the encrypted store — until then [`Action::StorageAddress`]
-//! only addresses a record, and the key holder remains the only reader/writer),
-//! `presence.set`, `typing.set`, and streaming reads (waking on a mention is
-//! `channel.read` with `mentionsOnly`, polled).
+//! Not in v1, all purely additive later: `presence.set`, `typing.set`, and
+//! streaming reads (waking on a mention is `channel.read` with `mentionsOnly`,
+//! polled). Memory read/write graduated into v1 as `storage.get`/`storage.put`,
+//! both slug-addressed; the host encrypts and decrypts, so the key holder stays
+//! the only party that ever sees the record's key.
 //!
 //! # Non-goals
 //!
@@ -72,7 +72,8 @@ pub use actions::{
     Action, ActionArgs, ActionOutcome, AgentTarget, AgentsCreateArgs, AgentsCreateOutcome,
     AgentsDeleteArgs, AgentsDeleteOutcome, AgentsUpdateArgs, AgentsUpdateOutcome, BrokerMessage,
     ChannelReadArgs, EventPublished, MessagePage, MessagePostArgs, MessageReplyArgs,
-    ProfileSetArgs, PubkeyHex, ReactionAddArgs, StorageAddress, StorageAddressArgs,
+    ProfileSetArgs, PubkeyHex, ReactionAddArgs, StorageAddress, StorageAddressArgs, StorageGetArgs,
+    StoragePutArgs, StorageRecord,
 };
 pub use client::{
     BrokerClient, BrokerClientExt, BrokerFuture, BrokerTransportError, Dispatch, ValidatedFuture,

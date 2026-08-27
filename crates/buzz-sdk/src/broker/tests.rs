@@ -79,6 +79,13 @@ fn action_fixtures() -> Vec<ActionArgs> {
         ActionArgs::StorageAddress(StorageAddressArgs {
             slug: "mem/broker-foundation".into(),
         }),
+        ActionArgs::StorageGet(StorageGetArgs {
+            slug: "core".into(),
+        }),
+        ActionArgs::StoragePut(StoragePutArgs {
+            slug: "mem/broker-foundation".into(),
+            value: "a remembered fact".into(),
+        }),
         ActionArgs::AgentsCreate(AgentsCreateArgs {
             channel_id: CHANNEL.into(),
             display_name: "Research helper".into(),
@@ -119,12 +126,16 @@ fn outcome_fixtures(keys: &Keys) -> Vec<ActionOutcome> {
         ActionOutcome::MessagePost(published.clone()),
         ActionOutcome::MessageReply(published.clone()),
         ActionOutcome::ReactionAdd(published.clone()),
-        ActionOutcome::ProfileSet(published),
+        ActionOutcome::ProfileSet(published.clone()),
         ActionOutcome::StorageAddress(StorageAddress {
             author_pubkey: pubkey(),
             kind: 30174,
             d_tag: EVENT.into(),
         }),
+        ActionOutcome::StorageGet(StorageRecord {
+            value: Some("a remembered fact".into()),
+        }),
+        ActionOutcome::StoragePut(published),
         ActionOutcome::AgentsCreate(AgentsCreateOutcome {
             agent_pubkey: pubkey(),
             display_name: "Research helper".into(),
@@ -248,6 +259,20 @@ fn every_outcome_round_trips_through_a_response_envelope() {
         assert_eq!(parsed.result.outcome(), Some(&outcome));
         assert!(parsed.result.error().is_none());
     }
+}
+
+/// A `storage.get` outcome omits `value` when the slug holds no record, and the
+/// absence survives the round trip as `None` — never a stored empty string.
+#[test]
+fn storage_get_outcome_absent_value_round_trips() {
+    let empty = ActionOutcome::StorageGet(StorageRecord { value: None });
+    let json = serde_json::to_value(&empty).expect("outcome serializes");
+    assert!(
+        json["outcome"].get("value").is_none(),
+        "an absent record must not put a value key on the wire"
+    );
+    let parsed: ActionOutcome = serde_json::from_value(json).expect("outcome deserializes");
+    assert_eq!(parsed, empty);
 }
 
 /// Args and outcome share the `action` discriminator, so a payload can never
@@ -936,6 +961,8 @@ fn every_payload_has_an_exact_and_secret_free_wire_schema() {
         ),
         ("profile.set/args", vec!["about", "displayName", "picture"]),
         ("storage.address/args", vec!["slug"]),
+        ("storage.get/args", vec!["slug"]),
+        ("storage.put/args", vec!["slug", "value"]),
         (
             "agents.create/args",
             vec![
@@ -974,6 +1001,8 @@ fn every_payload_has_an_exact_and_secret_free_wire_schema() {
             "storage.address/outcome",
             vec!["authorPubkey", "dTag", "kind"],
         ),
+        ("storage.get/outcome", vec!["value"]),
+        ("storage.put/outcome", vec!["createdAt", "eventId", "kind"]),
         (
             "agents.create/outcome",
             vec!["agentPubkey", "channelId", "displayName"],
@@ -1353,6 +1382,22 @@ fn validators_accept_and_reject_at_their_boundaries() {
     assert!(!slug("Core"));
     assert!(!slug("secrets"));
     assert!(!slug("mem/Bad Slug"));
+
+    // storage.put carries a body: non-empty, bounded, and still slug-gated.
+    let put = |slug: &str, value: String| {
+        StoragePutArgs {
+            slug: slug.into(),
+            value,
+        }
+        .validated()
+    };
+    assert!(put("core", "remember this".into()).is_ok());
+    assert!(put("core", "   ".into()).is_err());
+    assert!(matches!(
+        put("core", "x".repeat(actions::MAX_CONTENT_BYTES + 1)).unwrap_err(),
+        SdkError::ContentTooLarge { .. }
+    ));
+    assert!(put("Core", "v".into()).is_err());
 
     // Patch-shaped writes must change something, and reject unknown modes.
     let profile_error = ProfileSetArgs {

@@ -14,10 +14,11 @@ pub mod outcomes;
 pub use args::{
     ActionArgs, AgentTarget, AgentsCreateArgs, AgentsDeleteArgs, AgentsUpdateArgs, ChannelReadArgs,
     MessagePostArgs, MessageReplyArgs, ProfileSetArgs, ReactionAddArgs, StorageAddressArgs,
+    StorageGetArgs, StoragePutArgs,
 };
 pub use outcomes::{
     ActionOutcome, AgentsCreateOutcome, AgentsDeleteOutcome, AgentsUpdateOutcome, BrokerMessage,
-    EventPublished, MessagePage, StorageAddress,
+    EventPublished, MessagePage, StorageAddress, StorageRecord,
 };
 
 /// Maximum characters in a display name or agent name.
@@ -144,6 +145,10 @@ pub enum Action {
     ProfileSet,
     /// Derive the address of one encrypted-memory record.
     StorageAddress,
+    /// Read one encrypted-memory record by slug.
+    StorageGet,
+    /// Write one encrypted-memory record by slug.
+    StoragePut,
     /// Mint a managed agent owned by the requester.
     AgentsCreate,
     /// Patch a managed agent the requester owns.
@@ -154,7 +159,7 @@ pub enum Action {
 
 impl Action {
     /// Every action in this protocol version, in wire-name order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::AgentsCreate,
         Self::AgentsDelete,
         Self::AgentsUpdate,
@@ -164,6 +169,8 @@ impl Action {
         Self::ProfileSet,
         Self::ReactionAdd,
         Self::StorageAddress,
+        Self::StorageGet,
+        Self::StoragePut,
     ];
 
     /// Stable wire name.
@@ -176,6 +183,8 @@ impl Action {
             Self::ReactionAdd => "reaction.add",
             Self::ProfileSet => "profile.set",
             Self::StorageAddress => "storage.address",
+            Self::StorageGet => "storage.get",
+            Self::StoragePut => "storage.put",
             Self::AgentsCreate => "agents.create",
             Self::AgentsUpdate => "agents.update",
             Self::AgentsDelete => "agents.delete",
