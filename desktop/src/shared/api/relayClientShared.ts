@@ -91,18 +91,16 @@ type LiveSubscription = {
   closedRetryTimeout?: number;
 };
 
-export function hasLiveReqAttemptForGeneration(
+export function trackLiveReqAttempt(
   payload: unknown[],
   subscriptions: Map<string, RelaySubscription>,
-  generation: number,
 ) {
   const subId = payload[0] === "REQ" ? payload[1] : undefined;
   const subscription =
     typeof subId === "string" ? subscriptions.get(subId) : undefined;
-  return (
+  return (generation: number) =>
     subscription?.mode === "live" &&
-    subscription.liveReqGeneration === generation
-  );
+    subscription.liveReqGeneration === generation;
 }
 
 export type PendingEvent = {

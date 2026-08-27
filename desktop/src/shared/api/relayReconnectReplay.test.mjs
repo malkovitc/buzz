@@ -15,7 +15,7 @@ import {
   shouldPageReconnectReplay,
 } from "./relayReconnectReplay.ts";
 import { buildChannelFilter } from "./relayChannelFilters.ts";
-import { hasLiveReqAttemptForGeneration } from "./relayClientShared.ts";
+import { trackLiveReqAttempt } from "./relayClientShared.ts";
 import {
   finishLiveReq,
   flushEvents,
@@ -978,20 +978,22 @@ test("same-generation retry honors an attempted same-ID REQ after EOSE or CLOSED
     closeSubscription: async () => {},
     generation: 10,
   });
-  assert.equal(
-    hasLiveReqAttemptForGeneration(["REQ", "live-1"], subscriptions, 10),
-    true,
+  const wasLiveReqAttempted = trackLiveReqAttempt(
+    ["REQ", "live-1"],
+    subscriptions,
   );
+  assert.equal(wasLiveReqAttempted(10), true);
   await replay();
 
   assert.equal(reqCalls, 1);
   assert.equal(repairCalls, 1);
   assert.equal(finishLiveReq(subscription, 10), true);
   assert.equal(subscription.liveReqActive, false);
+  subscriptions.delete("live-1");
   assert.equal(
-    hasLiveReqAttemptForGeneration(["REQ", "live-1"], subscriptions, 10),
+    wasLiveReqAttempted(10),
     true,
-    "a CLOSED outcome must not make the original wrapper resend",
+    "even terminal deletion must not make the original wrapper resend",
   );
 });
 

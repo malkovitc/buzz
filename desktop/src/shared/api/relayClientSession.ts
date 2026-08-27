@@ -12,7 +12,7 @@ import {
 } from "@/shared/constants/kinds";
 import {
   getTextPayload,
-  hasLiveReqAttemptForGeneration as hasReqAttempt,
+  trackLiveReqAttempt as trackReq,
   toRelayFrames,
   type ConnectionState,
   type LiveSubscriptionReadiness,
@@ -663,6 +663,7 @@ export class RelayClient {
     payload: unknown[],
     fallbackMessage: string,
   ) {
+    const wasLiveReqAttempted = trackReq(payload, this.subscriptions);
     try {
       await this.sendRaw(payload);
     } catch (error) {
@@ -672,8 +673,7 @@ export class RelayClient {
       );
       try {
         await this.ensureConnected();
-        const { subscriptions, connectionGeneration } = this;
-        if (hasReqAttempt(payload, subscriptions, connectionGeneration)) return;
+        if (wasLiveReqAttempted(this.connectionGeneration)) return;
         await this.sendRaw(payload);
       } catch (retryError) {
         throw this.recoverFromSocketFailure(
