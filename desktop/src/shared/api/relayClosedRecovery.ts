@@ -32,6 +32,34 @@ export function clearClosedRetry(subscription: LiveSubscription) {
   subscription.closedRetryTimeout = undefined;
 }
 
+export function beginLiveReq(
+  subscription: LiveSubscription,
+  generation: number,
+) {
+  if (
+    subscription.liveReqGeneration === generation &&
+    subscription.liveReqActive
+  ) {
+    return false;
+  }
+  subscription.liveReqGeneration = generation;
+  subscription.liveReqActive = true;
+  return true;
+}
+
+export function finishLiveReq(
+  subscription: LiveSubscription,
+  generation: number,
+) {
+  if (
+    subscription.liveReqGeneration !== generation ||
+    !subscription.liveReqActive
+  )
+    return false;
+  subscription.liveReqActive = false;
+  return true;
+}
+
 function notifyClosedRepairSettled(subscription: LiveSubscription) {
   try {
     subscription.onClosedRepairSettled?.();
@@ -79,6 +107,12 @@ export function handleRelayClosed({
     subscription.reject(
       new Error(message || "Relay closed the history subscription."),
     );
+    return;
+  }
+  if (
+    subscription.liveReqGeneration !== undefined &&
+    !finishLiveReq(subscription, generation)
+  ) {
     return;
   }
   recoverLiveSubscriptionFromClosed({
@@ -184,9 +218,11 @@ function recoverLiveSubscriptionFromClosed({
     }
 
     void (async () => {
+      if (!beginLiveReq(subscription, generation)) return;
       try {
         await sendReq(subId, subscription.filter);
       } catch (error) {
+        finishLiveReq(subscription, generation);
         if (subscriptions.get(subId) !== subscription) return;
         console.error("Failed to restore closed relay subscription", error);
         recoverLiveSubscriptionFromClosed({
@@ -360,6 +396,13 @@ export function handleSubscriptionEose({
   const subscription = subscriptions.get(subId);
   if (!subscription) return;
   if (subscription.mode === "live") {
+    if (
+      generation !== undefined &&
+      subscription.liveReqGeneration !== undefined &&
+      !finishLiveReq(subscription, generation)
+    ) {
+      return;
+    }
     if (generation !== undefined)
       markReconnectLiveEose(subscription, generation);
     subscription.resolveReady?.("eose");

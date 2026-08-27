@@ -84,6 +84,9 @@ type LiveSubscription = {
     liveEose: boolean;
     repairDone: boolean;
   };
+  /** At most one same-ID live REQ may be active per socket generation. */
+  liveReqGeneration?: number;
+  liveReqActive?: boolean;
   closedRetryAttempt?: number;
   closedRetryTimeout?: number;
 };

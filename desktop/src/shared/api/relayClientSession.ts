@@ -29,6 +29,7 @@ import {
   buildGlobalStreamFilter,
 } from "@/shared/api/relayChannelFilters";
 import {
+  beginLiveReq,
   clearClosedRetry,
   flushEvents,
   handleRelayClosed,
@@ -599,15 +600,16 @@ export class RelayClient {
       readinessTimeoutMs,
     );
 
-    this.subscriptions.set(subId, {
+    const subscription: Extract<RelaySubscription, { mode: "live" }> = {
       mode: "live",
       filter,
       onEvent,
       onFlush,
       onClosedRepairSettled,
       resolveReady,
-    });
-
+    };
+    this.subscriptions.set(subId, subscription);
+    beginLiveReq(subscription, this.connectionGeneration);
     try {
       await this.sendRawWithReconnectRetry(
         ["REQ", subId, filter],

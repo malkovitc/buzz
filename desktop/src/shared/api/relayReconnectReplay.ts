@@ -5,6 +5,7 @@ import type {
 } from "@/shared/api/relayClientShared";
 import type { RelayEvent } from "@/shared/api/types";
 import {
+  beginLiveReq,
   markReconnectRepairDone,
   shouldDispatchSubscriptionEvent,
 } from "@/shared/api/relayClosedRecovery";
@@ -279,7 +280,9 @@ export async function replayLiveSubscriptions({
         subscription,
         shouldPageReplay,
       );
-      const willRepair = shouldPageReplay && replaySince !== undefined;
+      const willSendReq = beginLiveReq(subscription, generation);
+      const willRepair =
+        willSendReq && shouldPageReplay && replaySince !== undefined;
       let repairOwner: typeof subscription.reconnectReplay;
       if (willRepair) {
         // Install before the restored live REQ: a live frame may beat page one.
@@ -298,6 +301,7 @@ export async function replayLiveSubscriptions({
         channelId,
         replaySince,
         shouldPageReplay: willRepair,
+        willSendReq,
         repairOwner,
       };
     });
@@ -331,7 +335,14 @@ export async function replayLiveSubscriptions({
     const batch = replayRequests.slice(i, i + replayBatchSize);
     await Promise.all(
       batch.map(
-        async ({ subId, subscription, replaySince, shouldPageReplay }) => {
+        async ({
+          subId,
+          subscription,
+          replaySince,
+          shouldPageReplay,
+          willSendReq,
+        }) => {
+          if (!willSendReq) return;
           // The subscription map may change while replay is paused behind the
           // gate or an inter-batch delay. Never resurrect a disposed entry (or
           // overwrite its replacement) with a REQ from this stale snapshot.

@@ -945,6 +945,38 @@ test("disposed subscription receives no repair events after an in-flight page", 
   assert.deepEqual(delivered, []);
 });
 
+test("same-generation replay does not overlap an active same-ID REQ", async () => {
+  resetGate();
+  const subscription = {
+    mode: "live",
+    filter: buildChannelFilter("channel-1", 50),
+    onEvent: () => {},
+  };
+  const subscriptions = new Map([["live-1", subscription]]);
+  let reqCalls = 0;
+  let repairCalls = 0;
+  const replay = () =>
+    replayLiveSubscriptions({
+      subscriptions,
+      generation: 10,
+      sendRaw: async () => {
+        reqCalls += 1;
+      },
+      requestRepair: async () => {
+        repairCalls += 1;
+        return [];
+      },
+    });
+
+  await replay();
+  const repairOwner = subscription.reconnectReplay;
+  await replay();
+
+  assert.equal(reqCalls, 1);
+  assert.equal(repairCalls, 1);
+  assert.equal(subscription.reconnectReplay, repairOwner);
+});
+
 test("overlapping repair cannot mutate successor dedupe in the same generation", async () => {
   resetGate();
   const duplicate = event("successor-seen", 1001);
@@ -1129,6 +1161,7 @@ test("exhausted backfill pins the floor: next replay still requests the original
   // Reconnect 1: every backfill attempt is rate-limited.
   await replayLiveSubscriptions({
     subscriptions,
+    generation: 1,
     sendRaw: async () => {},
     requestRepair: async () => {
       throw new Error("rate-limited: quota exceeded; retry in 4s");
@@ -1148,6 +1181,7 @@ test("exhausted backfill pins the floor: next replay still requests the original
   const historyFilters = [];
   await replayLiveSubscriptions({
     subscriptions,
+    generation: 2,
     sendRaw: async () => {},
     requestRepair: async (request) => {
       historyFilters.push(request);
@@ -1171,6 +1205,7 @@ test("exhausted backfill pins the floor: next replay still requests the original
   const laterFilters = [];
   await replayLiveSubscriptions({
     subscriptions,
+    generation: 3,
     sendRaw: async () => {},
     requestRepair: async (request) => {
       laterFilters.push(request);
