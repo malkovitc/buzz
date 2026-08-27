@@ -15,8 +15,11 @@ import {
   shouldPageReconnectReplay,
 } from "./relayReconnectReplay.ts";
 import { buildChannelFilter } from "./relayChannelFilters.ts";
+import { trackLiveReqAttempt } from "./relayClientShared.ts";
 import {
+  finishLiveReq,
   flushEvents,
+  handleSubscriptionEose,
   markReconnectLiveEose,
   markReconnectRepairDone,
   prepareSubscriptionEvent,
@@ -580,6 +583,80 @@ test("stale replay sends no REQs when generation advances while gate was active"
 
 // ── Paged replay (existing behaviour) ────────────────────────────────────────
 
+test("cursorless bounded channel reconnect repairs from a clock-independent floor", async () => {
+  resetGate();
+  const filter = buildChannelFilter("channel-empty-before-outage", 50);
+  const repairRequests = [];
+  const delivered = [];
+  const missedWhileDown = eventRange("missed", 1_000, filter.limit + 1);
+  const subscription = {
+    mode: "live",
+    filter,
+    onEvent: (value) => delivered.push(value.id),
+    lastSeenCreatedAt: undefined,
+  };
+
+  await replayLiveSubscriptions({
+    subscriptions: new Map([["live-cursorless", subscription]]),
+    sendRaw: async () => {},
+    requestRepair: async (request) => {
+      repairRequests.push(request);
+      return missedWhileDown;
+    },
+  });
+
+  assert.deepEqual(repairRequests, [
+    {
+      channelId: "channel-empty-before-outage",
+      limit: 500,
+      since: 0,
+      until: undefined,
+      beforeId: undefined,
+    },
+  ]);
+  assert.equal(delivered.length, filter.limit + 1);
+  assert.equal(subscription.pendingReplaySince, undefined);
+});
+
+test("cursorless floor is pinned before a restored REQ can advance the cursor and fail", async () => {
+  resetGate();
+  const subscription = {
+    mode: "live",
+    filter: buildChannelFilter("channel-pre-paging-failure", 50),
+    onEvent: () => {},
+    lastSeenCreatedAt: undefined,
+  };
+  const subscriptions = new Map([["live-pre-paging", subscription]]);
+
+  await assert.rejects(
+    replayLiveSubscriptions({
+      subscriptions,
+      generation: 1,
+      sendRaw: async () => {
+        prepareSubscriptionEvent(subscription, event("new-live", 5_000));
+        throw new Error("socket failed before paging started");
+      },
+      requestRepair: async () => [],
+    }),
+  );
+
+  assert.equal(subscription.lastSeenCreatedAt, 5_000);
+  assert.equal(subscription.pendingReplaySince, 0);
+
+  const repairRequests = [];
+  await replayLiveSubscriptions({
+    subscriptions,
+    generation: 2,
+    sendRaw: async () => {},
+    requestRepair: async (request) => {
+      repairRequests.push(request);
+      return [];
+    },
+  });
+
+  assert.equal(repairRequests[0].since, 0);
+});
+
 test("channel reconnect replay pages the missed window until a short page", async () => {
   resetGate();
   const delivered = [];
@@ -910,7 +987,56 @@ test("disposed subscription receives no repair events after an in-flight page", 
   assert.deepEqual(delivered, []);
 });
 
-test("stale repair cannot clear the successor generation dedupe state", async () => {
+test("same-generation retry honors an attempted same-ID REQ after EOSE or CLOSED", async () => {
+  resetGate();
+  const subscription = {
+    mode: "live",
+    filter: buildChannelFilter("channel-1", 50),
+    onEvent: () => {},
+  };
+  const subscriptions = new Map([["live-1", subscription]]);
+  let reqCalls = 0;
+  let repairCalls = 0;
+  const replay = () =>
+    replayLiveSubscriptions({
+      subscriptions,
+      generation: 10,
+      sendRaw: async () => {
+        reqCalls += 1;
+      },
+      requestRepair: async () => {
+        repairCalls += 1;
+        return [];
+      },
+    });
+
+  await replay();
+  handleSubscriptionEose({
+    subscriptions,
+    subId: "live-1",
+    closeSubscription: async () => {},
+    generation: 10,
+  });
+  const wasLiveReqAttempted = trackLiveReqAttempt(
+    ["REQ", "live-1"],
+    subscriptions,
+  );
+  assert.equal(wasLiveReqAttempted(10), true);
+  await replay();
+
+  assert.equal(reqCalls, 1);
+  assert.equal(repairCalls, 1);
+  assert.equal(finishLiveReq(subscription, 10), true);
+  assert.equal(subscription.liveReqActive, false);
+  subscriptions.delete("live-1");
+  assert.equal(
+    wasLiveReqAttempted(10),
+    true,
+    "even terminal deletion must not make the original wrapper resend",
+  );
+});
+
+test("overlapping repair cannot mutate successor dedupe in the same generation", async () => {
   resetGate();
   const duplicate = event("successor-seen", 1001);
   const subscription = {
@@ -920,7 +1046,6 @@ test("stale repair cannot clear the successor generation dedupe state", async ()
     lastSeenCreatedAt: 1000,
   };
   const subscriptions = new Map([["live-1", subscription]]);
-  let generationActive = true;
   let startRepair;
   const repairStarted = new Promise((resolve) => {
     startRepair = resolve;
@@ -933,7 +1058,6 @@ test("stale repair cannot clear the successor generation dedupe state", async ()
   const replayPromise = replayLiveSubscriptions({
     subscriptions,
     generation: 10,
-    isActive: () => generationActive,
     sendRaw: async () => {},
     requestRepair: async () => {
       startRepair();
@@ -942,21 +1066,19 @@ test("stale repair cannot clear the successor generation dedupe state", async ()
   });
 
   await repairStarted;
-  generationActive = false;
-  subscription.reconnectReplay = {
-    generation: 11,
+  const successorOwner = {
+    generation: 10,
     seenEventIds: new Set([duplicate.id]),
     liveEose: false,
     repairDone: false,
   };
+  subscription.reconnectReplay = successorOwner;
   finishRepair([duplicate]);
   await replayPromise;
 
-  assert.equal(subscription.reconnectReplay.generation, 11);
-  assert.deepEqual(
-    [...subscription.reconnectReplay.seenEventIds],
-    [duplicate.id],
-  );
+  assert.equal(subscription.reconnectReplay, successorOwner);
+  assert.deepEqual([...successorOwner.seenEventIds], [duplicate.id]);
+  assert.equal(successorOwner.repairDone, false);
   assert.equal(shouldDispatchSubscriptionEvent(subscription, duplicate), false);
 });
 
@@ -1098,6 +1220,7 @@ test("exhausted backfill pins the floor: next replay still requests the original
   // Reconnect 1: every backfill attempt is rate-limited.
   await replayLiveSubscriptions({
     subscriptions,
+    generation: 1,
     sendRaw: async () => {},
     requestRepair: async () => {
       throw new Error("rate-limited: quota exceeded; retry in 4s");
@@ -1117,6 +1240,7 @@ test("exhausted backfill pins the floor: next replay still requests the original
   const historyFilters = [];
   await replayLiveSubscriptions({
     subscriptions,
+    generation: 2,
     sendRaw: async () => {},
     requestRepair: async (request) => {
       historyFilters.push(request);
@@ -1140,6 +1264,7 @@ test("exhausted backfill pins the floor: next replay still requests the original
   const laterFilters = [];
   await replayLiveSubscriptions({
     subscriptions,
+    generation: 3,
     sendRaw: async () => {},
     requestRepair: async (request) => {
       laterFilters.push(request);
@@ -1267,6 +1392,80 @@ test("dense-second repair advances by event id without gaps", async () => {
   );
 });
 
+test("repair buffer flushes before reconnect dedupe is released", async () => {
+  resetGate(0);
+  const shared = event("a".repeat(64), 1_000);
+  const delivered = [];
+  const queued = [];
+  const subscription = {
+    mode: "live",
+    filter: buildChannelFilter("channel-1", 50),
+    onEvent: (value) => delivered.push(value.id),
+    lastSeenCreatedAt: 1_001,
+  };
+  const subscriptions = new Map([["live-1", subscription]]);
+
+  await replayLiveSubscriptions({
+    subscriptions,
+    generation: 4,
+    sendRaw: async (payload) => {
+      if (payload[0] !== "REQ") return;
+      assert.equal(shouldDispatchSubscriptionEvent(subscription, shared), true);
+      subscription.onEvent(shared);
+      markReconnectLiveEose(subscription, 4);
+    },
+    requestRepair: async () => [shared],
+    replaySubscriptionEvent: (_subId, value) => queued.push(value),
+    flushReplayEvents: () => {
+      for (const value of queued.splice(0)) {
+        if (shouldDispatchSubscriptionEvent(subscription, value)) {
+          subscription.onEvent(value);
+        }
+      }
+    },
+  });
+
+  assert.deepEqual(delivered, [shared.id]);
+  assert.equal(subscription.reconnectReplay, undefined);
+});
+
+test("exhausted partial repairs flush before reconnect dedupe is released", async () => {
+  resetGate(0);
+  const repairPage = eventRange("partial", 1_000, REPLAY_BATCH_SIZE);
+  const delivered = [];
+  const queued = [];
+  const subscription = {
+    mode: "live",
+    filter: buildChannelFilter("channel-1", 50),
+    onEvent: (value) => delivered.push(value.id),
+    lastSeenCreatedAt: 1_001,
+  };
+
+  await replayLiveSubscriptions({
+    subscriptions: new Map([["live-1", subscription]]),
+    generation: 5,
+    sendRaw: async (payload) => {
+      if (payload[0] === "REQ") markReconnectLiveEose(subscription, 5);
+    },
+    requestRepair: async (request) => {
+      if (request.beforeId) throw new Error("next repair page unavailable");
+      return repairPage;
+    },
+    replaySubscriptionEvent: (_subId, value) => queued.push(value),
+    flushReplayEvents: () => {
+      for (const value of queued.splice(0)) {
+        if (shouldDispatchSubscriptionEvent(subscription, value)) {
+          subscription.onEvent(value);
+        }
+      }
+    },
+  });
+
+  assert.equal(delivered.length, REPLAY_BATCH_SIZE);
+  assert.equal(new Set(delivered).size, REPLAY_BATCH_SIZE);
+  assert.equal(subscription.reconnectReplay, undefined);
+});
+
 test("replay dedupe clears only after both completions and never from stale generation", () => {
   for (const repairFirst of [true, false]) {
     const subscription = {
@@ -1280,39 +1479,46 @@ test("replay dedupe clears only after both completions and never from stale gene
         repairDone: false,
       },
     };
-    markReconnectRepairDone(subscription, 11);
+    const repairOwner = subscription.reconnectReplay;
+    markReconnectRepairDone(subscription, 11, repairOwner);
     markReconnectLiveEose(subscription, 11);
     assert.equal(subscription.reconnectReplay.generation, 12);
     if (repairFirst) {
-      markReconnectRepairDone(subscription, 12);
+      markReconnectRepairDone(subscription, 12, repairOwner);
       assert.ok(subscription.reconnectReplay);
       markReconnectLiveEose(subscription, 12);
     } else {
       markReconnectLiveEose(subscription, 12);
       assert.ok(subscription.reconnectReplay);
-      markReconnectRepairDone(subscription, 12);
+      markReconnectRepairDone(subscription, 12, repairOwner);
     }
     assert.equal(subscription.reconnectReplay, undefined);
   }
 });
 
-test("buffer flush drops stale generations and removed subscriptions", () => {
+test("buffer flush drops stale generations and invokes onFlush once", () => {
   const delivered = [];
+  let flushes = 0;
   const subscription = {
     mode: "live",
     filter: buildChannelFilter("channel-1", 50),
     onEvent: (value) => delivered.push(value.id),
+    onFlush: () => {
+      flushes += 1;
+    },
   };
   flushEvents(
     [
       { subId: "live-1", event: event("stale", 100), generation: 6 },
       { subId: "removed", event: event("removed", 101), generation: 7 },
       { subId: "live-1", event: event("current", 102), generation: 7 },
+      { subId: "live-1", event: event("current-2", 103), generation: 7 },
     ],
     new Map([["live-1", subscription]]),
     7,
   );
-  assert.deepEqual(delivered, ["current"]);
+  assert.deepEqual(delivered, ["current", "current-2"]);
+  assert.equal(flushes, 1);
 });
 
 test("live-before-repair and repair-before-live dispatch once", async () => {

@@ -4,16 +4,35 @@ import test from "node:test";
 import {
   buildChannelAuxDeletionFilter,
   buildChannelAuxFilter,
+  buildChannelLiveFilter,
   buildChannelReactionAuxFilter,
   buildChannelStructuralAuxFilter,
   buildHuddleTtsLiveFilter,
 } from "./relayChannelFilters.ts";
+import {
+  CHANNEL_EVENT_KINDS,
+  KIND_CHANNEL_THREAD_SUMMARY,
+} from "../constants/kinds.ts";
+import { shouldPageReconnectReplay } from "./relayReconnectReplay.ts";
 
 const CHANNEL = "36411e44-0e2d-4cfe-bd6e-567eb169db9f";
 const IDS = [
   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 ];
+
+test("channel live filter is bounded without a reader-clock since", () => {
+  const filter = buildChannelLiveFilter(CHANNEL);
+
+  assert.equal("since" in filter, false);
+  assert.ok(filter.limit > 0);
+  assert.equal(shouldPageReconnectReplay(filter), true);
+  assert.deepEqual(filter["#h"], [CHANNEL]);
+  assert.deepEqual(filter.kinds, [
+    ...CHANNEL_EVENT_KINDS,
+    KIND_CHANNEL_THREAD_SUMMARY,
+  ]);
+});
 
 test("huddle TTS filter includes a bounded startup replay for both message kinds", () => {
   assert.deepEqual(buildHuddleTtsLiveFilter(CHANNEL, 1_725_100_000), {

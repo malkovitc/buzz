@@ -4,11 +4,19 @@ import test from "node:test";
 import {
   handleRelayClosed,
   handleSubscriptionEose,
+  markReconnectLiveEose,
+  prepareBufferedSubscriptionEvent,
+  shouldDispatchSubscriptionEvent,
 } from "./relayClosedRecovery.ts";
 import {
   requestFirstEventGated,
   requestHistoryGated,
 } from "./relayGateBoundary.ts";
+import { buildChannelLiveFilter } from "./relayChannelFilters.ts";
+import {
+  PAGE_REPLAY_MAX_ATTEMPTS,
+  RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS,
+} from "./relayReconnectReplay.ts";
 
 // ── Fake-timer setup ──────────────────────────────────────────────────────────
 // The rate-limit gate and closed-retry logic use window.setTimeout/clearTimeout.
@@ -452,6 +460,233 @@ test("non-rate-limited retryable CLOSED still schedules a retry", () => {
     true,
     "subscription must survive retryable CLOSED",
   );
+});
+
+test("buffering a repair event does not cancel a pending CLOSED retry", () => {
+  resetAll(0);
+  const subscription = {
+    mode: "live",
+    filter: buildChannelLiveFilter("ch-repair"),
+    onEvent: () => {},
+    closedRetryTimeout: 42,
+    closedRetryAttempt: 3,
+    lastSeenCreatedAt: 1_000,
+  };
+
+  assert.equal(
+    prepareBufferedSubscriptionEvent(
+      subscription,
+      {
+        id: "a".repeat(64),
+        pubkey: "b".repeat(64),
+        created_at: 2_000,
+        kind: 9,
+        tags: [["h", "ch-repair"]],
+        content: "repair",
+        sig: "c".repeat(128),
+      },
+      true,
+    ),
+    true,
+  );
+  assert.equal(subscription.closedRetryTimeout, 42);
+  assert.equal(subscription.closedRetryAttempt, 3);
+  assert.equal(subscription.lastSeenCreatedAt, 1_000);
+});
+
+test("cursorless bounded channel CLOSED retry repairs from zero", async () => {
+  resetAll(0);
+  const channelId = "ch-empty-before-closed";
+  const liveFilter = buildChannelLiveFilter(channelId);
+  const repairRequests = [];
+  const subscription = {
+    mode: "live",
+    filter: liveFilter,
+    onEvent: () => {},
+    lastSeenCreatedAt: undefined,
+  };
+  const subscriptions = new Map([["live-cursorless", subscription]]);
+
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-cursorless",
+    message: "error: temporary relay failure",
+    sendReq: async () => {},
+    requestRepair: async (request) => {
+      repairRequests.push(request);
+      return [];
+    },
+  });
+
+  tickTo(1_001);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(repairRequests.length, 1);
+  assert.equal(repairRequests[0].since, 0);
+  assert.equal(subscription.pendingReplaySince, undefined);
+});
+
+test("failed CLOSED repair retries only the repair and keeps the restored live REQ", async () => {
+  resetAll(0);
+  const subscription = {
+    mode: "live",
+    filter: buildChannelLiveFilter("ch-repair-failure"),
+    onEvent: () => {},
+    lastSeenCreatedAt: 3_000,
+  };
+  const subscriptions = new Map([["live-repair-failure", subscription]]);
+  let liveReqCalls = 0;
+  let repairCalls = 0;
+
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-repair-failure",
+    message: "error: temporary relay failure",
+    sendReq: async () => {
+      liveReqCalls += 1;
+    },
+    requestRepair: async () => {
+      repairCalls += 1;
+      throw new Error("repair IPC unavailable");
+    },
+    generation: 8,
+  });
+
+  tickTo(1_001);
+  await new Promise((resolve) => setImmediate(resolve));
+  tickTo(60_000);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(liveReqCalls, 1);
+  assert.equal(repairCalls, PAGE_REPLAY_MAX_ATTEMPTS);
+  assert.equal(
+    subscription.pendingReplaySince,
+    3_000 - RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS,
+  );
+  assert.equal(subscriptions.get("live-repair-failure"), subscription);
+});
+
+test("exhausted partial CLOSED repairs flush before releasing replay dedupe", async () => {
+  resetAll(0);
+  const channelId = "ch-partial-repair";
+  const delivered = [];
+  const queued = [];
+  const page = Array.from({ length: 500 }, (_, index) => ({
+    id: index.toString(16).padStart(64, "0"),
+    pubkey: "a".repeat(64),
+    created_at: 2_000 - index,
+    kind: 9,
+    tags: [["h", channelId]],
+    content: `partial ${index}`,
+    sig: "b".repeat(128),
+  }));
+  const subscription = {
+    mode: "live",
+    filter: buildChannelLiveFilter(channelId),
+    onEvent: (event) => delivered.push(event.id),
+    lastSeenCreatedAt: 1_000,
+  };
+  const subscriptions = new Map([["live-partial", subscription]]);
+  let repairCalls = 0;
+  let repairSettledCalls = 0;
+  subscription.onClosedRepairSettled = () => {
+    repairSettledCalls += 1;
+  };
+
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-partial",
+    message: "error: temporary relay failure",
+    sendReq: async () => {
+      markReconnectLiveEose(subscription, 9);
+    },
+    requestRepair: async () => {
+      repairCalls += 1;
+      if (repairCalls % 2 === 1) return page;
+      throw new Error("later repair page unavailable");
+    },
+    replaySubscriptionEvent: (_subId, event) => queued.push(event),
+    flushReplayEvents: () => {
+      for (const event of queued.splice(0)) {
+        if (shouldDispatchSubscriptionEvent(subscription, event)) {
+          subscription.onEvent(event);
+        }
+      }
+    },
+    generation: 9,
+  });
+
+  tickTo(1_001);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(repairCalls, PAGE_REPLAY_MAX_ATTEMPTS * 2);
+  assert.equal(delivered.length, page.length);
+  assert.equal(new Set(delivered).size, page.length);
+  assert.equal(subscription.reconnectReplay, undefined);
+  assert.notEqual(subscription.pendingReplaySince, undefined);
+  assert.equal(repairSettledCalls, 1);
+});
+
+test("CLOSED retry repairs more than the live limit from accepted author time", async () => {
+  resetAll(9_000_000);
+  const channelId = "ch-clock-skew";
+  const liveFilter = buildChannelLiveFilter(channelId);
+  const delivered = [];
+  const sentFilters = [];
+  const repairRequests = [];
+  const repairedEvents = Array.from(
+    { length: liveFilter.limit + 1 },
+    (_, index) => ({
+      id: String(index).padStart(64, "0"),
+      pubkey: "a".repeat(64),
+      created_at: 1_100 + index,
+      kind: 9,
+      tags: [["h", channelId]],
+      content: `recovered ${index}`,
+      sig: "b".repeat(128),
+    }),
+  );
+  let repairSettledCalls = 0;
+  const subscription = {
+    mode: "live",
+    filter: liveFilter,
+    onEvent: () => {},
+    onClosedRepairSettled: () => {
+      repairSettledCalls += 1;
+    },
+    lastSeenCreatedAt: 3_000,
+  };
+  const subscriptions = new Map([["live-closed", subscription]]);
+
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-closed",
+    message: "error: temporary relay failure",
+    sendReq: async (_subId, filter) => {
+      sentFilters.push(filter);
+    },
+    requestRepair: async (request) => {
+      repairRequests.push(request);
+      return repairedEvents;
+    },
+    replaySubscriptionEvent: (_subId, event) => delivered.push(event),
+    generation: 7,
+  });
+
+  tickTo(9_001_001);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(sentFilters, [liveFilter]);
+  assert.equal(repairRequests.length, 1);
+  assert.equal(
+    repairRequests[0].since,
+    3_000 - RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS,
+  );
+  assert.equal(repairRequests[0].until, undefined);
+  assert.equal(repairRequests[0].limit, 500);
+  assert.equal(delivered.length, liveFilter.limit + 1);
+  assert.equal(subscription.pendingReplaySince, undefined);
+  assert.equal(repairSettledCalls, 1);
 });
 
 test("terminal CLOSED deletes subscription and does not retry", () => {

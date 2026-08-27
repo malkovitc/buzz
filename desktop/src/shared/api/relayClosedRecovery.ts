@@ -1,8 +1,10 @@
 import { classifyRelayClosed } from "@/shared/api/relayClosedPolicy";
 import {
   activateRateLimit,
+  isRateLimited,
   parseRateLimitHint,
   rateLimitRemainingMs,
+  waitForRateLimit,
 } from "@/shared/api/relayRateLimitGate";
 import {
   sortEvents,
@@ -10,6 +12,13 @@ import {
   type RelaySubscriptionFilter,
   type SubscriptionEventBufferItem,
 } from "@/shared/api/relayClientShared";
+import type { ChannelReconnectRepairRequest } from "@/shared/api/channelReconnectRepair";
+import {
+  PAGE_REPLAY_MAX_ATTEMPTS,
+  replayReconnectHistoryPages,
+  resolveReconnectReplaySince,
+  shouldPageReconnectReplay,
+} from "@/shared/api/relayReconnectReplay";
 import type { RelayEvent } from "@/shared/api/types";
 
 const RETRY_BASE_DELAY_MS = 1_000;
@@ -23,16 +32,64 @@ export function clearClosedRetry(subscription: LiveSubscription) {
   subscription.closedRetryTimeout = undefined;
 }
 
+export function beginLiveReq(
+  subscription: LiveSubscription,
+  generation: number,
+) {
+  if (
+    subscription.liveReqGeneration === generation &&
+    subscription.liveReqActive
+  ) {
+    return false;
+  }
+  subscription.liveReqGeneration = generation;
+  subscription.liveReqActive = true;
+  return true;
+}
+
+export function finishLiveReq(
+  subscription: LiveSubscription,
+  generation: number,
+) {
+  if (
+    subscription.liveReqGeneration !== generation ||
+    !subscription.liveReqActive
+  )
+    return false;
+  subscription.liveReqActive = false;
+  return true;
+}
+
+function notifyClosedRepairSettled(subscription: LiveSubscription) {
+  try {
+    subscription.onClosedRepairSettled?.();
+  } catch (error) {
+    console.error("Failed to refresh after CLOSED repair", error);
+  }
+}
+
 export function handleRelayClosed({
   subscriptions,
   subId,
   message,
   sendReq,
+  requestRepair,
+  replaySubscriptionEvent,
+  flushReplayEvents,
+  generation = 0,
+  isActive = () => true,
 }: {
   subscriptions: Map<string, RelaySubscription>;
   subId: string;
   message: string;
   sendReq: (subId: string, filter: RelaySubscriptionFilter) => Promise<void>;
+  requestRepair?: (
+    request: ChannelReconnectRepairRequest,
+  ) => Promise<RelayEvent[]>;
+  replaySubscriptionEvent?: (subId: string, event: RelayEvent) => void;
+  flushReplayEvents?: () => void;
+  generation?: number;
+  isActive?: () => boolean;
 }) {
   const subscription = subscriptions.get(subId);
   if (!subscription) return;
@@ -52,12 +109,23 @@ export function handleRelayClosed({
     );
     return;
   }
+  if (
+    subscription.liveReqGeneration !== undefined &&
+    !finishLiveReq(subscription, generation)
+  ) {
+    return;
+  }
   recoverLiveSubscriptionFromClosed({
     subscriptions,
     subId,
     subscription,
     message,
     sendReq,
+    requestRepair,
+    replaySubscriptionEvent,
+    flushReplayEvents,
+    generation,
+    isActive,
   });
 }
 
@@ -67,12 +135,24 @@ function recoverLiveSubscriptionFromClosed({
   subscription,
   message,
   sendReq,
+  requestRepair,
+  replaySubscriptionEvent,
+  flushReplayEvents,
+  generation,
+  isActive,
 }: {
   subscriptions: Map<string, RelaySubscription>;
   subId: string;
   subscription: LiveSubscription;
   message: string;
   sendReq: (subId: string, filter: RelaySubscriptionFilter) => Promise<void>;
+  requestRepair?: (
+    request: ChannelReconnectRepairRequest,
+  ) => Promise<RelayEvent[]>;
+  replaySubscriptionEvent?: (subId: string, event: RelayEvent) => void;
+  flushReplayEvents?: () => void;
+  generation: number;
+  isActive: () => boolean;
 }) {
   subscription.resolveReady?.("closed");
   subscription.resolveReady = undefined;
@@ -111,19 +191,123 @@ function recoverLiveSubscriptionFromClosed({
   subscription.closedRetryAttempt = attempt + 1;
   subscription.closedRetryTimeout = window.setTimeout(() => {
     subscription.closedRetryTimeout = undefined;
-    if (subscriptions.get(subId) !== subscription) return;
-    void sendReq(subId, subscription.filter).catch((error) => {
-      if (subscriptions.get(subId) !== subscription) return;
-      console.error("Failed to restore closed relay subscription", error);
-      recoverLiveSubscriptionFromClosed({
-        subscriptions,
-        subId,
-        subscription,
-        message,
-        sendReq,
-      });
-    });
+    if (!isActive() || subscriptions.get(subId) !== subscription) return;
+
+    const channelId = subscription.filter["#h"]?.[0];
+    const shouldPageReplay = shouldPageReconnectReplay(subscription.filter);
+    const replaySince = resolveReconnectReplaySince(
+      subscription,
+      shouldPageReplay,
+    );
+    const shouldRepair =
+      channelId !== undefined &&
+      replaySince !== undefined &&
+      requestRepair !== undefined &&
+      shouldPageReplay;
+
+    let repairOwner: LiveSubscription["reconnectReplay"];
+    if (shouldRepair) {
+      subscription.pendingReplaySince = replaySince;
+      repairOwner = {
+        generation,
+        seenEventIds: new Set(),
+        liveEose: false,
+        repairDone: false,
+      };
+      subscription.reconnectReplay = repairOwner;
+    }
+
+    void (async () => {
+      if (!beginLiveReq(subscription, generation)) return;
+      try {
+        await sendReq(subId, subscription.filter);
+      } catch (error) {
+        finishLiveReq(subscription, generation);
+        if (subscriptions.get(subId) !== subscription) return;
+        console.error("Failed to restore closed relay subscription", error);
+        recoverLiveSubscriptionFromClosed({
+          subscriptions,
+          subId,
+          subscription,
+          message,
+          sendReq,
+          requestRepair,
+          replaySubscriptionEvent,
+          flushReplayEvents,
+          generation,
+          isActive,
+        });
+        return;
+      }
+      if (
+        !shouldRepair ||
+        channelId === undefined ||
+        replaySince === undefined ||
+        !requestRepair
+      ) {
+        return;
+      }
+
+      for (let attempt = 1; attempt <= PAGE_REPLAY_MAX_ATTEMPTS; attempt++) {
+        try {
+          const completed = await replayReconnectHistoryPages({
+            subscription,
+            channelId,
+            since: subscription.pendingReplaySince ?? replaySince,
+            until: undefined,
+            isActive: () =>
+              isActive() &&
+              subscriptions.get(subId) === subscription &&
+              subscription.reconnectReplay === repairOwner,
+            requestRepair,
+            replaySubscriptionEvent: replaySubscriptionEvent
+              ? (event) => replaySubscriptionEvent(subId, event)
+              : undefined,
+          });
+          if (completed && subscription.reconnectReplay === repairOwner) {
+            flushReplayEvents?.();
+            subscription.pendingReplaySince = undefined;
+            markReconnectRepairDone(subscription, generation, repairOwner);
+            notifyClosedRepairSettled(subscription);
+          }
+          return;
+        } catch (error) {
+          console.warn(
+            `[CLOSED recovery] history backfill attempt ${attempt}/${PAGE_REPLAY_MAX_ATTEMPTS} failed for ${subId}:`,
+            error,
+          );
+          if (attempt === PAGE_REPLAY_MAX_ATTEMPTS) {
+            // Partial attempts may have queued rows. Dispatch them while the
+            // cross-attempt/live dedupe set still exists, then release this
+            // generation without clearing the unresolved floor.
+            if (subscription.reconnectReplay === repairOwner) {
+              flushReplayEvents?.();
+              markReconnectRepairDone(subscription, generation, repairOwner);
+              notifyClosedRepairSettled(subscription);
+            }
+            return;
+          }
+          if (isRateLimited()) await waitForRateLimit();
+          if (
+            !isActive() ||
+            subscriptions.get(subId) !== subscription ||
+            subscription.reconnectReplay !== repairOwner
+          )
+            return;
+        }
+      }
+    })();
   }, delayMs);
+}
+
+export function prepareBufferedSubscriptionEvent(
+  subscription: RelaySubscription,
+  event: RelayEvent,
+  isRepair: boolean,
+) {
+  return isRepair
+    ? subscription.mode === "live"
+    : prepareSubscriptionEvent(subscription, event);
 }
 
 export function prepareSubscriptionEvent(
@@ -161,6 +345,7 @@ export function flushEvents(
   subscriptions: Map<string, RelaySubscription>,
   generation: number,
 ) {
+  const flushCallbacks = new Set<() => void>();
   for (const item of buffer) {
     const subscription = subscriptions.get(item.subId);
     if (
@@ -169,8 +354,10 @@ export function flushEvents(
       shouldDispatchSubscriptionEvent(subscription, item.event)
     ) {
       subscription.onEvent(item.event);
+      if (subscription.onFlush) flushCallbacks.add(subscription.onFlush);
     }
   }
+  for (const callback of flushCallbacks) callback();
 }
 
 export function markReconnectLiveEose(
@@ -186,9 +373,11 @@ export function markReconnectLiveEose(
 export function markReconnectRepairDone(
   subscription: Extract<RelaySubscription, { mode: "live" }>,
   generation: number,
+  repairOwner: Extract<RelaySubscription, { mode: "live" }>["reconnectReplay"],
 ) {
   const replay = subscription.reconnectReplay;
-  if (!replay || replay.generation !== generation) return;
+  if (!replay || replay.generation !== generation || replay !== repairOwner)
+    return;
   replay.repairDone = true;
   if (replay.liveEose) subscription.reconnectReplay = undefined;
 }
@@ -207,6 +396,15 @@ export function handleSubscriptionEose({
   const subscription = subscriptions.get(subId);
   if (!subscription) return;
   if (subscription.mode === "live") {
+    // EOSE ends only the initial history stream; the live REQ remains active.
+    // Only CLOSED (or a new socket generation) releases its same-ID send slot.
+    if (
+      generation !== undefined &&
+      subscription.liveReqGeneration !== undefined &&
+      subscription.liveReqGeneration !== generation
+    ) {
+      return;
+    }
     if (generation !== undefined)
       markReconnectLiveEose(subscription, generation);
     subscription.resolveReady?.("eose");

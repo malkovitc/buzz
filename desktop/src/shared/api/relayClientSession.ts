@@ -9,11 +9,10 @@ import {
   KIND_STREAM_MESSAGE,
   KIND_TYPING_INDICATOR,
   KIND_USER_STATUS,
-  CHANNEL_EVENT_KINDS,
-  KIND_CHANNEL_THREAD_SUMMARY,
 } from "@/shared/constants/kinds";
 import {
   getTextPayload,
+  trackLiveReqAttempt as trackReq,
   toRelayFrames,
   type ConnectionState,
   type LiveSubscriptionReadiness,
@@ -26,15 +25,17 @@ import {
   buildChannelAuxDeletionFilter,
   buildChannelFilter,
   buildChannelHistoryFilter,
+  buildChannelLiveFilter,
   buildChannelMentionFilter,
   buildGlobalStreamFilter,
 } from "@/shared/api/relayChannelFilters";
 import {
+  beginLiveReq,
   clearClosedRetry,
   flushEvents,
   handleRelayClosed,
   handleSubscriptionEose,
-  prepareSubscriptionEvent,
+  prepareBufferedSubscriptionEvent,
 } from "@/shared/api/relayClosedRecovery";
 import { getChannelReconnectRepairEvents } from "@/shared/api/channelReconnectRepair";
 import { replayLiveSubscriptions } from "@/shared/api/relayReconnectReplay";
@@ -326,30 +327,21 @@ export class RelayClient {
     return this.subscribe(buildChannelFilter(channelId, 50), onEvent);
   }
 
-  /** Subscribe to channel rows and aux starting now, with no history replay. */
   async subscribeToChannelLive(
     channelId: string,
     onEvent: (event: RelayEvent) => void,
+    options?: { onFlush?: () => void; onClosedRepairSettled?: () => void },
   ) {
-    // 39005 rides only this window-store subscription — CHANNEL_EVENT_KINDS'
-    // other consumers (unread tracking, cache merges) must never see
-    // summary overlays.
     return this.subscribe(
-      {
-        kinds: [...CHANNEL_EVENT_KINDS, KIND_CHANNEL_THREAD_SUMMARY],
-        "#h": [channelId],
-        limit: 1000,
-        since: Math.floor(Date.now() / 1_000),
-      },
+      buildChannelLiveFilter(channelId),
       onEvent,
+      undefined,
+      250,
+      options?.onFlush,
+      options?.onClosedRepairSettled,
     );
   }
-
-  /**
-   * Subscribe to huddle lifecycle events (kinds 48100–48103) for a channel,
-   * so HuddleIndicator detects active huddles without being drowned out by
-   * regular channel messages. Includes the last 10 historical events.
-   */
+  /** Huddle lifecycle subscription, isolated from regular channel traffic. */
   async subscribeToHuddleEvents(
     channelId: string,
     onEvent: (event: RelayEvent) => void,
@@ -395,7 +387,6 @@ export class RelayClient {
     );
   }
 
-  /** Subscribe to kind:30315 user status events (live only, no backfill). */
   async subscribeToUserStatusUpdates(onEvent: (event: RelayEvent) => void) {
     return this.subscribe(
       { kinds: [KIND_USER_STATUS], "#d": ["general"], limit: 0 },
@@ -426,20 +417,14 @@ export class RelayClient {
     );
   }
   async preconnect() {
-    // Explicit re-engagement (reconnect card / community switch): clears the
-    // terminal latch and AUTH rejection streak, and bypasses backoff once.
+    // Explicit re-engagement clears terminal auth state and bypasses backoff.
     this.terminal = false;
     this.authOkTracker.reset();
     this.keepAliveRequested = true;
     await this.connectBypassingBackoff();
   }
 
-  /**
-   * Environment-driven resume (online/focus/visibility): bypasses a pending
-   * backoff timer but preserves the terminal latch and AUTH rejection streak
-   * — only `preconnect()` clears those, so resume events during repeated
-   * AUTH rejection cannot defeat the consecutive-rejection cap.
-   */
+  /** Environment resume bypasses backoff but preserves terminal auth state. */
   async resumeReconnect() {
     if (this.terminal) return;
     await this.connectBypassingBackoff();
@@ -473,11 +458,7 @@ export class RelayClient {
     return this.connectionStateEmitter.get();
   }
 
-  /**
-   * Subscribe to connection-state transitions. The listener fires
-   * immediately with the current state, so callers need no separate
-   * `getConnectionState()` call to seed their UI.
-   */
+  /** Subscribe and immediately seed the listener with connection state. */
   subscribeToConnectionState(listener: (state: ConnectionState) => void) {
     return this.connectionStateEmitter.subscribe(listener);
   }
@@ -601,6 +582,8 @@ export class RelayClient {
     onEvent: (event: RelayEvent) => void,
     onReady?: (readiness: LiveSubscriptionReadiness) => void,
     readinessTimeoutMs = 250,
+    onFlush?: () => void,
+    onClosedRepairSettled?: () => void,
   ) {
     await this.ensureConnected();
 
@@ -618,13 +601,16 @@ export class RelayClient {
       readinessTimeoutMs,
     );
 
-    this.subscriptions.set(subId, {
+    const subscription: Extract<RelaySubscription, { mode: "live" }> = {
       mode: "live",
       filter,
       onEvent,
+      onFlush,
+      onClosedRepairSettled,
       resolveReady,
-    });
-
+    };
+    this.subscriptions.set(subId, subscription);
+    beginLiveReq(subscription, this.connectionGeneration);
     try {
       await this.sendRawWithReconnectRetry(
         ["REQ", subId, filter],
@@ -662,11 +648,9 @@ export class RelayClient {
       },
     });
   }
-
   private normalizeRelayError(error: unknown, fallbackMessage: string) {
     return error instanceof Error ? error : new Error(fallbackMessage);
   }
-
   private recoverFromSocketFailure(
     error: unknown,
     fallbackMessage: string,
@@ -675,11 +659,11 @@ export class RelayClient {
     this.resetConnection(normalizedError);
     return normalizedError;
   }
-
   private async sendRawWithReconnectRetry(
     payload: unknown[],
     fallbackMessage: string,
   ) {
+    const wasLiveReqAttempted = trackReq(payload, this.subscriptions);
     try {
       await this.sendRaw(payload);
     } catch (error) {
@@ -689,6 +673,7 @@ export class RelayClient {
       );
       try {
         await this.ensureConnected();
+        if (wasLiveReqAttempted(this.connectionGeneration)) return;
         await this.sendRaw(payload);
       } catch (retryError) {
         throw this.recoverFromSocketFailure(
@@ -698,7 +683,6 @@ export class RelayClient {
       }
     }
   }
-
   private async closeSubscription(subId: string) {
     if (this.wsId === null) {
       return;
@@ -824,6 +808,12 @@ export class RelayClient {
             ["REQ", subId, filter],
             "Failed to restore relay subscription after CLOSED.",
           ),
+        requestRepair: getChannelReconnectRepairEvents,
+        replaySubscriptionEvent: (subId, event) =>
+          this.handleEvent(subId, event, generation, true),
+        flushReplayEvents: () => this.flushEventBuffer(),
+        generation,
+        isActive: () => this.connectionGeneration === generation,
       });
       return;
     }
@@ -855,7 +845,12 @@ export class RelayClient {
     await this.sendRaw(["AUTH", event]);
   }
 
-  private handleEvent(subId: string, event: RelayEvent, generation: number) {
+  private handleEvent(
+    subId: string,
+    event: RelayEvent,
+    generation: number,
+    isRepair = false,
+  ) {
     const subscription = this.subscriptions.get(subId);
     if (!subscription) {
       return;
@@ -866,7 +861,8 @@ export class RelayClient {
       return;
     }
 
-    if (!prepareSubscriptionEvent(subscription, event)) return;
+    if (!prepareBufferedSubscriptionEvent(subscription, event, isRepair))
+      return;
     this.eventBuffer.push({ subId, event, generation });
     this.flushTimeout ??= window.setTimeout(
       () => this.flushEventBuffer(),
@@ -937,6 +933,9 @@ export class RelayClient {
         subscriptions: this.subscriptions,
         sendRaw: (payload) => this.sendRaw(payload),
         requestRepair: getChannelReconnectRepairEvents,
+        replaySubscriptionEvent: (subId, event) =>
+          this.handleEvent(subId, event, generation, true),
+        flushReplayEvents: () => this.flushEventBuffer(),
         generation,
         visibleChannelId: this.visibleChannelId,
         isActive: () => this.connectionGeneration === generation,

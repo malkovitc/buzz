@@ -60,6 +60,10 @@ type LiveSubscription = {
   mode: "live";
   filter: RelaySubscriptionFilter;
   onEvent: (event: RelayEvent) => void;
+  /** Invoked once after each buffered delivery containing this subscription. */
+  onFlush?: () => void;
+  /** Invoked after CLOSED gap repair settles so derived windows can refresh. */
+  onClosedRepairSettled?: () => void;
   resolveReady?: (readiness: LiveSubscriptionReadiness) => void;
   lastSeenCreatedAt?: number;
   /**
@@ -80,9 +84,24 @@ type LiveSubscription = {
     liveEose: boolean;
     repairDone: boolean;
   };
+  /** At most one same-ID live REQ may be active per socket generation. */
+  liveReqGeneration?: number;
+  liveReqActive?: boolean;
   closedRetryAttempt?: number;
   closedRetryTimeout?: number;
 };
+
+export function trackLiveReqAttempt(
+  payload: unknown[],
+  subscriptions: Map<string, RelaySubscription>,
+) {
+  const subId = payload[0] === "REQ" ? payload[1] : undefined;
+  const subscription =
+    typeof subId === "string" ? subscriptions.get(subId) : undefined;
+  return (generation: number) =>
+    subscription?.mode === "live" &&
+    subscription.liveReqGeneration === generation;
+}
 
 export type PendingEvent = {
   event: RelayEvent;

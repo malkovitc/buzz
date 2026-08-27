@@ -5,6 +5,7 @@ import type {
 } from "@/shared/api/relayClientShared";
 import type { RelayEvent } from "@/shared/api/types";
 import {
+  beginLiveReq,
   markReconnectRepairDone,
   shouldDispatchSubscriptionEvent,
 } from "@/shared/api/relayClosedRecovery";
@@ -110,6 +111,40 @@ export function shouldPageReconnectReplay(filter: RelaySubscriptionFilter) {
   );
 }
 
+export function resolveReconnectReplaySince(
+  subscription: Extract<RelaySubscription, { mode: "live" }>,
+  shouldPageReplay: boolean,
+) {
+  const cursorSince =
+    subscription.lastSeenCreatedAt === undefined
+      ? undefined
+      : Math.max(
+          0,
+          subscription.lastSeenCreatedAt -
+            (shouldPageReplay
+              ? RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS
+              : RECONNECT_REPLAY_SKEW_SECS),
+        );
+  // A page-capable bounded subscription with no accepted event still needs a
+  // repair floor: more than `limit` rows may have arrived while it was down.
+  // Zero is the only clock-independent safe fallback until a relay-authored
+  // event establishes the ordinary bounded cursor.
+  const fallbackSince = shouldPageReplay
+    ? (subscription.filter.since ?? 0)
+    : undefined;
+  // A pinned floor from a previously failed backfill takes precedence over the
+  // cursor because live events may have advanced while that older window was
+  // unresolved.
+  const replayFloor =
+    cursorSince === undefined
+      ? (subscription.pendingReplaySince ?? fallbackSince)
+      : Math.min(cursorSince, subscription.pendingReplaySince ?? Infinity);
+
+  return replayFloor === undefined
+    ? undefined
+    : Math.max(replayFloor, subscription.filter.since ?? 0);
+}
+
 /**
  * Page one subscription's missed-window history.
  *
@@ -127,6 +162,7 @@ export async function replayReconnectHistoryPages({
   until,
   isActive,
   requestRepair,
+  replaySubscriptionEvent,
 }: {
   subscription: Extract<RelaySubscription, { mode: "live" }>;
   channelId: string;
@@ -136,6 +172,7 @@ export async function replayReconnectHistoryPages({
   requestRepair: (
     request: ChannelReconnectRepairRequest,
   ) => Promise<RelayEvent[]>;
+  replaySubscriptionEvent?: (event: RelayEvent) => void;
 }): Promise<boolean> {
   let pageUntil: number | undefined = until;
   let beforeId: string | undefined;
@@ -154,7 +191,9 @@ export async function replayReconnectHistoryPages({
     if (!isActive()) return false;
 
     for (const event of events) {
-      if (shouldDispatchSubscriptionEvent(subscription, event)) {
+      if (replaySubscriptionEvent) {
+        replaySubscriptionEvent(event);
+      } else if (shouldDispatchSubscriptionEvent(subscription, event)) {
         subscription.onEvent(event);
       }
     }
@@ -182,6 +221,8 @@ export async function replayLiveSubscriptions({
   subscriptions,
   sendRaw,
   requestRepair,
+  replaySubscriptionEvent,
+  flushReplayEvents,
   generation = 0,
   pageReplayConcurrency = RECONNECT_REPLAY_PAGE_CONCURRENCY,
   visibleChannelId = null,
@@ -196,6 +237,8 @@ export async function replayLiveSubscriptions({
   requestRepair: (
     request: ChannelReconnectRepairRequest,
   ) => Promise<RelayEvent[]>;
+  replaySubscriptionEvent?: (subId: string, event: RelayEvent) => void;
+  flushReplayEvents?: () => void;
   generation?: number;
   pageReplayConcurrency?: number;
   /** Channel currently visible in the UI — its subscriptions go in the first batch. */
@@ -233,40 +276,25 @@ export async function replayLiveSubscriptions({
       const shouldPageReplay =
         channelId !== undefined &&
         shouldPageReconnectReplay(subscription.filter);
-      const cursorSince =
-        subscription.lastSeenCreatedAt === undefined
-          ? undefined
-          : Math.max(
-              0,
-              subscription.lastSeenCreatedAt -
-                (shouldPageReplay
-                  ? RECONNECT_REPLAY_CHANNEL_LOOKBACK_SECS
-                  : RECONNECT_REPLAY_SKEW_SECS),
-            );
-      // A pinned floor from a previously failed backfill takes precedence
-      // over the cursor: live events kept advancing `lastSeenCreatedAt`
-      // while the older window stayed unresolved, and starting from the
-      // cursor would skip it permanently.
-      const replayFloor =
-        cursorSince === undefined
-          ? subscription.pendingReplaySince
-          : Math.min(cursorSince, subscription.pendingReplaySince ?? Infinity);
-      // Native repair bypasses the original WS filter, so preserve its lower
-      // bound explicitly. Otherwise a from-now subscription can replay older
-      // rows and surface stale unread or notification activity on reconnect.
-      const replaySince =
-        replayFloor === undefined
-          ? undefined
-          : Math.max(replayFloor, subscription.filter.since ?? 0);
-      const willRepair = shouldPageReplay && replaySince !== undefined;
+      const replaySince = resolveReconnectReplaySince(
+        subscription,
+        shouldPageReplay,
+      );
+      const willSendReq = beginLiveReq(subscription, generation);
+      const willRepair =
+        willSendReq && shouldPageReplay && replaySince !== undefined;
+      let repairOwner: typeof subscription.reconnectReplay;
       if (willRepair) {
-        // Install before the restored live REQ: a live frame may beat page one.
-        subscription.reconnectReplay = {
+        // Install and pin the floor before the restored live REQ: a live frame
+        // may advance the cursor, or its send may fail before paging starts.
+        subscription.pendingReplaySince = replaySince;
+        repairOwner = {
           generation,
           seenEventIds: new Set(),
           liveEose: false,
           repairDone: false,
         };
+        subscription.reconnectReplay = repairOwner;
       }
 
       return {
@@ -275,6 +303,8 @@ export async function replayLiveSubscriptions({
         channelId,
         replaySince,
         shouldPageReplay: willRepair,
+        willSendReq,
+        repairOwner,
       };
     });
 
@@ -307,7 +337,14 @@ export async function replayLiveSubscriptions({
     const batch = replayRequests.slice(i, i + replayBatchSize);
     await Promise.all(
       batch.map(
-        async ({ subId, subscription, replaySince, shouldPageReplay }) => {
+        async ({
+          subId,
+          subscription,
+          replaySince,
+          shouldPageReplay,
+          willSendReq,
+        }) => {
+          if (!willSendReq) return;
           // The subscription map may change while replay is paused behind the
           // gate or an inter-batch delay. Never resurrect a disposed entry (or
           // overwrite its replacement) with a REQ from this stale snapshot.
@@ -351,7 +388,7 @@ export async function replayLiveSubscriptions({
         request.replaySince !== undefined,
     ),
     pageReplayConcurrency,
-    async ({ subId, subscription, channelId, replaySince }) => {
+    async ({ subId, subscription, channelId, replaySince, repairOwner }) => {
       // Backfill is best-effort: a failure here (typically a `rate-limited:`
       // CLOSED on a history REQ) must never escape to the session and tear
       // down the healthy, authenticated socket carrying the live REQs — that
@@ -363,7 +400,6 @@ export async function replayLiveSubscriptions({
       // of backfill success, so without the pin an exhausted backfill
       // followed by one live event would make the next reconnect skip the
       // unresolved window permanently. Cleared only on a completed pass.
-      subscription.pendingReplaySince = replaySince;
       for (let attempt = 1; attempt <= PAGE_REPLAY_MAX_ATTEMPTS; attempt++) {
         try {
           const completed = await replayReconnectHistoryPages({
@@ -380,16 +416,23 @@ export async function replayLiveSubscriptions({
             // alone stays true and a stale pass could complete and clear the
             // floor the superseding connection needs.
             isActive: () =>
-              isActive() && subscriptions.get(subId) === subscription,
+              isActive() &&
+              subscriptions.get(subId) === subscription &&
+              subscription.reconnectReplay === repairOwner,
             requestRepair,
+            replaySubscriptionEvent: replaySubscriptionEvent
+              ? (event) => replaySubscriptionEvent(subId, event)
+              : undefined,
           });
           // A stale-connection abort is NOT completion: the superseding
           // connection shares this subscription object and still needs the
           // pinned floor for its own replay. Only a genuinely completed
-          // window may release it.
-          if (completed) {
+          // window may release it. Flush queued repair rows first so dispatch
+          // dedupe still exists when the buffer processes them.
+          if (completed && subscription.reconnectReplay === repairOwner) {
+            flushReplayEvents?.();
             subscription.pendingReplaySince = undefined;
-            markReconnectRepairDone(subscription, generation);
+            markReconnectRepairDone(subscription, generation, repairOwner);
           }
           return;
         } catch (error) {
@@ -398,14 +441,25 @@ export async function replayLiveSubscriptions({
             error,
           );
           if (attempt === PAGE_REPLAY_MAX_ATTEMPTS) {
-            markReconnectRepairDone(subscription, generation);
+            // Every failed attempt may already have queued complete pages.
+            // Drain them while reconnect dedupe still spans live and repair
+            // delivery, then release repair completion.
+            if (subscription.reconnectReplay === repairOwner) {
+              flushReplayEvents?.();
+              markReconnectRepairDone(subscription, generation, repairOwner);
+            }
             return;
           }
           // The failed REQ's CLOSED handler arms the rate-limit gate before
           // rejecting; wait for it (no-op when the failure wasn't back-pressure)
           // and re-check that this replay's connection is still current.
           if (isRateLimited()) await waitForRateLimit();
-          if (subscriptions.get(subId) !== subscription || !isActive()) return;
+          if (
+            subscriptions.get(subId) !== subscription ||
+            !isActive() ||
+            subscription.reconnectReplay !== repairOwner
+          )
+            return;
         }
       }
     },
