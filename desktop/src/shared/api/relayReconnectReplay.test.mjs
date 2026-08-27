@@ -15,8 +15,9 @@ import {
   shouldPageReconnectReplay,
 } from "./relayReconnectReplay.ts";
 import { buildChannelFilter } from "./relayChannelFilters.ts";
-import { hasActiveLiveReq } from "./relayClientShared.ts";
+import { hasLiveReqAttemptForGeneration } from "./relayClientShared.ts";
 import {
+  finishLiveReq,
   flushEvents,
   handleSubscriptionEose,
   markReconnectLiveEose,
@@ -947,7 +948,7 @@ test("disposed subscription receives no repair events after an in-flight page", 
   assert.deepEqual(delivered, []);
 });
 
-test("same-generation replay does not overlap an active same-ID REQ", async () => {
+test("same-generation retry honors an attempted same-ID REQ after EOSE or CLOSED", async () => {
   resetGate();
   const subscription = {
     mode: "live",
@@ -977,11 +978,21 @@ test("same-generation replay does not overlap an active same-ID REQ", async () =
     closeSubscription: async () => {},
     generation: 10,
   });
-  assert.equal(hasActiveLiveReq(["REQ", "live-1"], subscriptions, 10), true);
+  assert.equal(
+    hasLiveReqAttemptForGeneration(["REQ", "live-1"], subscriptions, 10),
+    true,
+  );
   await replay();
 
   assert.equal(reqCalls, 1);
   assert.equal(repairCalls, 1);
+  assert.equal(finishLiveReq(subscription, 10), true);
+  assert.equal(subscription.liveReqActive, false);
+  assert.equal(
+    hasLiveReqAttemptForGeneration(["REQ", "live-1"], subscriptions, 10),
+    true,
+    "a CLOSED outcome must not make the original wrapper resend",
+  );
 });
 
 test("overlapping repair cannot mutate successor dedupe in the same generation", async () => {

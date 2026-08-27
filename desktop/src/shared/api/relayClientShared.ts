@@ -91,7 +91,7 @@ type LiveSubscription = {
   closedRetryTimeout?: number;
 };
 
-export function hasActiveLiveReq(
+export function hasLiveReqAttemptForGeneration(
   payload: unknown[],
   subscriptions: Map<string, RelaySubscription>,
   generation: number,
@@ -101,8 +101,7 @@ export function hasActiveLiveReq(
     typeof subId === "string" ? subscriptions.get(subId) : undefined;
   return (
     subscription?.mode === "live" &&
-    subscription.liveReqGeneration === generation &&
-    subscription.liveReqActive === true
+    subscription.liveReqGeneration === generation
   );
 }
 
