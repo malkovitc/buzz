@@ -285,7 +285,9 @@ export async function replayLiveSubscriptions({
         willSendReq && shouldPageReplay && replaySince !== undefined;
       let repairOwner: typeof subscription.reconnectReplay;
       if (willRepair) {
-        // Install before the restored live REQ: a live frame may beat page one.
+        // Install and pin the floor before the restored live REQ: a live frame
+        // may advance the cursor, or its send may fail before paging starts.
+        subscription.pendingReplaySince = replaySince;
         repairOwner = {
           generation,
           seenEventIds: new Set(),
@@ -398,7 +400,6 @@ export async function replayLiveSubscriptions({
       // of backfill success, so without the pin an exhausted backfill
       // followed by one live event would make the next reconnect skip the
       // unresolved window permanently. Cleared only on a completed pass.
-      subscription.pendingReplaySince = replaySince;
       for (let attempt = 1; attempt <= PAGE_REPLAY_MAX_ATTEMPTS; attempt++) {
         try {
           const completed = await replayReconnectHistoryPages({

@@ -618,6 +618,45 @@ test("cursorless bounded channel reconnect repairs from a clock-independent floo
   assert.equal(subscription.pendingReplaySince, undefined);
 });
 
+test("cursorless floor is pinned before a restored REQ can advance the cursor and fail", async () => {
+  resetGate();
+  const subscription = {
+    mode: "live",
+    filter: buildChannelFilter("channel-pre-paging-failure", 50),
+    onEvent: () => {},
+    lastSeenCreatedAt: undefined,
+  };
+  const subscriptions = new Map([["live-pre-paging", subscription]]);
+
+  await assert.rejects(
+    replayLiveSubscriptions({
+      subscriptions,
+      generation: 1,
+      sendRaw: async () => {
+        prepareSubscriptionEvent(subscription, event("new-live", 5_000));
+        throw new Error("socket failed before paging started");
+      },
+      requestRepair: async () => [],
+    }),
+  );
+
+  assert.equal(subscription.lastSeenCreatedAt, 5_000);
+  assert.equal(subscription.pendingReplaySince, 0);
+
+  const repairRequests = [];
+  await replayLiveSubscriptions({
+    subscriptions,
+    generation: 2,
+    sendRaw: async () => {},
+    requestRepair: async (request) => {
+      repairRequests.push(request);
+      return [];
+    },
+  });
+
+  assert.equal(repairRequests[0].since, 0);
+});
+
 test("channel reconnect replay pages the missed window until a short page", async () => {
   resetGate();
   const delivered = [];
