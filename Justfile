@@ -123,6 +123,11 @@ desktop-install:
 desktop-install-ci:
     pnpm install --frozen-lockfile
 
+# Run the production Pi ACP adapter's formatter, lints, and unit regressions.
+pi-acp-ci:
+    pnpm --filter @buzz/pi-acp check
+    pnpm --filter @buzz/pi-acp test
+
 # Run desktop lint and format checks
 desktop-check:
     cd {{desktop_dir}} && pnpm check
@@ -295,7 +300,7 @@ desktop-e2e-pre-push: _ensure-migrations
     cd {{desktop_dir}} && pnpm build:e2e && pnpm exec playwright test --only-changed=origin/main
 
 # Run all checks suitable for CI / pre-push (no infra needed)
-ci: check test-unit desktop-test desktop-build desktop-tauri-check desktop-tauri-test web-build mobile-test
+ci: check test-unit pi-acp-ci desktop-test desktop-build desktop-tauri-check desktop-tauri-test web-build mobile-test
 
 # ─── Test ─────────────────────────────────────────────────────────────────────
 

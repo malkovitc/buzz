@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import packageMetadata from "../package.json" with { type: "json" };
-import { PiAcpAdapter } from "./adapter.mjs";
 
 if (process.argv.includes("--version") || process.argv.includes("-V")) {
   process.stdout.write(`pi-acp ${packageMetadata.version}\n`);
@@ -14,6 +13,7 @@ if (process.platform === "win32") {
   process.exit(1);
 }
 
+const { PiAcpAdapter } = await import("./adapter.mjs");
 const adapter = new PiAcpAdapter({
   input: process.stdin,
   output: process.stdout,

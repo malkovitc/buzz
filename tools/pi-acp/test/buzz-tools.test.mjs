@@ -162,6 +162,222 @@ test("pre-aborted command signals never spawn a publication process", async (t) 
   await assert.rejects(fs.access(marker));
 });
 
+test("durable JSON records flush in write-sync-rename-directory-sync order", async (t) => {
+  const dir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "pi-acp-durable-record-"),
+  );
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const operations = [];
+  const fileSystem = {
+    open: async (...args) => {
+      const kind = args[1] === "r" ? "directory" : "file";
+      operations.push(`open:${kind}`);
+      const handle = await fs.open(...args);
+      return {
+        writeFile: async (...writeArgs) => {
+          operations.push("write:file");
+          await handle.writeFile(...writeArgs);
+        },
+        sync: async () => {
+          operations.push(`sync:${kind}`);
+          await handle.sync();
+        },
+        close: async () => {
+          operations.push(`close:${kind}`);
+          await handle.close();
+        },
+      };
+    },
+    rename: async (...args) => {
+      operations.push("rename");
+      await fs.rename(...args);
+    },
+    rm: (...args) => fs.rm(...args),
+  };
+  await testOnly.writeJsonAtomicDurable(
+    dir,
+    "receipt.json",
+    { event_id: eventId, accepted: true },
+    fileSystem,
+  );
+  assert.deepEqual(operations, [
+    "open:file",
+    "write:file",
+    "sync:file",
+    "close:file",
+    "rename",
+    "open:directory",
+    "sync:directory",
+    "close:directory",
+  ]);
+  assert.deepEqual(
+    JSON.parse(await fs.readFile(path.join(dir, "receipt.json"), "utf8")),
+    { event_id: eventId, accepted: true },
+  );
+  assert.equal(
+    (await fs.stat(path.join(dir, "receipt.json"))).mode & 0o777,
+    0o600,
+  );
+  assert.deepEqual(await fs.readdir(dir), ["receipt.json"]);
+});
+
+test("first-run receipt roots sync every newly linked directory", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-durable-root-"));
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  const operations = [];
+  const fileSystem = {
+    lstat: (...args) => fs.lstat(...args),
+    realpath: (...args) => fs.realpath(...args),
+    mkdir: async (directory, options) => {
+      operations.push(`mkdir:${path.basename(directory)}`);
+      await fs.mkdir(directory, options);
+    },
+    open: async (directory, flags) => {
+      operations.push(`open:${path.basename(directory)}`);
+      const handle = await fs.open(directory, flags);
+      return {
+        sync: async () => {
+          operations.push(`sync:${path.basename(directory)}`);
+          await handle.sync();
+        },
+        close: () => handle.close(),
+      };
+    },
+  };
+  const root = await testOnly.ensureDirectoryDurable(
+    path.join(base, ".buzz", "pi-acp-receipts"),
+    fileSystem,
+  );
+  const canonicalBase = await fs.realpath(base);
+  assert.equal(root, path.join(canonicalBase, ".buzz", "pi-acp-receipts"));
+  assert.deepEqual(operations, [
+    `open:${path.basename(path.dirname(canonicalBase))}`,
+    `sync:${path.basename(path.dirname(canonicalBase))}`,
+    "mkdir:.buzz",
+    `open:${path.basename(base)}`,
+    `sync:${path.basename(base)}`,
+    "mkdir:pi-acp-receipts",
+    "open:.buzz",
+    "sync:.buzz",
+  ]);
+});
+
+test("an existing first-use root resyncs its parent before publication", async (t) => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-root-race-"));
+  const root = path.join(parent, "receipts");
+  await fs.mkdir(root);
+  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+  const synced = [];
+  const fileSystem = {
+    lstat: (...args) => fs.lstat(...args),
+    realpath: (...args) => fs.realpath(...args),
+    open: async (directory, flags) => {
+      const handle = await fs.open(directory, flags);
+      return {
+        sync: async () => {
+          synced.push(await fs.realpath(directory));
+          await handle.sync();
+        },
+        close: () => handle.close(),
+      };
+    },
+  };
+  const canonicalRoot = await testOnly.ensureDirectoryDurable(root, fileSystem);
+  assert.equal(canonicalRoot, await fs.realpath(root));
+  assert.deepEqual(synced, [await fs.realpath(parent)]);
+});
+
+test("strict power-loss mode fails closed off Linux", () => {
+  assert.throws(
+    () =>
+      testOnly.assertPowerLossDurability(
+        { PI_ACP_REQUIRE_POWER_LOSS_DURABILITY: "1" },
+        "darwin",
+      ),
+    /supported only on Linux/,
+  );
+  assert.doesNotThrow(() =>
+    testOnly.assertPowerLossDurability(
+      { PI_ACP_REQUIRE_POWER_LOSS_DURABILITY: "1" },
+      "linux",
+    ),
+  );
+});
+
+test("failed durability barriers retain a fail-closed record state", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-durable-fault-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  let syncNumber = 0;
+  const fileSystem = {
+    open: async (...args) => {
+      const handle = await fs.open(...args);
+      return {
+        writeFile: (...writeArgs) => handle.writeFile(...writeArgs),
+        sync: async () => {
+          syncNumber += 1;
+          await handle.sync();
+          if (syncNumber === 2) throw new Error("directory flush failed");
+        },
+        close: () => handle.close(),
+      };
+    },
+    rename: (...args) => fs.rename(...args),
+    rm: (...args) => fs.rm(...args),
+  };
+  await assert.rejects(
+    testOnly.writeJsonAtomicDurable(
+      dir,
+      "request.json",
+      { contentSha256: "a".repeat(64) },
+      fileSystem,
+    ),
+    /directory flush failed/,
+  );
+  assert.deepEqual(await fs.readdir(dir), ["request.json"]);
+});
+
+test("pre-rename durability failure removes incomplete temporary records", async (t) => {
+  const dir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "pi-acp-durable-pre-rename-"),
+  );
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const fileSystem = {
+    open: async (...args) => {
+      const handle = await fs.open(...args);
+      return {
+        writeFile: (...writeArgs) => handle.writeFile(...writeArgs),
+        sync: async () => {
+          await handle.sync();
+          throw new Error("file flush failed");
+        },
+        close: () => handle.close(),
+      };
+    },
+    rename: (...args) => fs.rename(...args),
+    rm: (...args) => fs.rm(...args),
+  };
+  await assert.rejects(
+    testOnly.writeJsonAtomicDurable(
+      dir,
+      "request.json",
+      { contentSha256: "a".repeat(64) },
+      fileSystem,
+    ),
+    /file flush failed/,
+  );
+  assert.deepEqual(await fs.readdir(dir), []);
+});
+
+test("publisher output waits for inherited stdio to close", {
+  skip: process.platform === "win32",
+}, async () => {
+  const result = await testOnly.run("/bin/sh", [
+    "-c",
+    "(sleep 0.1; printf delayed-receipt) &",
+  ]);
+  assert.equal(result.stdout, "delayed-receipt");
+});
+
 test("aborting a wrapper terminates its publication process group", {
   skip: process.platform === "win32",
 }, async (t) => {

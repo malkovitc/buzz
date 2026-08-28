@@ -21,6 +21,29 @@ const buzzMeta = {
   },
 };
 
+test("version output does not load the adapter dependency graph", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-acp-version-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const sourceDir = path.join(root, "src");
+  fs.mkdirSync(sourceDir);
+  const isolatedEntrypoint = path.join(sourceDir, "pi-acp-rpc.mjs");
+  fs.copyFileSync(adapterPath, isolatedEntrypoint);
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ type: "module", version: "0.2.3" }),
+  );
+  const child = spawn(process.execPath, [isolatedEntrypoint, "--version"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  const [code] = await once(child, "close");
+  assert.equal(code, 0, stderr);
+  assert.equal(stdout, "pi-acp 0.2.3\n");
+});
+
 function startHarness(mode = "complete") {
   const receiptDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-acp-test-"));
   const child = spawn(process.execPath, [adapterPath], {
@@ -108,7 +131,7 @@ async function handshake(harness) {
   assert.equal(initialized.result._meta.steering.supported, true);
   assert.equal(initialized.result._meta.pilot.liveCanaryValidated, true);
   assert.equal(initialized.result._meta.pilot.fleetApproved, false);
-  assert.equal(initialized.result.agentInfo.version, "0.2.2");
+  assert.equal(initialized.result.agentInfo.version, "0.2.3");
 
   harness.send({
     jsonrpc: "2.0",

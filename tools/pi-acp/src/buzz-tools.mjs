@@ -130,9 +130,9 @@ async function run(
       if (!spawned) error.code = "PI_ACP_SAFE_UNSTARTED";
       finish(error);
     });
-    child.on("exit", (code, exitSignal) => {
-      // A wrapper may exit after backgrounding the real publisher. Always
-      // reap the whole broker tree before accepting the leader's result.
+    child.on("close", (code, exitSignal) => {
+      // Wait for stdout/stderr to close before accepting the receipt. A
+      // wrapper may also background a publisher, so reap its process group.
       terminate("SIGKILL");
       const result = {
         code,
@@ -166,23 +166,110 @@ function reservationKey(context, env) {
   return crypto.createHmac("sha256", secret).update(material).digest("hex");
 }
 
+function assertPowerLossDurability(env, platform = process.platform) {
+  if (
+    env.PI_ACP_REQUIRE_POWER_LOSS_DURABILITY === "1" &&
+    platform !== "linux"
+  ) {
+    throw new Error(
+      "strict power-loss receipt durability is supported only on Linux",
+    );
+  }
+}
+
+async function syncDirectory(directory, fileSystem = fs) {
+  const handle = await fileSystem.open(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function ensureDirectoryDurable(directory, fileSystem = fs) {
+  let cursor = path.resolve(directory);
+  const missing = [];
+  while (true) {
+    try {
+      const stat = await fileSystem.lstat(cursor);
+      if (!stat.isDirectory())
+        throw new Error("receipt path is not a directory");
+      cursor = await fileSystem.realpath(cursor);
+      break;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw error;
+      missing.unshift(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+  const anchorParent = path.dirname(cursor);
+  if (anchorParent !== cursor) await syncDirectory(anchorParent, fileSystem);
+  for (const component of missing) {
+    const child = path.join(cursor, component);
+    try {
+      await fileSystem.mkdir(child, { mode: 0o700 });
+    } catch (error) {
+      if (
+        error.code !== "EEXIST" ||
+        !(await fileSystem.lstat(child)).isDirectory()
+      )
+        throw error;
+    }
+    await syncDirectory(cursor, fileSystem);
+    cursor = child;
+  }
+  return cursor;
+}
+
+async function writeJsonAtomicDurable(
+  directory,
+  filename,
+  value,
+  fileSystem = fs,
+) {
+  const temporary = path.join(
+    directory,
+    `.${filename}.${process.pid}.${crypto.randomUUID()}.tmp`,
+  );
+  let renamed = false;
+  try {
+    const handle = await fileSystem.open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(value)}\n`);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fileSystem.rename(temporary, path.join(directory, filename));
+    renamed = true;
+    await syncDirectory(directory, fileSystem);
+  } catch (error) {
+    if (!renamed)
+      await fileSystem.rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
 async function reservePublication(context, content, env) {
   const contentSha256 = crypto
     .createHash("sha256")
     .update(content)
     .digest("hex");
-  const root =
+  assertPowerLossDurability(env);
+  const configuredRoot =
     env.PI_ACP_RECEIPT_DIR ||
     path.join(os.homedir(), ".buzz", "pi-acp-receipts");
-  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  const root = await ensureDirectoryDurable(configuredRoot);
   const directory = path.join(root, reservationKey(context, env));
   try {
     await fs.mkdir(directory, { mode: 0o700 });
-    await fs.writeFile(
-      path.join(directory, "request.json"),
-      `${JSON.stringify({ ...context, contentSha256 })}\n`,
-      { mode: 0o600 },
-    );
+    await syncDirectory(root);
+    await writeJsonAtomicDurable(directory, "request.json", {
+      ...context,
+      contentSha256,
+    });
     return { directory, existingReceipt: null };
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
@@ -211,11 +298,7 @@ async function reservePublication(context, content, env) {
 }
 
 async function storeReceipt(directory, receipt) {
-  const temporary = path.join(directory, `receipt.${process.pid}.tmp`);
-  await fs.writeFile(temporary, `${JSON.stringify(receipt)}\n`, {
-    mode: 0o600,
-  });
-  await fs.rename(temporary, path.join(directory, "receipt.json"));
+  await writeJsonAtomicDurable(directory, "receipt.json", receipt);
 }
 
 export function createBuzzTools({
@@ -346,4 +429,11 @@ export function createBuzzTools({
   return [buzzReply, kanbanTasks];
 }
 
-export const testOnly = { validateContext, reservationKey, run };
+export const testOnly = {
+  validateContext,
+  reservationKey,
+  run,
+  assertPowerLossDurability,
+  ensureDirectoryDurable,
+  writeJsonAtomicDurable,
+};
