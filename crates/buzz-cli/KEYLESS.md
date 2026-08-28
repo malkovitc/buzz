@@ -17,11 +17,11 @@ path), `messages send` / reply, `reactions add`, `users set-profile/set-presence
 presence, typing, observer telemetry, and turn liveness through the broker.
 Commands without a matching broker capability still need the local backend.
 
-The same provisioning variables now select the prototype keyless `buzz-acp`
+The same provisioning variables now select the keyless `buzz-acp`
 runtime. It derives its public identity through `storage.address`, polls
 configured channels through `channel.read`, uses broker-backed memory and live
 signals, and passes broker provisioning to the CLI used by the spawned agent. See
-[`../buzz-acp/README.md`](../buzz-acp/README.md#keyless-broker-mode-prototype)
+[`../buzz-acp/README.md`](../buzz-acp/README.md#keyless-broker-mode)
 for the runtime command and its deliberate housekeeping limits.
 
 ## Build

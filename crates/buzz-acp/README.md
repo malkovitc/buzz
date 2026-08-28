@@ -68,7 +68,7 @@ buzz-acp
 
 That's it. The harness spawns `goose acp`, connects to the relay, discovers channels, and starts listening. When someone @mentions the agent, goose receives the message and can reply using the Buzz CLI that the harness configures automatically.
 
-## Keyless broker mode (prototype)
+## Keyless broker mode
 
 Broker mode starts the runtime without an agent private key or direct relay
 connection. The harness derives the agent public key through `storage.address`,
