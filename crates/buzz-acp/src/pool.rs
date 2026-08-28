@@ -9099,6 +9099,40 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         json!([{ "tags": event_tags }])
     }
 
+    #[tokio::test]
+    async fn broker_resolver_uses_known_metadata_without_a_relay_fallback() {
+        let known_id = Uuid::new_v4();
+        let unknown_id = Uuid::new_v4();
+        let resolver = ChannelInfoResolver::without_fallback(
+            [
+                (
+                    known_id,
+                    crate::relay::ChannelInfo {
+                        name: "known".into(),
+                        channel_type: "stream".into(),
+                        description: None,
+                    },
+                ),
+                (
+                    unknown_id,
+                    crate::relay::ChannelInfo {
+                        name: "unknown".into(),
+                        channel_type: "unknown".into(),
+                        description: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert_eq!(
+            resolver.resolve(known_id).await.expect("known metadata").name,
+            "known"
+        );
+        assert!(resolver.resolve(unknown_id).await.is_none());
+    }
+
     /// A normal channel yields a non-DM (canvas allowed) and its name for the
     /// title suffix — and the second consumer reads it from cache, not the wire.
     #[tokio::test]
