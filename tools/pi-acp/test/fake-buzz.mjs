@@ -2,7 +2,10 @@
 
 process.stdin.resume();
 process.stdin.on("end", () => {
-  const delay = Number.parseInt(process.env.FAKE_BUZZ_DELAY_MS || "0", 10);
+  const delayVariable = process.argv.includes("tasks")
+    ? "FAKE_KANBAN_DELAY_MS"
+    : "FAKE_BUZZ_DELAY_MS";
+  const delay = Number.parseInt(process.env[delayVariable] || "0", 10);
   setTimeout(
     () => {
       process.stdout.write(

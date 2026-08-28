@@ -3,6 +3,7 @@
 import { attachJsonlReader, writeJsonl } from "../src/jsonl.mjs";
 
 let active = false;
+let terminalReplyCompleted = false;
 let timer;
 const mode = process.env.FAKE_PI_MODE || "complete";
 
@@ -62,18 +63,24 @@ attachJsonlReader(
   process.stdin,
   (command) => {
     switch (command.type) {
-      case "get_state":
-        respond(command, {
+      case "get_state": {
+        const state = {
           model: { provider: "fake", id: "test-model" },
           isStreaming: false,
           sessionId: "fake-session",
-        });
+        };
+        if (mode === "startup-steer") {
+          setTimeout(() => respond(command, state), 100);
+        } else {
+          respond(command, state);
+        }
         break;
+      }
       case "prompt":
         active = true;
         respond(command);
         if (mode === "complete") timer = setTimeout(() => complete(), 10);
-        else if (mode === "steer")
+        else if (mode === "steer" || mode === "startup-steer")
           timer = setTimeout(() => complete("unsteered"), 500);
         else if (mode === "pid")
           timer = setTimeout(() => complete(`pid:${process.pid}`), 10);
@@ -97,21 +104,80 @@ attachJsonlReader(
               }),
             5,
           );
-        } else if (mode === "broker" || mode === "broker-cancel") {
+        } else if (
+          mode === "broker" ||
+          mode === "broker-cancel" ||
+          mode === "terminal-publication"
+        ) {
           writeJsonl(process.stdout, {
             type: "broker_tool_request",
             id: "broker-test",
             toolName: "buzz_reply",
             args: { content: "brokered reply" },
           });
+          if (mode === "terminal-publication") {
+            writeJsonl(process.stdout, {
+              type: "broker_tool_request",
+              id: "broker-sibling",
+              toolName: "kanban_tasks",
+              args: { limit: 1 },
+            });
+          }
         }
         break;
       case "broker_tool_response":
-        if (mode === "broker" || mode === "broker-cancel")
+        if (mode === "broker" || mode === "broker-cancel") {
           setTimeout(
             () => complete(`broker:${command.success ? "ok" : command.error}`),
             5,
           );
+        } else if (
+          mode === "terminal-publication" &&
+          command.id === "broker-test"
+        ) {
+          terminalReplyCompleted = true;
+          writeJsonl(process.stdout, {
+            type: "tool_execution_end",
+            toolCallId: "reply-tool",
+            toolName: "buzz_reply",
+            result: command.result,
+            isError: !command.success,
+          });
+          writeJsonl(process.stdout, { type: "terminal_publication" });
+        } else if (
+          mode === "terminal-publication" &&
+          command.id === "broker-sibling" &&
+          terminalReplyCompleted
+        ) {
+          active = false;
+          writeJsonl(process.stdout, {
+            type: "message_update",
+            assistantMessageEvent: {
+              type: "text_delta",
+              contentIndex: 0,
+              delta: `sibling:${command.success ? "ok" : "aborted"}`,
+            },
+          });
+          writeJsonl(process.stdout, {
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              provider: "fake",
+              model: "test-model",
+              stopReason: "aborted",
+              usage: {
+                input: 10,
+                output: 2,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 12,
+                cost: { total: 0 },
+              },
+            },
+            toolResults: [],
+          });
+          writeJsonl(process.stdout, { type: "agent_settled" });
+        }
         break;
       case "steer":
         clearTimeout(timer);

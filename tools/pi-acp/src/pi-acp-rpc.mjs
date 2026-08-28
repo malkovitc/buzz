@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
+import packageMetadata from "../package.json" with { type: "json" };
 import { PiAcpAdapter } from "./adapter.mjs";
 
 if (process.argv.includes("--version") || process.argv.includes("-V")) {
-  process.stdout.write("pi-acp 0.2.1\n");
+  process.stdout.write(`pi-acp ${packageMetadata.version}\n`);
   process.exit(0);
 }
 if (process.platform === "win32") {

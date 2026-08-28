@@ -19,7 +19,8 @@ The internal pilot supports macOS and Linux. Windows is rejected fail-closed and
 - authoritative Buzz routing metadata supplied by `buzz-acp` under `_meta.buzz` when publication is allowed;
 - trusted parent-side publication broker: the Pi SDK subprocess never receives `BUZZ_PRIVATE_KEY`;
 - typed `buzz_reply` with non-empty validation, fixed routing, connected stdin, atomic reservation,
-  durable receipt replay, and fail-closed crash/network ambiguity handling;
+  durable receipt replay, fail-closed crash/network ambiguity handling, and terminal settlement after
+  a successful publication so provider continuation cannot hold the ACP turn open;
 - typed bounded `kanban_tasks` that cannot download the full board;
 - cumulative usage mapping, bounded tool output, and process-group cleanup.
 
@@ -42,7 +43,7 @@ From a reviewed exact Buzz commit:
 
 ```bash
 npm install --global ./tools/pi-acp
-pi-acp --version  # pi-acp 0.2.1 or newer
+pi-acp --version  # pi-acp 0.2.2 or newer
 ```
 
 The adapter uses Pi's existing provider authentication. Run Pi interactively once if the host has
