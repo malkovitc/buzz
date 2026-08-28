@@ -30,7 +30,7 @@ test("version output does not load the adapter dependency graph", async (t) => {
   fs.copyFileSync(adapterPath, isolatedEntrypoint);
   fs.writeFileSync(
     path.join(root, "package.json"),
-    JSON.stringify({ type: "module", version: "0.2.3" }),
+    JSON.stringify({ type: "module", version: "0.2.4" }),
   );
   const child = spawn(process.execPath, [isolatedEntrypoint, "--version"], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -41,7 +41,7 @@ test("version output does not load the adapter dependency graph", async (t) => {
   child.stderr.on("data", (chunk) => (stderr += chunk));
   const [code] = await once(child, "close");
   assert.equal(code, 0, stderr);
-  assert.equal(stdout, "pi-acp 0.2.3\n");
+  assert.equal(stdout, "pi-acp 0.2.4\n");
 });
 
 function startHarness(mode = "complete") {
@@ -131,7 +131,7 @@ async function handshake(harness) {
   assert.equal(initialized.result._meta.steering.supported, true);
   assert.equal(initialized.result._meta.pilot.liveCanaryValidated, true);
   assert.equal(initialized.result._meta.pilot.fleetApproved, false);
-  assert.equal(initialized.result.agentInfo.version, "0.2.3");
+  assert.equal(initialized.result.agentInfo.version, "0.2.4");
 
   harness.send({
     jsonrpc: "2.0",
