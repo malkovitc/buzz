@@ -1518,6 +1518,109 @@ fn validators_accept_and_reject_at_their_boundaries() {
     .is_err());
 }
 
+#[test]
+fn storage_put_bounds_the_complete_canonical_nip_ae_body() {
+    use buzz_core::engram::{Body, CORE_SLUG, NIP44_PLAINTEXT_MAX};
+
+    let body_len = |slug: &str, value: &str| {
+        if slug == CORE_SLUG {
+            Body::Core {
+                profile: value.into(),
+            }
+        } else {
+            Body::Memory {
+                slug: slug.into(),
+                value: Some(value.into()),
+            }
+        }
+        .to_json_bytes()
+        .len()
+    };
+    let put = |slug: &str, value: String| {
+        StoragePutArgs {
+            slug: slug.into(),
+            value,
+        }
+        .validated()
+    };
+
+    for slug in [CORE_SLUG, "mem/review-boundary"] {
+        let max_value_len = NIP44_PLAINTEXT_MAX - body_len(slug, "");
+        let at_limit = "x".repeat(max_value_len);
+        assert_eq!(body_len(slug, &at_limit), NIP44_PLAINTEXT_MAX);
+        put(slug, at_limit).expect("a canonical body exactly at the limit is valid");
+
+        let error = put(slug, "x".repeat(max_value_len + 1)).unwrap_err();
+        assert!(matches!(
+            error,
+            SdkError::ContentTooLarge {
+                max: NIP44_PLAINTEXT_MAX,
+                got
+            } if got == NIP44_PLAINTEXT_MAX + 1
+        ));
+    }
+
+    let slug = "mem/escaping";
+    let max_value_len = NIP44_PLAINTEXT_MAX - body_len(slug, "");
+    put(slug, "x".repeat(max_value_len)).expect("unescaped bytes fit exactly");
+    assert!(matches!(
+        put(slug, "\"".repeat(max_value_len)).unwrap_err(),
+        SdkError::ContentTooLarge { .. }
+    ));
+}
+
+#[test]
+fn observer_emit_bounds_the_complete_serialized_batch() {
+    let frame = |payload: String| ObserverFrame {
+        kind: "acp_write".into(),
+        payload,
+    };
+    let encoded_len = |payload: &str| {
+        serde_json::to_vec(&ObserverEmitArgs {
+            frames: vec![frame(payload.into())],
+        })
+        .unwrap()
+        .len()
+    };
+
+    let max_payload_len = actions::MAX_OBSERVER_BATCH_BYTES - encoded_len("");
+    assert!(max_payload_len <= actions::MAX_OBSERVER_FRAME_BYTES);
+    ObserverEmitArgs {
+        frames: vec![frame("x".repeat(max_payload_len))],
+    }
+    .validated()
+    .expect("a serialized batch exactly at the limit is valid");
+    assert!(matches!(
+        ObserverEmitArgs {
+            frames: vec![frame("\"".repeat(max_payload_len))]
+        }
+        .validated()
+        .unwrap_err(),
+        SdkError::ContentTooLarge { .. }
+    ));
+    assert!(matches!(
+        ObserverEmitArgs {
+            frames: vec![frame("x".repeat(max_payload_len + 1))]
+        }
+        .validated()
+        .unwrap_err(),
+        SdkError::ContentTooLarge { .. }
+    ));
+
+    let individually_valid = frame("x".repeat(300));
+    individually_valid
+        .validated()
+        .expect("one frame is independently valid");
+    assert!(matches!(
+        ObserverEmitArgs {
+            frames: vec![individually_valid; actions::MAX_OBSERVER_FRAMES]
+        }
+        .validated()
+        .unwrap_err(),
+        SdkError::ContentTooLarge { .. }
+    ));
+}
+
 /// Validation must be **inseparable from normalization**: there must be no way
 /// to learn that a request is valid while still holding the un-normalized value.
 ///
@@ -2432,6 +2535,28 @@ fn a_read_page_is_bounded_by_the_limit_its_own_request_asked_for() {
     )
     .validate_for(&unlimited)
     .is_err());
+}
+
+#[test]
+fn an_observer_receipt_cannot_accept_more_frames_than_were_sent() {
+    let request = prepared(ActionArgs::ObserverEmit(ObserverEmitArgs {
+        frames: vec![ObserverFrame {
+            kind: "acp_write".into(),
+            payload: "{}".into(),
+        }],
+    }));
+    let response = |accepted| {
+        BrokerResponse::new(
+            request.request_id(),
+            BrokerResult::succeeded(ActionOutcome::ObserverEmit(ObserverReceipt { accepted })),
+        )
+        .validate_for(&request)
+    };
+
+    response(0).expect("a host may accept none of a best-effort batch");
+    response(1).expect("the exact submitted count is valid");
+    let error = response(2).expect_err("a host cannot accept frames it was not sent");
+    assert!(error.to_string().contains("from a batch of 1"));
 }
 
 // ── Results ─────────────────────────────────────────────────────────────────

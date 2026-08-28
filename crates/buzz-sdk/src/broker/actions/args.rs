@@ -8,12 +8,15 @@ use serde::{Deserialize, Serialize};
 use super::{
     absent_or_valued, absent_or_valued_hex64, channel, channel_id, content, cursor, event_id,
     hex64_field, is_false, limit, mentions, optional, required, respond_to, validate_slug, Action,
-    PubkeyHex, DEFAULT_PAGE_LIMIT, MAX_ABOUT_CHARS, MAX_CONTENT_BYTES, MAX_EMOJI_CHARS,
-    MAX_NAME_CHARS, MAX_OBSERVER_FRAMES, MAX_OBSERVER_FRAME_BYTES, MAX_PROMPT_CHARS,
+    PubkeyHex, DEFAULT_PAGE_LIMIT, MAX_ABOUT_CHARS, MAX_EMOJI_CHARS, MAX_NAME_CHARS,
+    MAX_OBSERVER_BATCH_BYTES, MAX_OBSERVER_FRAMES, MAX_OBSERVER_FRAME_BYTES, MAX_PROMPT_CHARS,
     MAX_SCALAR_CHARS,
 };
 use crate::SdkError;
-use buzz_core::presence::PresenceStatus;
+use buzz_core::{
+    engram::{Body, CORE_SLUG, NIP44_PLAINTEXT_MAX},
+    presence::PresenceStatus,
+};
 
 /// Arguments for `channel.read` — the one read action.
 ///
@@ -333,18 +336,29 @@ impl StoragePutArgs {
     /// # Errors
     ///
     /// Returns [`SdkError::InvalidInput`] when the slug fails the NIP-AE grammar
-    /// or the value is empty, and [`SdkError::ContentTooLarge`] past
-    /// [`super::MAX_CONTENT_BYTES`].
+    /// or the value is empty, and [`SdkError::ContentTooLarge`] when the
+    /// complete canonical NIP-AE body exceeds its plaintext limit.
     pub fn validated(&self) -> Result<Self, SdkError> {
         let slug = required(&self.slug, "slug", 255)?;
         validate_slug(&slug).map_err(|e| SdkError::InvalidInput(e.to_string()))?;
         if self.value.trim().is_empty() {
             return Err(SdkError::InvalidInput("value must not be empty".into()));
         }
-        if self.value.len() > MAX_CONTENT_BYTES {
+        let body = if slug == CORE_SLUG {
+            Body::Core {
+                profile: self.value.clone(),
+            }
+        } else {
+            Body::Memory {
+                slug: slug.clone(),
+                value: Some(self.value.clone()),
+            }
+        };
+        let encoded_len = body.to_json_bytes().len();
+        if encoded_len > NIP44_PLAINTEXT_MAX {
             return Err(SdkError::ContentTooLarge {
-                max: MAX_CONTENT_BYTES,
-                got: self.value.len(),
+                max: NIP44_PLAINTEXT_MAX,
+                got: encoded_len,
             });
         }
         Ok(Self {
@@ -473,8 +487,9 @@ impl ObserverEmitArgs {
     /// # Errors
     ///
     /// Returns [`SdkError::InvalidInput`] for an empty batch or one past
-    /// [`super::MAX_OBSERVER_FRAMES`], and propagates each frame's own
-    /// validation error.
+    /// [`super::MAX_OBSERVER_FRAMES`], propagates each frame's own validation
+    /// error, and returns [`SdkError::ContentTooLarge`] when the complete
+    /// serialized argument exceeds [`super::MAX_OBSERVER_BATCH_BYTES`].
     pub fn validated(&self) -> Result<Self, SdkError> {
         if self.frames.is_empty() {
             return Err(SdkError::InvalidInput(
@@ -487,13 +502,25 @@ impl ObserverEmitArgs {
                 self.frames.len()
             )));
         }
-        Ok(Self {
+        let validated = Self {
             frames: self
                 .frames
                 .iter()
                 .map(ObserverFrame::validated)
                 .collect::<Result<_, _>>()?,
-        })
+        };
+        let encoded_len = serde_json::to_vec(&validated)
+            .map_err(|error| {
+                SdkError::InvalidInput(format!("observer batch is not serializable: {error}"))
+            })?
+            .len();
+        if encoded_len > MAX_OBSERVER_BATCH_BYTES {
+            return Err(SdkError::ContentTooLarge {
+                max: MAX_OBSERVER_BATCH_BYTES,
+                got: encoded_len,
+            });
+        }
+        Ok(validated)
     }
 }
 

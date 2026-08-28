@@ -65,12 +65,19 @@ pub const MAX_CURSOR_LEN: usize = 256;
 /// re-batches and paces publication. This bounds one call, not the stream.
 pub const MAX_OBSERVER_FRAMES: usize = 256;
 
+/// Maximum serialized bytes across one complete `observer.emit` argument.
+///
+/// A host must be able to re-batch accepted frames into observer plaintexts,
+/// whose canonical NIP-44 helper caps plaintext at this same size. Measuring
+/// the serialized argument also accounts for JSON escaping and frame metadata.
+pub const MAX_OBSERVER_BATCH_BYTES: usize = buzz_core::observer::OBSERVER_MAX_PLAINTEXT_LEN;
+
 /// Maximum bytes of one observer frame's opaque payload.
 ///
-/// The payload is passed through and encrypted host-side without being parsed,
-/// so it is bounded but not interpreted. Matches the runtime's per-frame
-/// plaintext budget.
-pub const MAX_OBSERVER_FRAME_BYTES: usize = 64 * 1024;
+/// The payload is passed through and encrypted host-side without being parsed.
+/// The complete serialized batch is subject to the stricter
+/// [`MAX_OBSERVER_BATCH_BYTES`] bound, including frame metadata and escaping.
+pub const MAX_OBSERVER_FRAME_BYTES: usize = buzz_core::observer::OBSERVER_MAX_PLAINTEXT_LEN;
 
 /// Inbound author gate modes a requester may ask for.
 ///

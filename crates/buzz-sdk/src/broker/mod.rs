@@ -763,6 +763,18 @@ impl BrokerResponse {
                     )));
                 }
             }
+            if let (
+                ActionArgs::ObserverEmit(args),
+                ActionOutcome::ObserverEmit(ObserverReceipt { accepted }),
+            ) = (&request.request.action, outcome)
+            {
+                if *accepted as usize > args.frames.len() {
+                    return Err(SdkError::InvalidInput(format!(
+                        "observer receipt accepted {accepted} frames from a batch of {}",
+                        args.frames.len()
+                    )));
+                }
+            }
         }
         Ok(())
     }
