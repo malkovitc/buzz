@@ -18,15 +18,18 @@ The internal pilot supports macOS and Linux. Windows is rejected fail-closed and
 - per-inbound-event turn, tool, and processed-token budgets with checkpoint steering and abort;
 - authoritative Buzz routing metadata supplied by `buzz-acp` under `_meta.buzz` when publication is allowed;
 - trusted parent-side publication broker: the Pi SDK subprocess never receives `BUZZ_PRIVATE_KEY`;
-- typed `buzz_reply` with non-empty validation, fixed routing, connected stdin, atomic reservation,
-  durable receipt replay, fail-closed crash/network ambiguity handling, and terminal settlement after
-  a successful publication so provider continuation cannot hold the ACP turn open;
+- typed `buzz_reply` with non-empty validation, fixed routing, connected stdin, atomically written
+  and fsynced reservation/receipt records, fail-closed crash/network ambiguity handling, and terminal
+  settlement after a successful publication so provider continuation cannot hold the ACP turn open;
 - typed bounded `kanban_tasks` that cannot download the full board;
 - cumulative usage mapping, bounded tool output, and process-group cleanup.
 
 `buzz_reply` intentionally reserves before network access. If the process crashes or the network
 result is ambiguous, it refuses to retry automatically. This preserves at-most-once publication at
-the cost of requiring operator reconciliation for an uncertain delivery.
+the cost of requiring operator reconciliation for an uncertain delivery. Linux deployments that
+automatically recover after host power loss must set `PI_ACP_REQUIRE_POWER_LOSS_DURABILITY=1`;
+the adapter fails closed before publication when that strict mode is requested on another OS.
+macOS retains process/network-crash protection but does not claim physical power-loss durability.
 
 ## Test
 
@@ -43,7 +46,7 @@ From a reviewed exact Buzz commit:
 
 ```bash
 npm install --global ./tools/pi-acp
-pi-acp --version  # pi-acp 0.2.2 or newer
+pi-acp --version  # pi-acp 0.2.3 or newer
 ```
 
 The adapter uses Pi's existing provider authentication. Run Pi interactively once if the host has
@@ -54,6 +57,7 @@ Raise budgets only through explicit environment values:
 PI_ACP_MAX_TURNS
 PI_ACP_MAX_TOOLS
 PI_ACP_MAX_PROCESSED_TOKENS
+PI_ACP_REQUIRE_POWER_LOSS_DURABILITY  # Linux-only strict receipt mode
 ```
 
 The process accepts ACP JSON-RPC/NDJSON on stdin and writes only ACP frames to stdout. Diagnostics

@@ -14,11 +14,11 @@ pub(super) const PI_RUNTIME: KnownAcpRuntime = KnownAcpRuntime {
     underlying_cli: Some("pi"),
     cli_install_commands: &["npm install -g @earendil-works/pi-coding-agent@0.84.2"],
     cli_install_commands_windows: &[],
-    adapter_install_commands: &["npm install -g https://github.com/malkovitc/buzz/releases/download/pi-acp-v0.2.2/buzz-pi-acp-0.2.2.tgz"],
+    adapter_install_commands: &["npm install -g https://github.com/malkovitc/buzz/releases/download/pi-acp-v0.2.3/buzz-pi-acp-0.2.3.tgz"],
     cli_install_instructions_url: "https://github.com/badlogic/pi-mono",
-    adapter_install_instructions_url: "https://github.com/malkovitc/buzz/tree/pi-acp-v0.2.2/tools/pi-acp",
+    adapter_install_instructions_url: "https://github.com/malkovitc/buzz/tree/pi-acp-v0.2.3/tools/pi-acp",
     cli_install_hint: "Install Pi 0.84.2; the pi-acp pilot adapter is packaged separately.",
-    adapter_install_hint: "Install the reviewed pi-acp 0.2.2 pilot package before selecting this runtime.",
+    adapter_install_hint: "Install the reviewed pi-acp 0.2.3 pilot package before selecting this runtime.",
     skill_dir: None,
     supports_acp_model_switching: false,
     model_env_var: None,
@@ -37,8 +37,8 @@ pub(super) const PI_RUNTIME: KnownAcpRuntime = KnownAcpRuntime {
     auth_probe_args: None,
 };
 
-/// Older Pi pilot adapters can hang after a successful steered publication.
-const MIN_PI_ACP_VERSION: (u64, u64, u64) = (0, 2, 2);
+/// Older Pi pilot adapters lack durable receipt and output-drain guarantees.
+const MIN_PI_ACP_VERSION: (u64, u64, u64) = (0, 2, 3);
 
 pub(super) fn pi_adapter_availability(path: &Path) -> AcpAvailabilityStatus {
     match probe_codex_acp_version(path) {
