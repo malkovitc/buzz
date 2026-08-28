@@ -46,7 +46,7 @@ From a reviewed exact Buzz commit:
 
 ```bash
 npm install --global ./tools/pi-acp
-pi-acp --version  # pi-acp 0.2.3 or newer
+pi-acp --version  # pi-acp 0.2.4 or newer
 ```
 
 The adapter uses Pi's existing provider authentication. Run Pi interactively once if the host has

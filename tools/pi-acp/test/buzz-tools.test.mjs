@@ -13,7 +13,7 @@ const context = {
 };
 const eventId = "b".repeat(64);
 
-async function fixture(t, runCommand) {
+async function fixture(t, runCommand, options = {}) {
   const receiptDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-tools-"));
   t.after(() => fs.rm(receiptDir, { recursive: true, force: true }));
   const env = {
@@ -22,8 +22,15 @@ async function fixture(t, runCommand) {
     PI_ACP_RECEIPT_DIR: receiptDir,
     PI_ACP_BUZZ_COMMAND: "/test/buzz",
     PI_ACP_KANBAN_COMMAND: "/test/kanban-ai",
+    ...(options.env ?? {}),
   };
-  const tools = createBuzzTools({ getContext: () => context, env, runCommand });
+  const tools = createBuzzTools({
+    getContext: () => context,
+    env,
+    runCommand,
+    ...(options.fileSystem ? { fileSystem: options.fileSystem } : {}),
+    ...(options.platform ? { platform: options.platform } : {}),
+  });
   return {
     env,
     receiptDir,
@@ -107,6 +114,72 @@ test("buzz_reply fails closed after an ambiguous reserved publication", async (t
   assert.equal(calls, 1);
 });
 
+test("strict replay re-barriers an uncertain receipt without republishing", async (t) => {
+  let failReceiptDirectorySync = false;
+  const rebarriered = [];
+  const fileSystem = {
+    lstat: (...args) => fs.lstat(...args),
+    stat: (...args) => fs.stat(...args),
+    realpath: (...args) => fs.realpath(...args),
+    mkdir: (...args) => fs.mkdir(...args),
+    readFile: (...args) => fs.readFile(...args),
+    rename: async (source, destination) => {
+      await fs.rename(source, destination);
+      if (path.basename(destination) === "receipt.json")
+        failReceiptDirectorySync = true;
+    },
+    rm: (...args) => fs.rm(...args),
+    open: async (target, flags, mode) => {
+      const handle = await fs.open(target, flags, mode);
+      return {
+        writeFile: (...args) => handle.writeFile(...args),
+        sync: async () => {
+          if (
+            failReceiptDirectorySync &&
+            flags === "r" &&
+            path.basename(target) !== "request.json" &&
+            path.basename(target) !== "receipt.json"
+          ) {
+            failReceiptDirectorySync = false;
+            throw new Error("receipt directory flush failed");
+          }
+          await handle.sync();
+          if (flags === "r" && path.basename(target).endsWith(".json"))
+            rebarriered.push(path.basename(target));
+        },
+        close: () => handle.close(),
+      };
+    },
+  };
+  let publications = 0;
+  const f = await fixture(
+    t,
+    async () => {
+      publications += 1;
+      return {
+        code: 0,
+        stdout: JSON.stringify({ event_id: eventId, accepted: true }),
+        stderr: "",
+      };
+    },
+    {
+      fileSystem,
+      platform: "linux",
+      env: { PI_ACP_REQUIRE_POWER_LOSS_DURABILITY: "1" },
+    },
+  );
+  await assert.rejects(
+    f.reply.execute("call-1", { content: "durable answer" }),
+    /receipt directory flush failed/,
+  );
+  const replay = await f.reply.execute("call-2", {
+    content: "durable answer",
+  });
+  assert.equal(publications, 1, "reconciliation must not publish again");
+  assert.equal(replay.details.replay, true);
+  assert.deepEqual(rebarriered, ["request.json", "receipt.json"]);
+});
+
 test("buzz_reply rejects unbound reply targets", async () => {
   const invalid = {
     ...context,
@@ -141,6 +214,14 @@ test("missing publisher executables release the unstarted reservation", async (t
     (error) => error.code === "PI_ACP_SAFE_UNSTARTED",
   );
   assert.deepEqual(await fs.readdir(f.receiptDir), []);
+});
+
+test("broker commands receive the authoritative adapter parent pid", async () => {
+  const result = await testOnly.run(process.execPath, [
+    "-e",
+    "process.stdout.write(process.env.PI_ACP_BROKER_PARENT_PID || '')",
+  ]);
+  assert.equal(result.stdout, String(process.pid));
 });
 
 test("pre-aborted command signals never spawn a publication process", async (t) => {
@@ -334,6 +415,37 @@ test("failed durability barriers retain a fail-closed record state", async (t) =
     /directory flush failed/,
   );
   assert.deepEqual(await fs.readdir(dir), ["request.json"]);
+});
+
+test("visible records can be re-barriered before durable replay", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-acp-rebarrier-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "receipt.json");
+  await fs.writeFile(file, JSON.stringify({ event_id: eventId }), {
+    mode: 0o600,
+  });
+  const operations = [];
+  const fileSystem = {
+    open: async (target, flags) => {
+      const kind = target === file ? "file" : "directory";
+      operations.push(`open:${kind}`);
+      const handle = await fs.open(target, flags);
+      return {
+        sync: async () => {
+          operations.push(`sync:${kind}`);
+          await handle.sync();
+        },
+        close: () => handle.close(),
+      };
+    },
+  };
+  await testOnly.syncRecordDurable(file, fileSystem);
+  assert.deepEqual(operations, [
+    "open:file",
+    "sync:file",
+    "open:directory",
+    "sync:directory",
+  ]);
 });
 
 test("pre-rename durability failure removes incomplete temporary records", async (t) => {

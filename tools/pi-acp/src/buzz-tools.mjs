@@ -98,7 +98,7 @@ async function run(
       return;
     }
     child = spawn(command, args, {
-      env,
+      env: { ...env, PI_ACP_BROKER_PARENT_PID: String(process.pid) },
       stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
@@ -186,6 +186,16 @@ async function syncDirectory(directory, fileSystem = fs) {
   }
 }
 
+async function syncRecordDurable(file, fileSystem = fs) {
+  const handle = await fileSystem.open(file, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await syncDirectory(path.dirname(file), fileSystem);
+}
+
 async function ensureDirectoryDurable(directory, fileSystem = fs) {
   let cursor = path.resolve(directory);
   const missing = [];
@@ -252,30 +262,34 @@ async function writeJsonAtomicDurable(
   }
 }
 
-async function reservePublication(context, content, env) {
+async function reservePublication(context, content, env, fileSystem, platform) {
   const contentSha256 = crypto
     .createHash("sha256")
     .update(content)
     .digest("hex");
-  assertPowerLossDurability(env);
+  assertPowerLossDurability(env, platform);
   const configuredRoot =
     env.PI_ACP_RECEIPT_DIR ||
     path.join(os.homedir(), ".buzz", "pi-acp-receipts");
-  const root = await ensureDirectoryDurable(configuredRoot);
+  const root = await ensureDirectoryDurable(configuredRoot, fileSystem);
   const directory = path.join(root, reservationKey(context, env));
   try {
-    await fs.mkdir(directory, { mode: 0o700 });
-    await syncDirectory(root);
-    await writeJsonAtomicDurable(directory, "request.json", {
-      ...context,
-      contentSha256,
-    });
+    await fileSystem.mkdir(directory, { mode: 0o700 });
+    await syncDirectory(root, fileSystem);
+    await writeJsonAtomicDurable(
+      directory,
+      "request.json",
+      { ...context, contentSha256 },
+      fileSystem,
+    );
     return { directory, existingReceipt: null };
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
     try {
+      const requestFile = path.join(directory, "request.json");
+      const receiptFile = path.join(directory, "receipt.json");
       const request = JSON.parse(
-        await fs.readFile(path.join(directory, "request.json"), "utf8"),
+        await fileSystem.readFile(requestFile, "utf8"),
       );
       if (request.contentSha256 !== contentSha256) {
         throw new Error(
@@ -283,8 +297,12 @@ async function reservePublication(context, content, env) {
         );
       }
       const receipt = JSON.parse(
-        await fs.readFile(path.join(directory, "receipt.json"), "utf8"),
+        await fileSystem.readFile(receiptFile, "utf8"),
       );
+      if (env.PI_ACP_REQUIRE_POWER_LOSS_DURABILITY === "1") {
+        await syncRecordDurable(requestFile, fileSystem);
+        await syncRecordDurable(receiptFile, fileSystem);
+      }
       return { directory, existingReceipt: receipt };
     } catch (readError) {
       if (readError.code === "ENOENT") {
@@ -297,14 +315,16 @@ async function reservePublication(context, content, env) {
   }
 }
 
-async function storeReceipt(directory, receipt) {
-  await writeJsonAtomicDurable(directory, "receipt.json", receipt);
+async function storeReceipt(directory, receipt, fileSystem) {
+  await writeJsonAtomicDurable(directory, "receipt.json", receipt, fileSystem);
 }
 
 export function createBuzzTools({
   getContext,
   env = process.env,
   runCommand = run,
+  fileSystem = fs,
+  platform = process.platform,
 } = {}) {
   const buzzReply = defineTool({
     name: "buzz_reply",
@@ -325,7 +345,13 @@ export function createBuzzTools({
         );
       }
       const context = validateContext(getContext?.());
-      const reservation = await reservePublication(context, content, env);
+      const reservation = await reservePublication(
+        context,
+        content,
+        env,
+        fileSystem,
+        platform,
+      );
       if (reservation.existingReceipt) {
         return toolText(JSON.stringify(reservation.existingReceipt), {
           receipt: reservation.existingReceipt,
@@ -353,7 +379,10 @@ export function createBuzzTools({
         );
       } catch (error) {
         if (error.code === "PI_ACP_SAFE_UNSTARTED") {
-          await fs.rm(reservation.directory, { recursive: true, force: true });
+          await fileSystem.rm(reservation.directory, {
+            recursive: true,
+            force: true,
+          });
         }
         throw error;
       }
@@ -385,7 +414,7 @@ export function createBuzzTools({
         reply_to: context.replyTo,
         triggering_event_ids: context.triggeringEventIds,
       };
-      await storeReceipt(reservation.directory, receipt);
+      await storeReceipt(reservation.directory, receipt, fileSystem);
       return toolText(JSON.stringify(receipt), { receipt, replay: false });
     },
   });
@@ -435,5 +464,6 @@ export const testOnly = {
   run,
   assertPowerLossDurability,
   ensureDirectoryDurable,
+  syncRecordDurable,
   writeJsonAtomicDurable,
 };
