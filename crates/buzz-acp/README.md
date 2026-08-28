@@ -80,6 +80,7 @@ the same host.
 export BUZZ_AGENT_MODE=broker
 export BUZZ_BROKER_URL=http://127.0.0.1:8787
 export BUZZ_BROKER_CREDENTIAL=dev-token
+export BUZZ_BROKER_RELAY_URL=wss://relay.example
 export BUZZ_ACP_CHANNELS=5df7dfa8-e919-43df-8efd-f1dcb8af7071
 export BUZZ_ACP_AGENT_OWNER=a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971
 unset BUZZ_PRIVATE_KEY BUZZ_RELAY_URL BUZZ_AUTH_TAG
@@ -90,6 +91,8 @@ buzz-acp
 Broker mode requires explicit channel UUIDs and `respond-to=owner-only` because
 the contract does not expose channel discovery or metadata. Core-memory reads,
 presence, typing, observer telemetry, and turn liveness use broker actions.
+`BUZZ_BROKER_RELAY_URL` identifies the relay behind the broker for desktop
+observer/runtime pairing only; the harness and its children never connect to it.
 Relay-only conversation enrichment, setup nudges, sibling-profile lookup, and
 reaction-based turn status remain disabled. The `buzz` CLI operations available
 to the spawned agent are documented in
@@ -149,6 +152,7 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_RELAY_URL` | no | `ws://localhost:3000` | Relay WebSocket URL. |
 | `BUZZ_BROKER_URL` | broker only | — | Broker base URL; actions are posted to `/v1/action`. |
 | `BUZZ_BROKER_CREDENTIAL` | broker only | — | Bearer credential issued by the broker host. |
+| `BUZZ_BROKER_RELAY_URL` | broker only | — | Relay identity behind the broker, used only for observer/runtime pairing; never connected to directly. |
 | `BUZZ_BROKER_POLL_INTERVAL_MS` | no | `1000` | Broker `channel.read` polling interval; minimum `100`. |
 | `BUZZ_ACP_CHANNELS` | broker only | — | Comma-separated channel UUIDs to poll. |
 | `BUZZ_ACP_AGENT_OWNER` | broker only | — | Owner pubkey accepted by the broker-mode author gate. |

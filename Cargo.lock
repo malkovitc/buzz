@@ -976,6 +976,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "buzz-sdk",
+ "nostr 0.44.7",
  "reqwest 0.13.4",
  "serde_json",
  "tokio",

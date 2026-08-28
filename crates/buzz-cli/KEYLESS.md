@@ -20,7 +20,9 @@ Commands without a matching broker capability still need the local backend.
 The same provisioning variables now select the keyless `buzz-acp`
 runtime. It derives its public identity through `storage.address`, polls
 configured channels through `channel.read`, uses broker-backed memory and live
-signals, and passes broker provisioning to the CLI used by the spawned agent. See
+signals, and passes broker provisioning to the CLI used by the spawned agent.
+The ACP harness additionally requires `BUZZ_BROKER_RELAY_URL` as observer/runtime
+identity metadata, but never connects to that relay URL directly. See
 [`../buzz-acp/README.md`](../buzz-acp/README.md#keyless-broker-mode)
 for the runtime command and its deliberate housekeeping limits.
 

@@ -99,6 +99,9 @@ pub enum AgentMode {
 pub struct BrokerConfig {
     pub base_url: String,
     pub credential: String,
+    /// Canonical relay identity for observer/runtime pairing. The harness does
+    /// not connect to this URL in broker mode.
+    pub relay_url: String,
     pub poll_interval: std::time::Duration,
 }
 
@@ -107,6 +110,7 @@ impl std::fmt::Debug for BrokerConfig {
         f.debug_struct("BrokerConfig")
             .field("base_url", &self.base_url)
             .field("credential", &"<redacted>")
+            .field("relay_url", &self.relay_url)
             .field("poll_interval", &self.poll_interval)
             .finish()
     }
@@ -317,6 +321,11 @@ pub struct CliArgs {
 
     #[arg(long, env = "BUZZ_BROKER_CREDENTIAL", hide_env_values = true)]
     pub broker_credential: Option<String>,
+
+    /// Relay identity behind the broker, used only for observer/runtime
+    /// pairing. Broker mode never opens a connection to this URL.
+    #[arg(long, env = "BUZZ_BROKER_RELAY_URL")]
+    pub broker_relay_url: Option<String>,
 
     /// Delay between broker polling sweeps in keyless mode.
     #[arg(long, env = "BUZZ_BROKER_POLL_INTERVAL_MS", default_value_t = 1000)]
@@ -850,10 +859,11 @@ pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'sta
 ///
 /// Codex sandboxes MCP subprocesses (including `buzz-cli`) behind a Seatbelt sandbox
 /// that blocks all outbound network by default. Without this env var, `buzz-cli`
-/// requests are blocked before they can reach the relay WebSocket.
+/// requests are blocked before they can reach the selected runtime endpoint (the
+/// relay locally, or the broker in keyless mode).
 ///
 /// Returns a `CODEX_CONFIG` object with network access and autonomous-agent plugin defaults for
-/// Codex agents, or `None` for non-Codex agents or when the relay URL cannot be parsed.
+/// Codex agents, or `None` for non-Codex agents or when the endpoint URL cannot be parsed.
 ///
 /// The env var is forwarded by the `@agentclientprotocol/codex-acp` adapter (1.x) as a
 /// session-level config override (via `CODEX_CONFIG` → `thread/start config`), which is
@@ -861,11 +871,11 @@ pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'sta
 /// That sets `NetworkSandboxPolicy::Enabled`, causing the Seatbelt policy to include
 /// `(allow network-outbound)` — full outbound TCP/TLS at the OS level.
 ///
-/// URL validation is preserved as a guard: injection is skipped when the relay URL cannot
+/// URL validation is preserved as a guard: injection is skipped when the endpoint URL cannot
 /// be parsed, avoiding accidental sandbox widening for malformed configs.
 ///
 /// Handles `ws://`, `wss://`, `http://`, and `https://` schemes.
-pub fn codex_network_env(agent_command: &str, relay_url: &str) -> Option<(String, String)> {
+pub fn codex_network_env(agent_command: &str, endpoint_url: &str) -> Option<(String, String)> {
     match normalize_agent_command_identity(agent_command).as_str() {
         "codex" | "codex-acp" => {}
         _ => return None,
@@ -873,19 +883,19 @@ pub fn codex_network_env(agent_command: &str, relay_url: &str) -> Option<(String
 
     // Validate the relay URL before injecting broader network access. On parse failure,
     // skip injection rather than panicking or widening the sandbox unconditionally.
-    let host = match Url::parse(relay_url) {
+    let host = match Url::parse(endpoint_url) {
         Ok(u) => match u.host_str() {
             Some(h) => h.to_owned(),
             None => {
                 tracing::warn!(
-                    relay_url,
-                    "codex network config: no host in relay URL — skipping injection"
+                    endpoint_url,
+                    "codex network config: no host in endpoint URL — skipping injection"
                 );
                 return None;
             }
         },
         Err(e) => {
-            tracing::warn!(relay_url, error = %e, "codex network config: failed to parse relay URL — skipping injection");
+            tracing::warn!(endpoint_url, error = %e, "codex network config: failed to parse endpoint URL — skipping injection");
             return None;
         }
     };
@@ -993,6 +1003,17 @@ impl Config {
                             .into(),
                     )
                 })?;
+                let relay_url = args.broker_relay_url.take().ok_or_else(|| {
+                    ConfigError::ConfigFile(
+                        "BUZZ_BROKER_RELAY_URL / --broker-relay-url is required in broker mode"
+                            .into(),
+                    )
+                })?;
+                let relay_url = buzz_core::relay::normalize_relay_url(&relay_url).map_err(|error| {
+                    ConfigError::ConfigFile(format!(
+                        "invalid broker relay identity in BUZZ_BROKER_RELAY_URL / --broker-relay-url: {error}"
+                    ))
+                })?;
                 if args.broker_poll_interval_ms < 100 {
                     return Err(ConfigError::ConfigFile(
                         "broker poll interval must be at least 100ms".into(),
@@ -1033,6 +1054,7 @@ impl Config {
                 Some(BrokerConfig {
                     base_url,
                     credential,
+                    relay_url,
                     poll_interval: std::time::Duration::from_millis(args.broker_poll_interval_ms),
                 })
             }
@@ -1255,6 +1277,9 @@ impl Config {
 
         // Spawned desktop agents now carry a complete instance snapshot. Team
         // instructions arrive independently so they can be layered at runtime.
+        let relay_url = broker
+            .as_ref()
+            .map_or_else(|| args.relay_url.clone(), |broker| broker.relay_url.clone());
         let mut persona_env_vars = Vec::new();
         match broker.as_ref() {
             Some(broker) => persona_env_vars.extend([
@@ -1263,6 +1288,7 @@ impl Config {
                 ("BUZZ_BROKER_CREDENTIAL".into(), broker.credential.clone()),
                 // Explicit tombstones keep inherited local credentials and
                 // routing out of the spawned agent process.
+                ("BUZZ_BROKER_RELAY_URL".into(), String::new()),
                 ("BUZZ_RELAY_URL".into(), String::new()),
                 ("BUZZ_PRIVATE_KEY".into(), String::new()),
                 ("BUZZ_AUTH_TAG".into(), String::new()),
@@ -1271,7 +1297,8 @@ impl Config {
                 ("BUZZ_AGENT_MODE".into(), "local".into()),
                 ("BUZZ_BROKER_URL".into(), String::new()),
                 ("BUZZ_BROKER_CREDENTIAL".into(), String::new()),
-                ("BUZZ_RELAY_URL".into(), args.relay_url.clone()),
+                ("BUZZ_BROKER_RELAY_URL".into(), String::new()),
+                ("BUZZ_RELAY_URL".into(), relay_url.clone()),
                 ("BUZZ_PRIVATE_KEY".into(), keys.secret_key().to_secret_hex()),
             ]),
         }
@@ -1280,8 +1307,11 @@ impl Config {
         // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
         // for non-Codex agents or unparseable relay URLs.
+        let network_url = broker
+            .as_ref()
+            .map_or(relay_url.as_str(), |broker| broker.base_url.as_str());
         let has_generated_codex_config =
-            if let Some(network_env) = codex_network_env(&agent_command, &args.relay_url) {
+            if let Some(network_env) = codex_network_env(&agent_command, network_url) {
                 persona_env_vars.push(network_env);
                 true
             } else {
@@ -1308,7 +1338,7 @@ impl Config {
             keys,
             agent_mode: args.agent_mode,
             broker,
-            relay_url: args.relay_url,
+            relay_url,
             agent_command,
             agent_args,
             mcp_command: args.mcp_command,
@@ -1372,8 +1402,8 @@ impl Config {
                 self.keys.public_key().to_hex()
             ),
             (AgentMode::Broker, Some(broker)) => format!(
-                "mode=broker broker={} pubkey=(derived-at-connect)",
-                broker.base_url
+                "mode=broker broker={} relay_identity={} pubkey=(derived-at-connect)",
+                broker.base_url, broker.relay_url
             ),
             (AgentMode::Broker, None) => {
                 "mode=broker broker=(missing) pubkey=(derived-at-connect)".into()
@@ -1782,6 +1812,8 @@ mod tests {
             "http://127.0.0.1:8787",
             "--broker-credential",
             "cred",
+            "--broker-relay-url",
+            "wss://relay.example",
             "--channels",
             CHANNEL,
             "--agent-owner",
@@ -1797,6 +1829,7 @@ mod tests {
 
         assert_eq!(config.agent_mode, AgentMode::Broker);
         assert!(config.broker.is_some());
+        assert_eq!(config.relay_url, "wss://relay.example");
         assert!(config.presence_enabled);
         assert!(config.typing_enabled);
         assert!(config.memory_enabled);
@@ -1855,6 +1888,43 @@ mod tests {
     }
 
     #[test]
+    fn broker_mode_requires_an_explicit_relay_identity() {
+        let mut args = broker_args(&[]);
+        args.broker_relay_url = None;
+
+        assert!(Config::from_args(args)
+            .expect_err("broker relay identity must be required")
+            .to_string()
+            .contains("BUZZ_BROKER_RELAY_URL"));
+    }
+
+    #[test]
+    fn broker_mode_canonicalizes_relay_identity_without_forwarding_it() {
+        let mut args = broker_args(&[]);
+        args.broker_relay_url = Some("WSS://Relay.Example:443/".into());
+        let config = Config::from_args(args).expect("valid broker config");
+
+        assert_eq!(config.relay_url, "wss://relay.example");
+        assert!(config
+            .persona_env_vars
+            .iter()
+            .any(|(name, value)| name == "BUZZ_BROKER_RELAY_URL" && value.is_empty()));
+        assert!(config
+            .persona_env_vars
+            .iter()
+            .any(|(name, value)| name == "BUZZ_RELAY_URL" && value.is_empty()));
+    }
+
+    #[test]
+    fn broker_mode_rejects_invalid_relay_identity() {
+        let mut args = broker_args(&[]);
+        args.broker_relay_url = Some("https://relay.example".into());
+
+        let error = Config::from_args(args).expect_err("invalid relay identity should fail");
+        assert!(error.to_string().contains("scheme must be ws or wss"));
+    }
+
+    #[test]
     fn local_mode_requires_a_private_key() {
         let args = CliArgs::parse_from(["buzz-acp", "--agent-mode", "local"]);
 
@@ -1877,6 +1947,8 @@ mod tests {
             "http://127.0.0.1:8787",
             "--broker-credential",
             "cred",
+            "--broker-relay-url",
+            "wss://relay.example",
             "--agent-owner",
             OWNER,
         ]);

@@ -6,12 +6,23 @@
 //! correlation checks; this type never interprets a verdict.
 
 use buzz_sdk::broker::{
-    BrokerClient, BrokerFuture, BrokerResponse, BrokerTransportError, Dispatch, PreparedRequest,
-    BROKER_ACTION_PATH, BROKER_CREDENTIAL_HEADER,
+    Action, BrokerClient, BrokerFuture, BrokerResponse, BrokerTransportError, Dispatch,
+    PreparedRequest, BROKER_ACTION_PATH, BROKER_CREDENTIAL_HEADER,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+// A channel.read page may contain 500 messages whose content alone is up to
+// 64 KiB each. Keep the transport bounded while leaving room for the signed
+// event envelopes, tags, and JSON encoding around that contract-valid page.
+const MAX_CHANNEL_READ_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+fn max_response_bytes(request: &PreparedRequest) -> usize {
+    match request.action() {
+        Action::ChannelRead => MAX_CHANNEL_READ_RESPONSE_BYTES,
+        _ => MAX_RESPONSE_BYTES,
+    }
+}
 
 /// Invalid broker provisioning rejected before a bearer credential can leave
 /// the process.
@@ -114,6 +125,7 @@ impl HttpBrokerClient {
 impl BrokerClient for HttpBrokerClient {
     fn send<'a>(&'a self, request: &'a PreparedRequest, _dispatch: Dispatch) -> BrokerFuture<'a> {
         Box::pin(async move {
+            let max_response_bytes = max_response_bytes(request);
             let url = format!(
                 "{}{BROKER_ACTION_PATH}",
                 self.base_url.trim_end_matches('/')
@@ -135,11 +147,11 @@ impl BrokerClient for HttpBrokerClient {
                 let status = response.status().as_u16();
                 if response
                     .content_length()
-                    .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+                    .is_some_and(|length| length > max_response_bytes as u64)
                 {
                     return Err(BrokerTransportError::NoEnvelope {
                         status,
-                        detail: format!("response exceeds {MAX_RESPONSE_BYTES} bytes"),
+                        detail: format!("response exceeds {max_response_bytes} bytes"),
                     });
                 }
                 let mut body = Vec::new();
@@ -148,10 +160,10 @@ impl BrokerClient for HttpBrokerClient {
                     .await
                     .map_err(|e| BrokerTransportError::Unreachable(e.to_string()))?
                 {
-                    if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                    if body.len().saturating_add(chunk.len()) > max_response_bytes {
                         return Err(BrokerTransportError::NoEnvelope {
                             status,
-                            detail: format!("response exceeds {MAX_RESPONSE_BYTES} bytes"),
+                            detail: format!("response exceeds {max_response_bytes} bytes"),
                         });
                     }
                     body.extend_from_slice(&chunk);
@@ -190,9 +202,12 @@ mod tests {
     use axum::response::Response;
     use axum::routing::post;
     use axum::Router;
+    use buzz_sdk::broker::actions::MAX_CONTENT_BYTES;
     use buzz_sdk::broker::{
-        ActionArgs, BrokerClientExt, BrokerRequest, BrokerResult, MessagePostArgs,
+        ActionArgs, ActionOutcome, BrokerClientExt, BrokerMessage, BrokerRequest, BrokerResult,
+        ChannelReadArgs, MessagePage, MessagePostArgs,
     };
+    use nostr::{EventBuilder, Keys, Kind};
     use tokio::net::TcpListener;
 
     const CHANNEL: &str = "5df7dfa8-e919-43df-8efd-f1dcb8af7071";
@@ -237,6 +252,20 @@ mod tests {
             mentions: Vec::new(),
         });
         BrokerRequest::new("req-post-1", args)
+            .unwrap()
+            .prepare()
+            .unwrap()
+    }
+
+    fn channel_read_request() -> PreparedRequest {
+        let args = ActionArgs::ChannelRead(ChannelReadArgs {
+            channel_id: CHANNEL.to_string(),
+            root_event_id: None,
+            mentions_only: false,
+            cursor: None,
+            limit: Some(100),
+        });
+        BrokerRequest::new("req-read-1", args)
             .unwrap()
             .prepare()
             .unwrap()
@@ -343,5 +372,35 @@ mod tests {
             error,
             BrokerTransportError::NoEnvelope { detail, .. } if detail.contains("exceeds")
         ));
+    }
+
+    #[tokio::test]
+    async fn contract_valid_channel_page_may_exceed_default_response_bound() {
+        let request = channel_read_request();
+        let message = BrokerMessage(
+            EventBuilder::new(Kind::Custom(9), "x".repeat(MAX_CONTENT_BYTES))
+                .sign_with_keys(&Keys::generate())
+                .expect("fixture event signs"),
+        );
+        let outcome = ActionOutcome::ChannelRead(MessagePage {
+            messages: vec![message; 40],
+            next_cursor: None,
+        });
+        let body = serde_json::to_string(&BrokerResponse::new(
+            request.request_id(),
+            BrokerResult::succeeded(outcome),
+        ))
+        .unwrap();
+        assert!(body.len() > MAX_RESPONSE_BYTES);
+        assert!(body.len() < MAX_CHANNEL_READ_RESPONSE_BYTES);
+        let (base, _) = spawn(StatusCode::OK, body).await;
+
+        let response = HttpBrokerClient::new(base, CRED)
+            .unwrap()
+            .execute(&request)
+            .await
+            .expect("valid channel page");
+
+        assert!(matches!(response.result(), BrokerResult::Succeeded { .. }));
     }
 }
