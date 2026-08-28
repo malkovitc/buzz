@@ -309,13 +309,8 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_AGENT_MODE", default_value = "local")]
     pub agent_mode: AgentMode,
 
-    #[arg(
-        long,
-        env = "BUZZ_PRIVATE_KEY",
-        hide_env_values = true,
-        default_value = ""
-    )]
-    pub private_key: String,
+    #[arg(long, env = "BUZZ_PRIVATE_KEY", hide_env_values = true)]
+    pub private_key: Option<String>,
 
     #[arg(long, env = "BUZZ_BROKER_URL")]
     pub broker_url: Option<String>,
@@ -976,10 +971,13 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
+        // Clap preserves an explicitly empty argument or environment variable as
+        // `Some("")`; normalize it to absence before applying mode-specific rules.
+        let mut private_key = args.private_key.take().filter(|key| !key.is_empty());
         let broker = match args.agent_mode {
             AgentMode::Local => None,
             AgentMode::Broker => {
-                if !args.private_key.is_empty() {
+                if private_key.is_some() {
                     return Err(ConfigError::ConfigFile(
                         "broker mode is keyless — unset BUZZ_PRIVATE_KEY / --private-key".into(),
                     ));
@@ -1040,7 +1038,14 @@ impl Config {
             }
         };
         let keys = match args.agent_mode {
-            AgentMode::Local => Keys::parse(&args.private_key)?,
+            AgentMode::Local => {
+                let private_key = private_key.as_deref().ok_or_else(|| {
+                    ConfigError::ConfigFile(
+                        "BUZZ_PRIVATE_KEY / --private-key is required in local mode".into(),
+                    )
+                })?;
+                Keys::parse(private_key)?
+            }
             // Never used as the agent identity. A placeholder keeps the local
             // runtime's concrete types intact while the broker path diverges
             // before relay setup; it is never exported to subprocesses.
@@ -1049,9 +1054,10 @@ impl Config {
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
         // crate we can only clear the String — the allocator may retain copies.
-        args.private_key
-            .replace_range(.., &"0".repeat(args.private_key.len()));
-        args.private_key.clear();
+        if let Some(private_key) = private_key.as_mut() {
+            private_key.replace_range(.., &"0".repeat(private_key.len()));
+            private_key.clear();
+        }
 
         let system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
@@ -1839,13 +1845,23 @@ mod tests {
     fn broker_mode_rejects_an_agent_private_key() {
         let key = "1".repeat(64);
         let mut args = broker_args(&[]);
-        args.private_key = key;
+        args.private_key = Some(key);
         let result = Config::from_args(args);
 
         assert!(result
             .expect_err("private key must fail closed")
             .to_string()
             .contains("keyless"));
+    }
+
+    #[test]
+    fn local_mode_requires_a_private_key() {
+        let args = CliArgs::parse_from(["buzz-acp", "--agent-mode", "local"]);
+
+        assert!(Config::from_args(args)
+            .expect_err("local mode must require a private key")
+            .to_string()
+            .contains("required in local mode"));
     }
 
     #[test]
