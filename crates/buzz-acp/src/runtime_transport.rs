@@ -1,8 +1,8 @@
 //! Runtime event transport selected by provisioning.
 //!
 //! Local mode delegates to the existing authenticated relay client. Broker
-//! mode polls the frozen `channel.read` action and deliberately provides no
-//! relay publisher: relay-only housekeeping is disabled by broker-mode config.
+//! mode polls `channel.read` and routes keyless storage and live signals back
+//! through the broker. Capabilities with no broker action remain relay-only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -10,7 +10,9 @@ use std::time::Duration;
 use buzz_broker_client::HttpBrokerClient;
 use buzz_sdk::broker::{
     ActionArgs, ActionOutcome, BrokerClientExt, BrokerErrorCode, BrokerRequest, BrokerResult,
-    ChannelReadArgs, StorageAddressArgs,
+    ChannelReadArgs, EventPublished, LivenessPingArgs, ObserverEmitArgs, ObserverFrame,
+    ObserverReceipt, PresenceSetArgs, StorageAddressArgs, StorageGetArgs, StorageRecord,
+    TypingSetArgs,
 };
 use nostr::{Event, Keys};
 use tokio::time::MissedTickBehavior;
@@ -26,6 +28,77 @@ pub enum RuntimeTransport {
     Broker(BrokerRuntime),
 }
 
+#[derive(Clone)]
+pub enum RuntimeSignalPublisher {
+    Local {
+        publisher: RelayEventPublisher,
+        keys: Keys,
+    },
+    Broker(BrokerActions),
+}
+
+impl RuntimeSignalPublisher {
+    pub async fn presence_set(
+        &self,
+        status: buzz_core::presence::PresenceStatus,
+    ) -> Result<(), RelayError> {
+        match self {
+            Self::Local { publisher, keys } => {
+                use buzz_core::kind::KIND_PRESENCE_UPDATE;
+                use nostr::{EventBuilder, Kind};
+
+                let event = EventBuilder::new(
+                    Kind::Custom(KIND_PRESENCE_UPDATE as u16),
+                    status.to_string(),
+                )
+                .tags([])
+                .sign_with_keys(keys)
+                .map_err(|error| RelayError::Http(format!("presence sign error: {error}")))?;
+                publisher.publish_event(event).await
+            }
+            Self::Broker(actions) => actions.presence_set(status).await.map(|_| ()),
+        }
+    }
+
+    pub async fn typing_set(
+        &self,
+        channel_id: Uuid,
+        root_event_id: Option<String>,
+        parent_event_id: Option<String>,
+    ) -> Result<(), RelayError> {
+        match self {
+            Self::Local { publisher, keys } => {
+                use buzz_core::kind::KIND_TYPING_INDICATOR;
+                use nostr::{EventBuilder, Kind, Tag};
+
+                let h_tag = Tag::parse(["h", &channel_id.to_string()])
+                    .map_err(|error| RelayError::Http(error.to_string()))?;
+                let mut tags = vec![h_tag];
+                if let Some(parent) = parent_event_id.as_deref() {
+                    if let Some(root) = root_event_id.as_deref() {
+                        if root != parent {
+                            tags.push(
+                                Tag::parse(["e", root, "", "root"])
+                                    .map_err(|error| RelayError::Http(error.to_string()))?,
+                            );
+                        }
+                    }
+                    tags.push(
+                        Tag::parse(["e", parent, "", "reply"])
+                            .map_err(|error| RelayError::Http(error.to_string()))?,
+                    );
+                }
+                let event = EventBuilder::new(Kind::Custom(KIND_TYPING_INDICATOR as u16), "")
+                    .tags(tags)
+                    .sign_with_keys(keys)
+                    .map_err(|error| RelayError::Http(format!("typing sign error: {error}")))?;
+                publisher.try_publish_event(event)
+            }
+            Self::Broker(actions) => actions.typing_set(channel_id).await.map(|_| ()),
+        }
+    }
+}
+
 pub struct BrokerRuntime {
     client: HttpBrokerClient,
     channel_ids: Vec<Uuid>,
@@ -37,6 +110,102 @@ pub struct BrokerRuntime {
     poll: tokio::time::Interval,
     placeholder_keys: Keys,
     terminal_error: Option<String>,
+}
+
+/// Cloneable handle for broker-backed capabilities used outside the polling
+/// loop (memory, presence, typing, observer telemetry, and turn liveness).
+#[derive(Clone)]
+pub struct BrokerActions {
+    client: HttpBrokerClient,
+}
+
+impl BrokerActions {
+    async fn run(&self, args: ActionArgs) -> Result<ActionOutcome, RelayError> {
+        execute(&self.client, args)
+            .await
+            .map_err(BrokerActionError::relay_error)
+    }
+
+    pub async fn storage_get(&self, slug: String) -> Result<StorageRecord, RelayError> {
+        match self
+            .run(ActionArgs::StorageGet(StorageGetArgs { slug }))
+            .await?
+        {
+            ActionOutcome::StorageGet(record) => Ok(record),
+            _ => Err(wrong_outcome("storage.get")),
+        }
+    }
+
+    pub async fn presence_set(
+        &self,
+        status: buzz_core::presence::PresenceStatus,
+    ) -> Result<EventPublished, RelayError> {
+        match self
+            .run(ActionArgs::PresenceSet(PresenceSetArgs { status }))
+            .await?
+        {
+            ActionOutcome::PresenceSet(published) => Ok(published),
+            _ => Err(wrong_outcome("presence.set")),
+        }
+    }
+
+    pub async fn typing_set(&self, channel_id: Uuid) -> Result<EventPublished, RelayError> {
+        match self
+            .run(ActionArgs::TypingSet(TypingSetArgs {
+                channel_id: channel_id.to_string(),
+            }))
+            .await?
+        {
+            ActionOutcome::TypingSet(published) => Ok(published),
+            _ => Err(wrong_outcome("typing.set")),
+        }
+    }
+
+    pub async fn observer_emit(
+        &self,
+        frames: Vec<ObserverFrame>,
+    ) -> Result<ObserverReceipt, RelayError> {
+        match self
+            .run(ActionArgs::ObserverEmit(ObserverEmitArgs { frames }))
+            .await?
+        {
+            ActionOutcome::ObserverEmit(receipt) => Ok(receipt),
+            _ => Err(wrong_outcome("observer.emit")),
+        }
+    }
+
+    pub async fn liveness_ping(
+        &self,
+        channel_id: Uuid,
+        turn_id: String,
+    ) -> Result<EventPublished, RelayError> {
+        match self
+            .run(ActionArgs::LivenessPing(LivenessPingArgs {
+                channel_id: channel_id.to_string(),
+                turn_id,
+            }))
+            .await?
+        {
+            ActionOutcome::LivenessPing(published) => Ok(published),
+            _ => Err(wrong_outcome("liveness.ping")),
+        }
+    }
+}
+
+fn wrong_outcome(action: &str) -> RelayError {
+    RelayError::Http(format!("broker returned the wrong outcome for {action}"))
+}
+
+fn advance_cursor(
+    cursors: &mut HashMap<Uuid, String>,
+    channel_id: Uuid,
+    next_cursor: Option<String>,
+) {
+    if let Some(cursor) = next_cursor {
+        cursors.insert(channel_id, cursor);
+    } else {
+        cursors.remove(&channel_id);
+    }
 }
 
 struct BrokerActionError {
@@ -64,7 +233,8 @@ impl BrokerRuntime {
         poll_interval: Duration,
         placeholder_keys: Keys,
     ) -> Result<(Self, String), RelayError> {
-        let client = HttpBrokerClient::new(base_url, credential);
+        let client = HttpBrokerClient::new(base_url, credential)
+            .map_err(|error| RelayError::Http(format!("broker config: {error}")))?;
         let outcome = execute(
             &client,
             ActionArgs::StorageAddress(StorageAddressArgs {
@@ -152,9 +322,11 @@ impl BrokerRuntime {
                         continue;
                     }
                 };
-                if let Some(cursor) = page.next_cursor {
-                    self.cursors.insert(channel_id, cursor);
-                }
+                // `nextCursor` is a pagination continuation, not a durable
+                // tail watermark. Return to the host's current default window
+                // after draining so newly-arrived events remain visible; the
+                // rotating dedup sets absorb the replay.
+                advance_cursor(&mut self.cursors, channel_id, page.next_cursor);
                 for message in page.messages {
                     if let Err(error) = message.verify() {
                         tracing::warn!(%channel_id, "broker returned an unverifiable event: {error}");
@@ -353,6 +525,27 @@ impl RuntimeTransport {
         }
     }
 
+    pub fn broker_actions(&self) -> Option<BrokerActions> {
+        match self {
+            Self::Local(_) => None,
+            Self::Broker(runtime) => Some(BrokerActions {
+                client: runtime.client.clone(),
+            }),
+        }
+    }
+
+    pub fn signal_publisher(&self, keys: Keys) -> RuntimeSignalPublisher {
+        match self {
+            Self::Local(relay) => RuntimeSignalPublisher::Local {
+                publisher: relay.event_publisher(),
+                keys,
+            },
+            Self::Broker(runtime) => RuntimeSignalPublisher::Broker(BrokerActions {
+                client: runtime.client.clone(),
+            }),
+        }
+    }
+
     pub fn rest_client(&self) -> RestClient {
         match self {
             Self::Local(relay) => relay.rest_client(),
@@ -365,32 +558,120 @@ impl RuntimeTransport {
         }
     }
 
-    pub fn build_typing_event(
-        &self,
-        channel_id: Uuid,
-        root_event_id: Option<&str>,
-        parent_event_id: Option<&str>,
-    ) -> Result<Event, RelayError> {
-        match self {
-            Self::Local(relay) => {
-                relay.build_typing_event(channel_id, root_event_id, parent_event_id)
-            }
-            Self::Broker(_) => Err(RelayError::Http(
-                "typing indicators are disabled in broker mode".into(),
-            )),
-        }
-    }
-
-    pub fn try_publish_event(&self, event: Event) -> Result<(), RelayError> {
-        match self {
-            Self::Local(relay) => relay.try_publish_event(event),
-            Self::Broker(_) => Err(RelayError::ConnectionClosed),
-        }
-    }
-
     pub async fn shutdown(self) {
         if let Self::Local(relay) = self {
             relay.shutdown().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, Bytes};
+    use axum::http::StatusCode;
+    use axum::response::Response;
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn terminal_page_returns_polling_to_the_default_window() {
+        let channel_id = Uuid::new_v4();
+        let mut cursors = HashMap::new();
+        advance_cursor(&mut cursors, channel_id, Some("continuation".into()));
+        assert_eq!(
+            cursors.get(&channel_id).map(String::as_str),
+            Some("continuation")
+        );
+
+        advance_cursor(&mut cursors, channel_id, None);
+        assert!(!cursors.contains_key(&channel_id));
+    }
+
+    #[tokio::test]
+    async fn broker_actions_route_storage_and_live_signals() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new().route(
+            "/v1/action",
+            post({
+                let seen = Arc::clone(&seen);
+                move |body: Bytes| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let request_id = request["requestId"].as_str().unwrap();
+                        let action = request["action"].as_str().unwrap();
+                        seen.lock().unwrap().push(action.to_string());
+                        let outcome = match action {
+                            "storage.get" => serde_json::json!({ "value": "core" }),
+                            "observer.emit" => serde_json::json!({ "accepted": 1 }),
+                            _ => serde_json::json!({
+                                "eventId": "cacf5f811cc8ef3f4af3f92cc222f92a86cdf6a26728a144c8e63b74ab6db359",
+                                "kind": 20001,
+                                "createdAt": 1_700_000_000u64,
+                            }),
+                        };
+                        let response = serde_json::json!({
+                            "type": "broker_result",
+                            "protocolVersion": 1,
+                            "requestId": request_id,
+                            "status": "succeeded",
+                            "action": action,
+                            "outcome": outcome,
+                        });
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Body::from(response.to_string()))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let actions = BrokerActions {
+            client: HttpBrokerClient::new(format!("http://{address}"), "credential").unwrap(),
+        };
+        let channel_id = Uuid::new_v4();
+
+        assert_eq!(
+            actions
+                .storage_get("core".into())
+                .await
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("core")
+        );
+        actions
+            .presence_set(buzz_core::presence::PresenceStatus::Online)
+            .await
+            .unwrap();
+        actions.typing_set(channel_id).await.unwrap();
+        actions
+            .observer_emit(vec![ObserverFrame {
+                kind: "turn_started".into(),
+                payload: "{}".into(),
+            }])
+            .await
+            .unwrap();
+        actions
+            .liveness_ping(channel_id, "turn-1".into())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "storage.get",
+                "presence.set",
+                "typing.set",
+                "observer.emit",
+                "liveness.ping",
+            ]
+        );
     }
 }

@@ -24,7 +24,7 @@ use buzz_core::engram::{
     self, conversation_key, d_tag, normalize_slug, select_head, validate_and_decrypt, Body, Listing,
 };
 use buzz_core::kind::KIND_AGENT_ENGRAM;
-use buzz_sdk::broker::StorageAddressArgs;
+use buzz_sdk::broker::{StorageAddressArgs, StorageGetArgs, StoragePutArgs};
 use nostr::PublicKey;
 
 use crate::backend::{AgentBackend, Backend};
@@ -804,11 +804,16 @@ pub async fn dispatch(cmd: crate::MemCmd, client: &BuzzClient) -> Result<(), Cli
     }
 }
 
-/// Keyless (broker) dispatch for encrypted-memory addressing only.
-///
-/// The returned coordinates are intentionally surfaced as-is. They identify
-/// the encrypted record but do not, by themselves, provide read, decrypt,
-/// encrypt, or publish semantics; those remain a later runtime slice.
+async fn broker_value(backend: &Backend, slug: String) -> Result<String, CliError> {
+    backend
+        .storage_get(StorageGetArgs { slug: slug.clone() })
+        .await?
+        .value
+        .ok_or_else(|| CliError::NotFound(format!("not found: {slug}")))
+}
+
+/// Keyless (broker) dispatch. The host owns encryption, signing, and relay
+/// publication; the CLI sees only slug-addressed plaintext records.
 pub async fn dispatch_broker(cmd: crate::MemCmd, backend: &Backend) -> Result<(), CliError> {
     use crate::MemCmd;
     match cmd {
@@ -823,9 +828,82 @@ pub async fn dispatch_broker(cmd: crate::MemCmd, backend: &Backend) -> Result<()
             );
             Ok(())
         }
-        _ => Err(CliError::Usage(
-            "keyless (broker) mode supports only 'mem address' in this group; encrypted-memory \
-             reads and writes need the later runtime storage slice"
+        MemCmd::Get { slug, owner, agent } => {
+            if owner.is_some() || agent.is_some() {
+                return Err(CliError::Usage(
+                    "--owner/--agent are unavailable in broker mode; identity is credential-bound"
+                        .into(),
+                ));
+            }
+            let slug = normalize_slug(&slug)
+                .map_err(|e| CliError::Usage(format!("invalid slug: {e}")))?;
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(broker_value(backend, slug).await?.as_bytes())
+                .map_err(|e| CliError::Other(e.to_string()))
+        }
+        MemCmd::Hash { slug, owner, agent } => {
+            if owner.is_some() || agent.is_some() {
+                return Err(CliError::Usage(
+                    "--owner/--agent are unavailable in broker mode; identity is credential-bound"
+                        .into(),
+                ));
+            }
+            let slug = normalize_slug(&slug)
+                .map_err(|e| CliError::Usage(format!("invalid slug: {e}")))?;
+            println!("{}", sha256_hex(&broker_value(backend, slug).await?));
+            Ok(())
+        }
+        MemCmd::Set {
+            slug,
+            value,
+            owner,
+            allow_empty,
+        } => {
+            if owner.is_some() {
+                return Err(CliError::Usage(
+                    "--owner is unavailable in broker mode; identity is credential-bound".into(),
+                ));
+            }
+            let slug = normalize_slug(&slug)
+                .map_err(|e| CliError::Usage(format!("invalid slug: {e}")))?;
+            let value = if value == "-" {
+                let mut input = String::new();
+                std::io::stdin()
+                    .take((engram::NIP44_PLAINTEXT_MAX + 1) as u64)
+                    .read_to_string(&mut input)
+                    .map_err(|e| CliError::Other(format!("stdin read failed: {e}")))?;
+                input
+            } else {
+                value
+            };
+            if value.is_empty() {
+                let detail = if allow_empty {
+                    "the broker storage contract does not support empty records"
+                } else {
+                    "refusing to write an empty broker record"
+                };
+                return Err(CliError::Usage(detail.into()));
+            }
+            let published = backend
+                .storage_put(StoragePutArgs { slug: slug.clone(), value })
+                .await?;
+            eprintln!(
+                "wrote {slug} (event {}, created_at {})",
+                published.event_id, published.created_at
+            );
+            Ok(())
+        }
+        MemCmd::Ls { .. } => Err(CliError::Usage(
+            "'mem ls' is unavailable in broker mode because the contract has no storage listing action"
+                .into(),
+        )),
+        MemCmd::Patch { .. } => Err(CliError::Usage(
+            "'mem patch' is not yet wired to broker read-modify-write; use mem get/hash/set"
+                .into(),
+        )),
+        MemCmd::Rm { .. } => Err(CliError::Usage(
+            "'mem rm' is unavailable because the broker contract has no delete/tombstone action"
                 .into(),
         )),
     }

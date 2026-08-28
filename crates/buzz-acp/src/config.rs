@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use clap::ValueEnum;
-use nostr::Keys;
+use nostr::{Keys, PublicKey};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -1021,11 +1021,17 @@ impl Config {
                             .into(),
                     ));
                 }
-                if args.agent_owner.is_none() {
-                    return Err(ConfigError::ConfigFile(
+                let owner = args.agent_owner.as_deref().ok_or_else(|| {
+                    ConfigError::ConfigFile(
                         "--agent-owner / BUZZ_ACP_AGENT_OWNER is required in broker mode".into(),
-                    ));
-                }
+                    )
+                })?;
+                let owner = PublicKey::from_hex(owner.trim()).map_err(|error| {
+                    ConfigError::ConfigFile(format!(
+                        "broker-mode --agent-owner must be a 64-hex public key: {error}"
+                    ))
+                })?;
+                args.agent_owner = Some(owner.to_hex());
                 Some(BrokerConfig {
                     base_url,
                     credential,
@@ -1244,8 +1250,8 @@ impl Config {
         // Spawned desktop agents now carry a complete instance snapshot. Team
         // instructions arrive independently so they can be layered at runtime.
         let mut persona_env_vars = Vec::new();
-        if let Some(broker) = broker.as_ref() {
-            persona_env_vars.extend([
+        match broker.as_ref() {
+            Some(broker) => persona_env_vars.extend([
                 ("BUZZ_AGENT_MODE".into(), "broker".into()),
                 ("BUZZ_BROKER_URL".into(), broker.base_url.clone()),
                 ("BUZZ_BROKER_CREDENTIAL".into(), broker.credential.clone()),
@@ -1254,7 +1260,14 @@ impl Config {
                 ("BUZZ_RELAY_URL".into(), String::new()),
                 ("BUZZ_PRIVATE_KEY".into(), String::new()),
                 ("BUZZ_AUTH_TAG".into(), String::new()),
-            ]);
+            ]),
+            None => persona_env_vars.extend([
+                ("BUZZ_AGENT_MODE".into(), "local".into()),
+                ("BUZZ_BROKER_URL".into(), String::new()),
+                ("BUZZ_BROKER_CREDENTIAL".into(), String::new()),
+                ("BUZZ_RELAY_URL".into(), args.relay_url.clone()),
+                ("BUZZ_PRIVATE_KEY".into(), keys.secret_key().to_secret_hex()),
+            ]),
         }
         let model = args.model;
 
@@ -1317,9 +1330,9 @@ impl Config {
                 args.context_message_limit
             },
             max_turns_per_session: args.max_turns_per_session,
-            presence_enabled: args.agent_mode == AgentMode::Local && !args.no_presence,
-            typing_enabled: args.agent_mode == AgentMode::Local && !args.no_typing,
-            memory_enabled: args.agent_mode == AgentMode::Local && args.memory && !args.no_memory,
+            presence_enabled: !args.no_presence,
+            typing_enabled: !args.no_typing,
+            memory_enabled: args.memory && !args.no_memory,
             model,
             effort_level: args.effort_level,
             session_title: args
@@ -1332,7 +1345,7 @@ impl Config {
             allowed_respond_to,
             persona_env_vars,
             has_generated_codex_config,
-            relay_observer: args.agent_mode == AgentMode::Local && args.relay_observer,
+            relay_observer: args.relay_observer,
             exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
             idle_pool_sleep_secs: args.idle_pool_sleep,
@@ -1773,14 +1786,14 @@ mod tests {
     }
 
     #[test]
-    fn broker_mode_is_keyless_and_disables_relay_only_features() {
+    fn broker_mode_is_keyless_and_enables_broker_capabilities() {
         let config = Config::from_args(broker_args(&[])).expect("valid broker config");
 
         assert_eq!(config.agent_mode, AgentMode::Broker);
         assert!(config.broker.is_some());
-        assert!(!config.presence_enabled);
-        assert!(!config.typing_enabled);
-        assert!(!config.memory_enabled);
+        assert!(config.presence_enabled);
+        assert!(config.typing_enabled);
+        assert!(config.memory_enabled);
         assert!(!config.relay_observer);
         assert_eq!(config.context_message_limit, 0);
         assert!(config
@@ -1791,6 +1804,35 @@ mod tests {
             .persona_env_vars
             .iter()
             .any(|(name, value)| name == "BUZZ_PRIVATE_KEY" && value.is_empty()));
+    }
+
+    #[test]
+    fn broker_mode_rejects_an_invalid_owner_pubkey() {
+        let mut args = broker_args(&[]);
+        args.agent_owner = Some("not-a-pubkey".into());
+        assert!(Config::from_args(args)
+            .expect_err("invalid owner must fail at startup")
+            .to_string()
+            .contains("64-hex"));
+    }
+
+    #[test]
+    fn explicit_local_mode_tombstones_inherited_broker_provisioning() {
+        let key = "1".repeat(64);
+        let args =
+            CliArgs::parse_from(["buzz-acp", "--agent-mode", "local", "--private-key", &key]);
+        let config = Config::from_args(args).expect("valid local config");
+        let value = |name: &str| {
+            config
+                .persona_env_vars
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(value("BUZZ_AGENT_MODE"), Some("local"));
+        assert_eq!(value("BUZZ_BROKER_URL"), Some(""));
+        assert_eq!(value("BUZZ_BROKER_CREDENTIAL"), Some(""));
+        assert!(value("BUZZ_PRIVATE_KEY").is_some_and(|value| !value.is_empty()));
     }
 
     #[test]

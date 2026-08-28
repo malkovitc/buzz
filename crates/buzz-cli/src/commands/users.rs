@@ -424,7 +424,7 @@ pub async fn cmd_set_profile(
     Ok(())
 }
 
-/// Keyless (broker) dispatch for the users group: `set-profile` only.
+/// Keyless (broker) dispatch for profile and presence updates.
 pub async fn dispatch_broker(cmd: crate::UsersCmd, backend: &Backend) -> Result<(), CliError> {
     use crate::UsersCmd;
     match cmd {
@@ -460,8 +460,25 @@ pub async fn dispatch_broker(cmd: crate::UsersCmd, backend: &Backend) -> Result<
             );
             Ok(())
         }
+        UsersCmd::SetPresence { status } => {
+            let status = match status {
+                crate::PresenceStatus::Online => buzz_core::presence::PresenceStatus::Online,
+                crate::PresenceStatus::Away => buzz_core::presence::PresenceStatus::Away,
+                crate::PresenceStatus::Offline => buzz_core::presence::PresenceStatus::Offline,
+            };
+            let published = backend
+                .presence_set(buzz_sdk::broker::PresenceSetArgs { status })
+                .await?;
+            println!(
+                "{}",
+                serde_json::to_string(&published)
+                    .map_err(|e| CliError::Other(format!("serialize outcome: {e}")))?
+            );
+            Ok(())
+        }
         _ => Err(CliError::Usage(
-            "keyless (broker) mode supports only 'users set-profile' in this group".into(),
+            "keyless (broker) mode supports only 'users set-profile' and 'users set-presence' in this group"
+                .into(),
         )),
     }
 }

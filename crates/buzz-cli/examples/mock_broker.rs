@@ -73,6 +73,42 @@ async fn action(headers: axum::http::HeaderMap, body: Bytes) -> Response {
                 "dTag": FAKE_EVENT_ID,
             }),
         ),
+        "storage.get" => succeeded(
+            request_id,
+            action,
+            serde_json::json!({ "value": "I am a keyless agent using broker-backed memory." }),
+        ),
+        "storage.put" => succeeded(
+            request_id,
+            action,
+            serde_json::json!({ "eventId": FAKE_EVENT_ID, "kind": 30174, "createdAt": 1_700_000_000u64 }),
+        ),
+        "presence.set" => succeeded(
+            request_id,
+            action,
+            serde_json::json!({ "eventId": FAKE_EVENT_ID, "kind": 20001, "createdAt": 1_700_000_000u64 }),
+        ),
+        "typing.set" => succeeded(
+            request_id,
+            action,
+            serde_json::json!({ "eventId": FAKE_EVENT_ID, "kind": 20002, "createdAt": 1_700_000_000u64 }),
+        ),
+        "observer.emit" => succeeded(
+            request_id,
+            action,
+            serde_json::json!({
+                "accepted": request
+                    .get("args")
+                    .and_then(|args| args.get("frames"))
+                    .and_then(|frames| frames.as_array())
+                    .map_or(0, Vec::len),
+            }),
+        ),
+        "liveness.ping" => succeeded(
+            request_id,
+            action,
+            serde_json::json!({ "eventId": FAKE_EVENT_ID, "kind": 24200, "createdAt": 1_700_000_000u64 }),
+        ),
         "channel.read" => succeeded(request_id, action, serde_json::json!({ "messages": [] })),
         other => serde_json::json!({
             "type": "broker_result",

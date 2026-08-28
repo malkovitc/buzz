@@ -85,30 +85,6 @@ fn current_working_directory() -> Result<String> {
     Ok(cwd.to_string_lossy().into_owned())
 }
 
-/// Publish a kind:20001 presence update event via the WebSocket connection.
-///
-/// Ephemeral kinds (20000-29999) are rejected by the HTTP bridge, so presence
-/// updates must be routed through the WS path.
-///
-/// Content is a bare status string (`"online"`, `"away"`, `"offline"`) matching
-/// the desktop client's format. The relay stores this in Redis and synthesizes
-/// it back on presence queries.
-async fn publish_presence(
-    publisher: &relay::RelayEventPublisher,
-    keys: &nostr::Keys,
-    status: &str,
-) -> Result<(), relay::RelayError> {
-    use buzz_core::kind::KIND_PRESENCE_UPDATE;
-    use nostr::{EventBuilder, Kind};
-
-    let event = EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE as u16), status)
-        .tags([])
-        .sign_with_keys(keys)
-        .map_err(|e| relay::RelayError::Http(format!("presence sign error: {e}")))?;
-    publisher.publish_event(event).await?;
-    Ok(())
-}
-
 fn emit_runtime_lifecycle(
     observer: Option<&observer::ObserverHandle>,
     start_nonce: &str,
@@ -644,6 +620,70 @@ fn spawn_relay_observer_publisher(
             owner_pubkey,
         )
         .await;
+    })
+}
+
+fn spawn_broker_observer_publisher(
+    observer: observer::ObserverHandle,
+    broker: runtime_transport::BrokerActions,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut rx = observer.subscribe();
+        let snapshot = observer.snapshot();
+        let mut queue = ObserverPublishQueue::default();
+        let max_snapshot_seq = snapshot.iter().map(|event| event.seq).max().unwrap_or(0);
+        for event in snapshot {
+            queue.ingest(event);
+        }
+
+        let mut publish_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + OBSERVER_PUBLISH_TICK,
+            OBSERVER_PUBLISH_TICK,
+        );
+        publish_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut closed = false;
+        loop {
+            tokio::select! {
+                result = rx.recv(), if !closed => match result {
+                    Ok(event) if event.seq > max_snapshot_seq => queue.ingest(event),
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        tracing::warn!(dropped = count, "broker observer publisher lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => closed = true,
+                },
+                _ = publish_tick.tick() => {
+                    if let Some(mut event) = queue.next_frame() {
+                        fit_observer_event_to_budget(&mut event);
+                        match serde_json::to_string(&event) {
+                            Ok(payload) => {
+                                let frame = buzz_sdk::broker::ObserverFrame {
+                                    kind: event.kind.clone(),
+                                    payload,
+                                };
+                                match broker.observer_emit(vec![frame]).await {
+                                    Ok(receipt) if receipt.accepted == 1 => {}
+                                    Ok(receipt) => tracing::warn!(
+                                        accepted = receipt.accepted,
+                                        "broker did not accept the observer frame"
+                                    ),
+                                    Err(error) => tracing::warn!(
+                                        "broker observer frame dropped: {error}"
+                                    ),
+                                }
+                            }
+                            Err(error) => tracing::warn!(
+                                "failed to serialize broker observer frame: {error}"
+                            ),
+                        }
+                    }
+                    let publish_complete = closed && queue.is_empty();
+                    if publish_complete {
+                        break;
+                    }
+                }
+            }
+        }
     })
 }
 
@@ -2082,8 +2122,8 @@ async fn tokio_main() -> Result<()> {
         ),
     }
 
-    let presence_publisher = relay.event_publisher();
-    let presence_keys = config.keys.clone();
+    let signal_publisher = relay.signal_publisher(config.keys.clone());
+    let broker_actions = relay.broker_actions();
 
     // Priority: BUZZ_AUTH_TAG (NIP-OA attestation) → --agent-owner flag.
     let startup_owner: Option<String> = match config.agent_mode {
@@ -2134,8 +2174,14 @@ async fn tokio_main() -> Result<()> {
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
     let mut relay_observer_publisher = None;
+    let mut broker_observer_publisher = None;
     if config.relay_observer {
-        if let (Some(observer), Some(owner_pubkey_hex)) =
+        if config.agent_mode == AgentMode::Broker {
+            if let (Some(observer), Some(actions)) = (observer.clone(), broker_actions.clone()) {
+                broker_observer_publisher = Some((observer, actions));
+                tracing::info!("broker observer enabled");
+            }
+        } else if let (Some(observer), Some(owner_pubkey_hex)) =
             (observer.clone(), owner_cache.pubkey.clone())
         {
             match PublicKey::from_hex(&owner_pubkey_hex) {
@@ -2235,6 +2281,9 @@ async fn tokio_main() -> Result<()> {
             owner,
         ));
     }
+    if let Some((observer, actions)) = broker_observer_publisher.take() {
+        relay_observer_publisher_task = Some(spawn_broker_observer_publisher(observer, actions));
+    }
 
     let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
     let dedup_mode = config.dedup_mode;
@@ -2245,7 +2294,10 @@ async fn tokio_main() -> Result<()> {
     // connected. Publishing after channel subscriptions gives desktop callers
     // a durable readiness boundary before they send a startup mention.
     if config.presence_enabled {
-        match publish_presence(&presence_publisher, &presence_keys, "online").await {
+        match signal_publisher
+            .presence_set(buzz_core::presence::PresenceStatus::Online)
+            .await
+        {
             Ok(_) => tracing::info!("presence set to online"),
             Err(e) => tracing::warn!("failed to set initial presence: {e}"),
         }
@@ -2289,6 +2341,7 @@ async fn tokio_main() -> Result<()> {
         heartbeat_prompt: config.heartbeat_prompt.clone(),
         cwd,
         relay_features_enabled: config.agent_mode == AgentMode::Local,
+        broker_actions,
         rest_client: relay.rest_client(),
         channel_info,
         context_message_limit: config.context_message_limit,
@@ -3263,10 +3316,12 @@ async fn tokio_main() -> Result<()> {
                     if let Some(h) = presence_task.take() {
                         h.abort();
                     }
-                    let pp = presence_publisher.clone();
-                    let pk = presence_keys.clone();
+                    let signals = signal_publisher.clone();
                     presence_task = Some(tokio::spawn(async move {
-                        if let Err(e) = publish_presence(&pp, &pk, "online").await {
+                        if let Err(e) = signals
+                            .presence_set(buzz_core::presence::PresenceStatus::Online)
+                            .await
+                        {
                             tracing::warn!("presence heartbeat failed: {e}");
                         }
                     }));
@@ -3279,20 +3334,29 @@ async fn tokio_main() -> Result<()> {
                     }
                 } => {
                     let _ = result_rx;
-                    // Use try_publish (non-blocking) for typing indicators —
-                    // they're ephemeral and must not block the main loop during
-                    // relay reconnection (#35).
+                    // Signals are ephemeral. Publish each on a detached task so
+                    // a slow relay or broker never stalls the main event loop.
                     for (&ch, scopes) in &typing_channels {
                         for thread_tags in scopes {
-                            if let Ok(event) = relay.build_typing_event(
-                                ch,
-                                thread_tags.root_event_id.as_deref(),
-                                thread_tags.parent_event_id.as_deref(),
-                            ) {
-                                if let Err(e) = relay.try_publish_event(event) {
-                                    tracing::debug!("typing indicator dropped for {ch}: {e}");
+                            let signals = signal_publisher.clone();
+                            let root = thread_tags.root_event_id.clone();
+                            let parent = thread_tags.parent_event_id.clone();
+                            tokio::spawn(async move {
+                                match tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    signals.typing_set(ch, root, parent),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => tracing::debug!(
+                                        "typing indicator dropped for {ch}: {e}"
+                                    ),
+                                    Err(_) => {
+                                        tracing::debug!("typing indicator timed out for {ch}")
+                                    }
                                 }
-                            }
+                            });
                         }
                     }
                     None
@@ -3679,7 +3743,7 @@ async fn tokio_main() -> Result<()> {
     if config.presence_enabled {
         match tokio::time::timeout(
             Duration::from_secs(2),
-            publish_presence(&presence_publisher, &presence_keys, "offline"),
+            signal_publisher.presence_set(buzz_core::presence::PresenceStatus::Offline),
         )
         .await
         {
@@ -5275,6 +5339,18 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
         env: {
             let mut env = match config.agent_mode {
                 AgentMode::Local => vec![
+                    EnvVar {
+                        name: "BUZZ_AGENT_MODE".into(),
+                        value: "local".into(),
+                    },
+                    EnvVar {
+                        name: "BUZZ_BROKER_URL".into(),
+                        value: String::new(),
+                    },
+                    EnvVar {
+                        name: "BUZZ_BROKER_CREDENTIAL".into(),
+                        value: String::new(),
+                    },
                     EnvVar {
                         name: "BUZZ_RELAY_URL".into(),
                         value: config.relay_url.clone(),

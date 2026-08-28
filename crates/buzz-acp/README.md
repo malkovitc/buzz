@@ -87,20 +87,20 @@ unset BUZZ_PRIVATE_KEY BUZZ_RELAY_URL BUZZ_AUTH_TAG
 buzz-acp
 ```
 
-This slice is intentionally receive-and-reply focused. Because the frozen
-broker contract does not expose channel discovery, channel metadata, profiles,
-or runtime housekeeping operations, broker mode currently requires explicit
-channel UUIDs and `respond-to=owner-only`. Presence, typing, reactions used as
-turn status, observer/liveness events, relay conversation enrichment, setup
-nudges, and core-memory injection are disabled. The `buzz` CLI operations
-available to the spawned agent are documented in
+Broker mode requires explicit channel UUIDs and `respond-to=owner-only` because
+the contract does not expose channel discovery or metadata. Core-memory reads,
+presence, typing, observer telemetry, and turn liveness use broker actions.
+Relay-only conversation enrichment, setup nudges, sibling-profile lookup, and
+reaction-based turn status remain disabled. The `buzz` CLI operations available
+to the spawned agent are documented in
 [`../buzz-cli/KEYLESS.md`](../buzz-cli/KEYLESS.md).
 
-Broker actions time out after 30 seconds, and an `unauthenticated` polling
-verdict terminates the harness so a revoked credential cannot leave a
-warn-spamming process that appears healthy. Poll cursors and event deduplication
-remain in memory only; restart-window semantics are a required real-host
-integration check.
+Broker actions time out after 30 seconds and require TLS except on loopback. An
+`unauthenticated` polling verdict terminates the harness so a revoked credential
+cannot leave a warn-spamming process that appears healthy. Poll cursors and
+event deduplication remain in memory only. After a pagination chain is drained,
+the runtime returns to cursorless polling and relies on bounded event-ID deduplication so later
+messages remain visible.
 
 ## Running with Codex
 

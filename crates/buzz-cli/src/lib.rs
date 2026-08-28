@@ -2142,7 +2142,7 @@ async fn run_broker(cli: Cli) -> Result<(), CliError> {
                 .into(),
         )
     })?;
-    let backend = backend::Backend::broker(base_url, credential);
+    let backend = backend::Backend::broker(base_url, credential)?;
 
     match cli.command {
         Cmd::Messages(sub) => commands::messages::dispatch_broker(sub, &backend).await,
@@ -2150,9 +2150,8 @@ async fn run_broker(cli: Cli) -> Result<(), CliError> {
         Cmd::Users(sub) => commands::users::dispatch_broker(sub, &backend).await,
         Cmd::Mem(sub) => commands::mem::dispatch_broker(sub, &backend).await,
         _ => Err(CliError::Usage(
-            "keyless (broker) mode currently supports the wake→reply slice plus reactions and \
-             profile, plus encrypted-memory addressing: 'messages get/send', 'reactions add', \
-             'users set-profile', and 'mem address'. Other commands need the local backend — \
+            "keyless (broker) mode currently supports messages, reactions, profile/presence updates, and \
+             broker-backed memory get/set/address/hash. Other commands need the local backend — \
              unset --agent-mode or set it to 'local'"
                 .into(),
         )),

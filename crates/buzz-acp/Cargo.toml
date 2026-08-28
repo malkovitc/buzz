@@ -78,5 +78,6 @@ evalexpr = { workspace = true }
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
+axum = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 httparse = "1"

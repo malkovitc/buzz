@@ -14,7 +14,8 @@ use uuid::Uuid;
 use buzz_sdk::broker::{
     ActionArgs, ActionOutcome, BrokerClientExt, BrokerError, BrokerRequest, BrokerResult,
     ChannelReadArgs, EventPublished, MessagePage, MessagePostArgs, MessageReplyArgs,
-    ProfileSetArgs, PubkeyHex, ReactionAddArgs, StorageAddress, StorageAddressArgs,
+    PresenceSetArgs, ProfileSetArgs, PubkeyHex, ReactionAddArgs, StorageAddress,
+    StorageAddressArgs, StorageGetArgs, StoragePutArgs, StorageRecord,
 };
 use buzz_sdk::ThreadRef;
 
@@ -34,7 +35,10 @@ pub trait AgentBackend {
     async fn message_reply(&self, args: MessageReplyArgs) -> Result<EventPublished, CliError>;
     async fn reaction_add(&self, args: ReactionAddArgs) -> Result<EventPublished, CliError>;
     async fn profile_set(&self, args: ProfileSetArgs) -> Result<EventPublished, CliError>;
+    async fn presence_set(&self, args: PresenceSetArgs) -> Result<EventPublished, CliError>;
     async fn storage_address(&self, args: StorageAddressArgs) -> Result<StorageAddress, CliError>;
+    async fn storage_get(&self, args: StorageGetArgs) -> Result<StorageRecord, CliError>;
+    async fn storage_put(&self, args: StoragePutArgs) -> Result<EventPublished, CliError>;
 }
 
 /// Keyless backend: no key, no relay route. Every operation is a broker request.
@@ -102,10 +106,31 @@ impl AgentBackend for BrokerBackend {
         }
     }
 
+    async fn presence_set(&self, args: PresenceSetArgs) -> Result<EventPublished, CliError> {
+        match self.run(ActionArgs::PresenceSet(args)).await? {
+            ActionOutcome::PresenceSet(published) => Ok(published),
+            _ => Err(unexpected_outcome("presence.set")),
+        }
+    }
+
     async fn storage_address(&self, args: StorageAddressArgs) -> Result<StorageAddress, CliError> {
         match self.run(ActionArgs::StorageAddress(args)).await? {
             ActionOutcome::StorageAddress(address) => Ok(address),
             _ => Err(unexpected_outcome("storage.address")),
+        }
+    }
+
+    async fn storage_get(&self, args: StorageGetArgs) -> Result<StorageRecord, CliError> {
+        match self.run(ActionArgs::StorageGet(args)).await? {
+            ActionOutcome::StorageGet(record) => Ok(record),
+            _ => Err(unexpected_outcome("storage.get")),
+        }
+    }
+
+    async fn storage_put(&self, args: StoragePutArgs) -> Result<EventPublished, CliError> {
+        match self.run(ActionArgs::StoragePut(args)).await? {
+            ActionOutcome::StoragePut(published) => Ok(published),
+            _ => Err(unexpected_outcome("storage.put")),
         }
     }
 }
@@ -235,6 +260,12 @@ impl AgentBackend for LocalBackend {
         self.publish(event).await
     }
 
+    async fn presence_set(&self, _args: PresenceSetArgs) -> Result<EventPublished, CliError> {
+        Err(CliError::Other(
+            "local presence updates use the existing signed command path".into(),
+        ))
+    }
+
     async fn storage_address(&self, args: StorageAddressArgs) -> Result<StorageAddress, CliError> {
         let owner = crate::commands::mem::resolve_owner(&self.client, None)?;
         let conversation_key =
@@ -245,6 +276,18 @@ impl AgentBackend for LocalBackend {
             kind: buzz_core::kind::KIND_AGENT_ENGRAM,
             d_tag: buzz_core::engram::d_tag(&conversation_key, &args.slug),
         })
+    }
+
+    async fn storage_get(&self, _args: StorageGetArgs) -> Result<StorageRecord, CliError> {
+        Err(CliError::Other(
+            "local storage reads use the existing encrypted-memory command path".into(),
+        ))
+    }
+
+    async fn storage_put(&self, _args: StoragePutArgs) -> Result<EventPublished, CliError> {
+        Err(CliError::Other(
+            "local storage writes use the existing encrypted-memory command path".into(),
+        ))
     }
 }
 
@@ -257,11 +300,13 @@ pub enum Backend {
 
 impl Backend {
     /// Keyless: talk to a broker `base_url` with `credential`.
-    #[must_use]
-    pub fn broker(base_url: impl Into<String>, credential: impl Into<String>) -> Self {
-        Self::Broker(BrokerBackend::new(HttpBrokerClient::new(
-            base_url, credential,
-        )))
+    pub fn broker(
+        base_url: impl Into<String>,
+        credential: impl Into<String>,
+    ) -> Result<Self, CliError> {
+        let client = HttpBrokerClient::new(base_url, credential)
+            .map_err(|error| CliError::Usage(format!("invalid broker configuration: {error}")))?;
+        Ok(Self::Broker(BrokerBackend::new(client)))
     }
 
     /// Local: hold the key and talk to the relay.
@@ -307,10 +352,31 @@ impl AgentBackend for Backend {
         }
     }
 
+    async fn presence_set(&self, args: PresenceSetArgs) -> Result<EventPublished, CliError> {
+        match self {
+            Self::Local(b) => b.presence_set(args).await,
+            Self::Broker(b) => b.presence_set(args).await,
+        }
+    }
+
     async fn storage_address(&self, args: StorageAddressArgs) -> Result<StorageAddress, CliError> {
         match self {
             Self::Local(b) => b.storage_address(args).await,
             Self::Broker(b) => b.storage_address(args).await,
+        }
+    }
+
+    async fn storage_get(&self, args: StorageGetArgs) -> Result<StorageRecord, CliError> {
+        match self {
+            Self::Local(b) => b.storage_get(args).await,
+            Self::Broker(b) => b.storage_get(args).await,
+        }
+    }
+
+    async fn storage_put(&self, args: StoragePutArgs) -> Result<EventPublished, CliError> {
+        match self {
+            Self::Local(b) => b.storage_put(args).await,
+            Self::Broker(b) => b.storage_put(args).await,
         }
     }
 }
@@ -377,7 +443,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        BrokerBackend::new(HttpBrokerClient::new(format!("http://{addr}"), "cred"))
+        BrokerBackend::new(HttpBrokerClient::new(format!("http://{addr}"), "cred").unwrap())
     }
 
     fn succeeded(rid: &str, action: &str, outcome: serde_json::Value) -> (StatusCode, String) {
@@ -513,6 +579,41 @@ mod tests {
         assert_eq!(address.author_pubkey.as_str(), PUBKEY);
         assert_eq!(address.kind, 30174);
         assert_eq!(address.d_tag, EVENT_ID);
+    }
+
+    #[tokio::test]
+    async fn broker_storage_get_returns_plaintext_or_absence() {
+        let backend = spawn_host(|rid, action| {
+            succeeded(rid, action, serde_json::json!({ "value": "remember me" }))
+        })
+        .await;
+        let record = backend
+            .storage_get(StorageGetArgs {
+                slug: "core".into(),
+            })
+            .await
+            .expect("record");
+        assert_eq!(record.value.as_deref(), Some("remember me"));
+    }
+
+    #[tokio::test]
+    async fn broker_storage_put_returns_the_published_event() {
+        let backend = spawn_host(|rid, action| {
+            succeeded(
+                rid,
+                action,
+                serde_json::json!({ "eventId": EVENT_ID, "kind": 30174, "createdAt": 1_700_000_000u64 }),
+            )
+        })
+        .await;
+        let published = backend
+            .storage_put(StoragePutArgs {
+                slug: "core".into(),
+                value: "remember me".into(),
+            })
+            .await
+            .expect("published");
+        assert_eq!(published.kind, 30174);
     }
 
     #[tokio::test]
