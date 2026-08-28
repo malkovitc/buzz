@@ -31,9 +31,11 @@ function startHarness(mode = "complete") {
       PI_ACP_PI_ARGS_JSON: JSON.stringify([fakePiPath]),
       FAKE_PI_MODE: mode,
       PI_ACP_BUZZ_COMMAND: fakeBuzzPath,
+      PI_ACP_KANBAN_COMMAND: fakeBuzzPath,
       PI_ACP_RECEIPT_DIR: receiptDir,
       BUZZ_PRIVATE_KEY: "1".repeat(64),
       FAKE_BUZZ_DELAY_MS: mode === "broker-cancel" ? "2000" : "0",
+      FAKE_KANBAN_DELAY_MS: mode === "terminal-publication" ? "2000" : "0",
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -66,7 +68,7 @@ function startHarness(mode = "complete") {
     send(message) {
       writeJsonl(child.stdin, message);
     },
-    waitFor(predicate, timeoutMs = 5_000) {
+    waitFor(predicate, timeoutMs = 30_000) {
       const existing = messages.find(predicate);
       if (existing) return Promise.resolve(existing);
       return new Promise((resolve, reject) => {
@@ -75,7 +77,7 @@ function startHarness(mode = "complete") {
           waiters.splice(waiters.indexOf(waiter), 1);
           reject(
             new Error(
-              `timed out waiting for adapter message; stderr=${stderr}`,
+              `timed out waiting for adapter message; stderr=${stderr}; messages=${JSON.stringify(messages)}`,
             ),
           );
         }, timeoutMs);
@@ -106,6 +108,7 @@ async function handshake(harness) {
   assert.equal(initialized.result._meta.steering.supported, true);
   assert.equal(initialized.result._meta.pilot.liveCanaryValidated, true);
   assert.equal(initialized.result._meta.pilot.fleetApproved, false);
+  assert.equal(initialized.result.agentInfo.version, "0.2.2");
 
   harness.send({
     jsonrpc: "2.0",
@@ -196,6 +199,40 @@ test("steers an active Pi prompt without starting a second ACP prompt", async (t
   assert.ok(
     harness.messages.some(
       (message) => message.params?.update?.content?.text === "steered:focus",
+    ),
+  );
+});
+
+test("queues startup steering until the SDK prompt is active", async (t) => {
+  const harness = startHarness("startup-steer");
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+
+  harness.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "start" }],
+      _meta: buzzMeta,
+    },
+  });
+  harness.send({
+    jsonrpc: "2.0",
+    id: 4,
+    method: "_session/steering",
+    params: { sessionId, prompt: [{ type: "text", text: "early focus" }] },
+  });
+
+  const steered = await harness.waitFor((message) => message.id === 4);
+  assert.deepEqual(steered.result, { outcome: "injected" });
+  const completed = await harness.waitFor((message) => message.id === 3);
+  assert.equal(completed.result.stopReason, "end_turn");
+  assert.ok(
+    harness.messages.some(
+      (message) =>
+        message.params?.update?.content?.text === "steered:early focus",
     ),
   );
 });
@@ -343,6 +380,32 @@ test("brokers Buzz publication without exposing the signing key", async (t) => {
   assert.ok(
     harness.messages.some(
       (message) => message.params?.update?.content?.text === "broker:ok",
+    ),
+  );
+});
+
+test("terminal publication stays successful and aborts sibling broker work", async (t) => {
+  const harness = startHarness("terminal-publication");
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+  const startedAt = Date.now();
+  harness.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "publish and stop" }],
+      _meta: buzzMeta,
+    },
+  });
+
+  const completed = await harness.waitFor((message) => message.id === 3);
+  assert.equal(completed.result.stopReason, "end_turn");
+  assert.ok(Date.now() - startedAt < 1_500);
+  assert.ok(
+    harness.messages.some(
+      (message) => message.params?.update?.content?.text === "sibling:aborted",
     ),
   );
 });

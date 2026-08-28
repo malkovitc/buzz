@@ -121,7 +121,7 @@ Question sessions should be ephemeral or aggressively rotated. Implementation se
 | `initialize` | adapter capability declaration | Advertise protocol v2, filesystem/terminal capabilities actually supported, and explicit steering metadata only after tests pass. |
 | `session/new` | `createAgentSession()` | Validate cwd/model/tool policy, create a fresh task session, return a stable adapter session ID. |
 | `session/prompt` | `session.prompt()` | Accept one inbound Buzz event, attach budget state, stream updates, settle only on `agent_settled`. |
-| steering extension | `session.steer()` | Queue after the current tool set; never drop the inbound Buzz event. |
+| steering extension | `session.steer()` | Queue after the current tool set; acknowledge only when Pi dequeues that exact message for consumption, and reject if terminal publication settles first so Buzz can retry the inbound event. |
 | `session/cancel` | `session.abort()` | Abort model and tools, drain events, return `cancelled` within the Buzz deadline. |
 | agent text deltas | `message_update:text_delta` | Emit ACP agent-message chunks without publishing directly to Buzz. |
 | thinking deltas | `message_update:thinking_delta` | Emit only when ACP/Buzz policy permits; never persist hidden reasoning as a channel message. |

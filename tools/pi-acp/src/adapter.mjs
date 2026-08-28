@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import packageMetadata from "../package.json" with { type: "json" };
 import { createBuzzTools } from "./buzz-tools.mjs";
 import { attachJsonlReader, writeJsonl } from "./jsonl.mjs";
 
@@ -194,7 +195,7 @@ export class PiAcpAdapter {
           },
           mcpCapabilities: { http: false, sse: false },
         },
-        agentInfo: { name: "pi-acp", version: "0.2.1" },
+        agentInfo: { name: "pi-acp", version: packageMetadata.version },
         _meta: {
           steering: { supported: true },
           pilot: { liveCanaryValidated: true, fleetApproved: false },
@@ -379,11 +380,18 @@ export class PiAcpAdapter {
       );
       return;
     }
+    let resolveSdkPromptStart;
+    const sdkPromptStart = new Promise((resolve) => {
+      resolveSdkPromptStart = resolve;
+    });
     this.currentPrompt = {
       acpId: message.id,
       sessionId: session.id,
       buzzContext,
       cancelled: false,
+      terminalPublished: false,
+      sdkPromptStart,
+      resolveSdkPromptStart,
       brokerAbortController: new AbortController(),
       usage: emptyUsage(),
       finalStopReason: "end_turn",
@@ -397,8 +405,10 @@ export class PiAcpAdapter {
         return;
       }
       await this.#sendPiCommand("prompt", { message: text });
+      this.currentPrompt?.resolveSdkPromptStart(true);
     } catch (error) {
       const prompt = this.currentPrompt;
+      prompt?.resolveSdkPromptStart(false);
       this.currentPrompt = null;
       this.#stopPi();
       if (prompt)
@@ -444,6 +454,14 @@ export class PiAcpAdapter {
     if (!this.currentPrompt || this.currentPrompt.sessionId !== session.id) {
       this.#send(
         rpcError(message.id, INVALID_PARAMS, "steering: no active prompt"),
+      );
+      return;
+    }
+    const prompt = this.currentPrompt;
+    const started = await prompt.sdkPromptStart;
+    if (!started || this.currentPrompt !== prompt) {
+      this.#send(
+        rpcError(message.id, INVALID_PARAMS, "steering: prompt did not start"),
       );
       return;
     }
@@ -493,6 +511,9 @@ export class PiAcpAdapter {
         break;
       case "turn_end":
         this.#turnEnd(event);
+        break;
+      case "terminal_publication":
+        this.#terminalPublication();
         break;
       case "agent_settled":
         this.#settlePrompt();
@@ -609,6 +630,13 @@ export class PiAcpAdapter {
     });
   }
 
+  #terminalPublication() {
+    if (!this.currentPrompt || this.currentPrompt.terminalPublished) return;
+    this.currentPrompt.terminalPublished = true;
+    this.currentPrompt.finalStopReason = "end_turn";
+    this.currentPrompt.brokerAbortController.abort();
+  }
+
   #turnEnd(event) {
     const usage = event.message?.usage;
     addUsage(this.currentPrompt.usage, usage);
@@ -619,13 +647,17 @@ export class PiAcpAdapter {
       addUsage(this.currentPrompt.usage, result?.usage);
     if (event.message?.stopReason === "length")
       this.currentPrompt.finalStopReason = "max_tokens";
-    else if (event.message?.stopReason === "aborted")
+    else if (
+      event.message?.stopReason === "aborted" &&
+      !this.currentPrompt.terminalPublished
+    )
       this.currentPrompt.finalStopReason = "cancelled";
   }
 
   #settlePrompt() {
     const prompt = this.currentPrompt;
     if (!prompt) return;
+    prompt.resolveSdkPromptStart(false);
     prompt.brokerAbortController.abort();
     this.currentPrompt = null;
     const usage = prompt.usage;
@@ -677,6 +709,7 @@ export class PiAcpAdapter {
   #failPrompt(error) {
     const prompt = this.currentPrompt;
     if (!prompt) return;
+    prompt.resolveSdkPromptStart(false);
     prompt.brokerAbortController.abort();
     this.currentPrompt = null;
     this.#send(rpcError(prompt.acpId, INTERNAL_ERROR, error.message));
@@ -689,6 +722,7 @@ export class PiAcpAdapter {
     for (const pending of this.piResponses.values()) pending.reject(error);
     this.piResponses.clear();
     if (this.currentPrompt) {
+      this.currentPrompt.resolveSdkPromptStart(false);
       this.currentPrompt.brokerAbortController.abort();
       this.#send(
         rpcError(this.currentPrompt.acpId, INTERNAL_ERROR, error.message),

@@ -10,6 +10,9 @@ import {
 import { Type } from "typebox";
 import { EventBudget } from "./event-budget.mjs";
 import { attachJsonlReader, writeJsonl } from "./jsonl.mjs";
+import { BrokerRequestRegistry } from "./sdk-broker.mjs";
+import { TerminalPublicationLifecycle } from "./sdk-lifecycle.mjs";
+import { SteeringDeliveryGate } from "./sdk-steering.mjs";
 
 function option(name) {
   const index = process.argv.indexOf(name);
@@ -30,20 +33,14 @@ const budget = new EventBudget(limits);
 let session;
 let streaming = false;
 let disposed = false;
-let brokerRequestId = 0;
-const brokerResponses = new Map();
+const brokerRequests = new BrokerRequestRegistry();
+const terminalPublication = new TerminalPublicationLifecycle();
+const steeringDelivery = new SteeringDeliveryGate();
 
-function callBroker(toolName, args) {
-  const id = `broker-${++brokerRequestId}`;
-  return new Promise((resolve, reject) => {
-    brokerResponses.set(id, { resolve, reject });
-    writeJsonl(process.stdout, {
-      type: "broker_tool_request",
-      id,
-      toolName,
-      args,
-    });
-  });
+function callBroker(toolName, args, signal) {
+  return brokerRequests.request(toolName, args, signal, (request) =>
+    writeJsonl(process.stdout, request),
+  );
 }
 
 const budgetExtension = {
@@ -66,8 +63,8 @@ const customTools = [
     parameters: Type.Object({
       content: Type.String({ minLength: 1, maxLength: 64 * 1024 }),
     }),
-    execute: async (_toolCallId, params) =>
-      await callBroker("buzz_reply", params),
+    execute: async (_toolCallId, params, signal) =>
+      await callBroker("buzz_reply", params, signal),
   }),
   defineTool({
     name: "kanban_tasks",
@@ -86,8 +83,8 @@ const customTools = [
       search: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
     }),
-    execute: async (_toolCallId, params) =>
-      await callBroker("kanban_tasks", params),
+    execute: async (_toolCallId, params, signal) =>
+      await callBroker("kanban_tasks", params, signal),
   }),
 ];
 const tools = [...builtInTools, ...customTools.map((tool) => tool.name)];
@@ -114,15 +111,66 @@ const ready = (async () => {
   });
   session = created.session;
   session.subscribe((event) => {
-    writeJsonl(process.stdout, event);
     if (event.type === "agent_start") streaming = true;
-    if (event.type === "agent_settled") streaming = false;
+    if (event.type === "agent_settled") {
+      streaming = false;
+      terminalPublication.endPrompt();
+      steeringDelivery.rejectAll((command) =>
+        response(
+          command,
+          false,
+          undefined,
+          "agent settled before steering was consumed",
+        ),
+      );
+    }
+    if (event.type === "queue_update") {
+      steeringDelivery.observeQueue(
+        event.steering,
+        (command) => response(command, true),
+        (command) =>
+          response(
+            command,
+            false,
+            undefined,
+            "Pi steering queue diverged before the message was consumed",
+          ),
+      );
+    }
     if (event.type === "turn_start" && budget.onTurnStart() === "abort") {
       void session.abort();
     }
+    writeJsonl(process.stdout, event);
     if (event.type === "turn_end") {
       const outcome = budget.onTurnEnd(event);
-      if (outcome.checkpoint) void session.steer(outcome.message);
+      if (outcome.checkpoint && terminalPublication.acceptsSteering()) {
+        const entry = steeringDelivery.enqueueInternal(outcome.message);
+        void session
+          .steer(outcome.message)
+          .catch(() => steeringDelivery.remove(entry));
+      }
+    }
+    const terminalSettlement = terminalPublication.settle(
+      event,
+      session,
+      () => {
+        steeringDelivery.rejectAll((command) =>
+          response(
+            command,
+            false,
+            undefined,
+            "terminal Buzz publication completed before steering was consumed",
+          ),
+        );
+        writeJsonl(process.stdout, { type: "terminal_publication" });
+      },
+    );
+    if (terminalSettlement) {
+      void terminalSettlement.catch(() => {
+        process.stderr.write(
+          "[pi-acp-sdk] terminal publication did not settle the session\n",
+        );
+      });
     }
   });
 })();
@@ -158,23 +206,55 @@ async function handle(command) {
           break;
         }
         budget.reset();
+        terminalPublication.beginPrompt();
         response(command, true);
         void session.prompt(command.message).catch((error) => {
           process.stderr.write(
             `[pi-acp-sdk] prompt failed: ${error.message}\n`,
           );
           streaming = false;
+          terminalPublication.endPrompt();
+          steeringDelivery.rejectAll((pending) =>
+            response(
+              pending,
+              false,
+              undefined,
+              "prompt failed before steering was consumed",
+            ),
+          );
           writeJsonl(process.stdout, {
             type: "prompt_failed",
             error: error.message,
           });
         });
         break;
-      case "steer":
-        await session.steer(command.message);
-        response(command, true);
+      case "steer": {
+        if (!terminalPublication.acceptsSteering()) {
+          response(
+            command,
+            false,
+            undefined,
+            "no active Pi prompt accepts steering",
+          );
+          break;
+        }
+        const entry = steeringDelivery.enqueue(command, command.message);
+        try {
+          await session.steer(command.message);
+        } catch (error) {
+          if (steeringDelivery.remove(entry)) throw error;
+        }
         break;
+      }
       case "abort":
+        steeringDelivery.rejectAll((pending) =>
+          response(
+            pending,
+            false,
+            undefined,
+            "agent aborted before steering was consumed",
+          ),
+        );
         await session.abort();
         response(command, true);
         break;
@@ -195,11 +275,7 @@ attachJsonlReader(
   process.stdin,
   (command) => {
     if (command?.type === "broker_tool_response") {
-      const pending = brokerResponses.get(command.id);
-      if (!pending) return;
-      brokerResponses.delete(command.id);
-      if (command.success) pending.resolve(command.result);
-      else pending.reject(new Error(command.error || "brokered tool failed"));
+      brokerRequests.respond(command);
       return;
     }
     void handle(command);
@@ -210,6 +286,15 @@ attachJsonlReader(
 async function shutdown() {
   if (disposed) return;
   disposed = true;
+  brokerRequests.rejectAll();
+  steeringDelivery.rejectAll((command) =>
+    response(
+      command,
+      false,
+      undefined,
+      "bridge closed before steering was consumed",
+    ),
+  );
   try {
     await ready;
     await session.abort();
