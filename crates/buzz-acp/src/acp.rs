@@ -2204,6 +2204,8 @@ pub struct BuzzPromptMetadata {
     pub triggering_event_ids: Vec<String>,
     pub allowed_reply_event_ids: Vec<String>,
     pub reply_to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_command: Option<String>,
 }
 
 fn build_prompt_params(
@@ -2775,10 +2777,12 @@ mod tests {
             triggering_event_ids: vec!["a".repeat(64), "b".repeat(64)],
             allowed_reply_event_ids: vec!["b".repeat(64)],
             reply_to: "b".repeat(64),
+            control_command: Some("-status".into()),
         };
         let params = build_prompt_params("session", &["hello"], Some(&metadata));
         assert_eq!(params["_meta"]["buzz"]["channelId"], metadata.channel_id);
         assert_eq!(params["_meta"]["buzz"]["replyTo"], metadata.reply_to);
+        assert_eq!(params["_meta"]["buzz"]["controlCommand"], "-status");
         assert_eq!(
             params["_meta"]["buzz"]["allowedReplyEventIds"],
             serde_json::json!(metadata.allowed_reply_event_ids)

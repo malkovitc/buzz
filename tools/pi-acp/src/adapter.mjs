@@ -16,6 +16,7 @@ const INVALID_PARAMS = -32602;
 const INTERNAL_ERROR = -32603;
 const MAX_SYSTEM_PROMPT_BYTES = 64 * 1024;
 const MAX_TOOL_OUTPUT_BYTES = 16 * 1024;
+const CLOUD_CONTROL_COMMANDS = new Set(["-status", "-cloud", "-local"]);
 
 function rpcResult(id, result) {
   return { jsonrpc: "2.0", id, result };
@@ -88,6 +89,7 @@ export class PiAcpAdapter {
       createBuzzTools({
         getContext: () => this.currentPrompt?.buzzContext,
         env: this.env,
+        includeCloudControl: true,
       }).map((tool) => [tool.name, tool]),
     );
   }
@@ -340,6 +342,76 @@ export class PiAcpAdapter {
     return session;
   }
 
+  async #runCloudControl(message, session, buzzContext, command) {
+    const abortController = new AbortController();
+    this.currentPrompt = {
+      acpId: message.id,
+      sessionId: session.id,
+      buzzContext,
+      cancelled: false,
+      controlOnly: true,
+      brokerAbortController: abortController,
+    };
+    try {
+      const controlTool = this.brokerTools.get("cloud_control");
+      const replyTool = this.brokerTools.get("buzz_reply");
+      if (!controlTool || !replyTool)
+        throw new Error("deterministic cloud control tools are unavailable");
+      const result = await controlTool.execute(
+        `cloud-control-${crypto.randomUUID()}`,
+        { command },
+        abortController.signal,
+      );
+      const content = result?.content?.[0]?.text;
+      if (typeof content !== "string" || content.trim().length === 0)
+        throw new Error("cloud control produced no status content");
+      await replyTool.execute(
+        `cloud-control-reply-${crypto.randomUUID()}`,
+        { content },
+        abortController.signal,
+      );
+      this.#send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: session.id,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: content },
+          },
+        },
+      });
+      this.#send(
+        rpcResult(message.id, {
+          stopReason: "end_turn",
+          _meta: { cloudControl: { command, deterministic: true } },
+        }),
+      );
+    } catch (error) {
+      if (
+        this.currentPrompt?.acpId === message.id &&
+        this.currentPrompt.cancelled
+      ) {
+        this.#send(
+          rpcResult(message.id, {
+            stopReason: "cancelled",
+            _meta: { cloudControl: { command, deterministic: true } },
+          }),
+        );
+      } else {
+        this.#send(
+          rpcError(
+            message.id,
+            INTERNAL_ERROR,
+            `deterministic cloud control failed: ${error.message}`,
+          ),
+        );
+      }
+    } finally {
+      if (this.currentPrompt?.acpId === message.id) this.currentPrompt = null;
+    }
+  }
+
   async #sessionPrompt(message) {
     const session = this.#sessionFor(
       message.params,
@@ -369,7 +441,9 @@ export class PiAcpAdapter {
       buzzContext !== null &&
       (typeof buzzContext.channelId !== "string" ||
         !Array.isArray(buzzContext.triggeringEventIds) ||
-        typeof buzzContext.replyTo !== "string")
+        typeof buzzContext.replyTo !== "string" ||
+        (buzzContext.controlCommand !== undefined &&
+          !CLOUD_CONTROL_COMMANDS.has(buzzContext.controlCommand)))
     ) {
       this.#send(
         rpcError(
@@ -377,6 +451,15 @@ export class PiAcpAdapter {
           INVALID_PARAMS,
           "session/prompt: malformed authenticated _meta.buzz routing context",
         ),
+      );
+      return;
+    }
+    if (buzzContext?.controlCommand) {
+      await this.#runCloudControl(
+        message,
+        session,
+        buzzContext,
+        buzzContext.controlCommand,
       );
       return;
     }
@@ -430,6 +513,7 @@ export class PiAcpAdapter {
       return;
     this.currentPrompt.cancelled = true;
     this.currentPrompt.brokerAbortController.abort();
+    if (this.currentPrompt.controlOnly) return;
     try {
       await this.#sendPiCommand("abort");
     } catch (error) {

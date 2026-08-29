@@ -22,6 +22,10 @@ The internal pilot supports macOS and Linux. Windows is rejected fail-closed and
   and fsynced reservation/receipt records, fail-closed crash/network ambiguity handling, and terminal
   settlement after a successful publication so provider continuation cannot hold the ACP turn open;
 - typed bounded `kanban_tasks` that cannot download the full board;
+- authenticated `-status`, `-cloud`, and `-local` fast path: `buzz-acp` marks only exact
+  owner-signed, agent-mentioned commands in `_meta.buzz`; the adapter invokes one fixed absolute
+  controller executable, publishes its bounded status through the durable reply broker, and never
+  starts a Pi `AgentSession`, model turn, or model-callable tool;
 - cumulative usage mapping, bounded tool output, and process-group cleanup.
 
 `buzz_reply` intentionally reserves before network access. If the process crashes or the network
@@ -46,7 +50,7 @@ From a reviewed exact Buzz commit:
 
 ```bash
 npm install --global ./tools/pi-acp
-pi-acp --version  # pi-acp 0.2.4 or newer
+pi-acp --version  # pi-acp 0.2.5 or newer
 ```
 
 The adapter uses Pi's existing provider authentication. Run Pi interactively once if the host has
@@ -58,7 +62,16 @@ PI_ACP_MAX_TURNS
 PI_ACP_MAX_TOOLS
 PI_ACP_MAX_PROCESSED_TOKENS
 PI_ACP_REQUIRE_POWER_LOSS_DURABILITY  # Linux-only strict receipt mode
+PI_ACP_CLOUD_CONTROL_COMMAND           # absolute trusted controller client path
+PI_ACP_CLOUD_CONTROL_TIMEOUT_MS        # 1000..900000; default 600000
 ```
+
+The cloud controller receives one JSON object on stdin and must return exactly
+`{"status":"ok|blocked","content":"..."}` on stdout. Its environment is reduced to basic
+process/user variables: Buzz and model secrets are not inherited. The controller must be
+idempotent by `triggeringEventIds`; a durable external daemon is required for transitions that
+stop the calling Desktop or container. Relative paths, extra response fields, oversized content,
+unknown commands, child failures, and malformed routing fail closed without an LLM fallback.
 
 The process accepts ACP JSON-RPC/NDJSON on stdin and writes only ACP frames to stdout. Diagnostics
 go to stderr. `PI_ACP_PI_COMMAND` and `PI_ACP_PI_ARGS_JSON` retain the non-shipping RPC subprocess

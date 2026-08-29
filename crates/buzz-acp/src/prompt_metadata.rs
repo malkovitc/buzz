@@ -1,7 +1,29 @@
 use crate::acp::BuzzPromptMetadata;
 use crate::queue::{
-    parse_thread_tags, resolve_reply_anchor, FlushBatch, PromptChannelInfo, PromptProfileLookup,
+    cloud_control_command_for_batch, parse_thread_tags, resolve_reply_anchor, FlushBatch,
+    PromptChannelInfo, PromptProfileLookup,
 };
+
+pub(crate) fn cloud_control_for_batch(
+    batch: &FlushBatch,
+    known_names: &[&str],
+    owner_pubkey: Option<&nostr::PublicKey>,
+    agent_pubkey: &nostr::PublicKey,
+) -> Option<String> {
+    let event = &batch.events.first()?.event;
+    let owner = owner_pubkey?;
+    let agent_hex = agent_pubkey.to_hex();
+    if event.kind.as_u16() != buzz_core::kind::KIND_STREAM_MESSAGE as u16
+        || event.pubkey != *owner
+        || !event.tags.iter().any(|tag| {
+            tag.as_slice().first().map(String::as_str) == Some("p")
+                && tag.as_slice().get(1).map(String::as_str) == Some(agent_hex.as_str())
+        })
+    {
+        return None;
+    }
+    cloud_control_command_for_batch(batch, known_names)
+}
 
 pub(crate) fn for_batch(
     batch: &FlushBatch,
@@ -36,6 +58,7 @@ pub(crate) fn for_batch(
         triggering_event_ids,
         allowed_reply_event_ids: vec![reply_to.clone()],
         reply_to,
+        control_command: None,
     })
 }
 
@@ -64,6 +87,55 @@ mod tests {
             cancelled_events: Vec::new(),
             cancel_reason: None,
         }
+    }
+
+    #[test]
+    fn cloud_control_requires_exact_owner_stream_event_and_real_agent_mention() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let mentioned = EventBuilder::new(Kind::Custom(9), "@Caliper -status")
+            .tags([Tag::public_key(agent.public_key())])
+            .sign_with_keys(&owner)
+            .unwrap();
+        let control_batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event: mentioned,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        assert_eq!(
+            cloud_control_for_batch(
+                &control_batch,
+                &["Caliper"],
+                Some(&owner.public_key()),
+                &agent.public_key(),
+            ),
+            Some("-status".into())
+        );
+        assert_eq!(
+            cloud_control_for_batch(
+                &control_batch,
+                &["Caliper"],
+                Some(&Keys::generate().public_key()),
+                &agent.public_key(),
+            ),
+            None,
+            "a non-owner event must never gain control semantics"
+        );
+        assert_eq!(
+            cloud_control_for_batch(
+                &control_batch,
+                &["Caliper"],
+                Some(&owner.public_key()),
+                &Keys::generate().public_key(),
+            ),
+            None,
+            "the event must mention this exact agent"
+        );
     }
 
     #[test]

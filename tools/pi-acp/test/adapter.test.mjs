@@ -12,6 +12,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const adapterPath = path.join(here, "../src/pi-acp-rpc.mjs");
 const fakePiPath = path.join(here, "fake-pi.mjs");
 const fakeBuzzPath = path.join(here, "fake-buzz.mjs");
+const fakeCloudControlPath = path.join(here, "fake-cloud-control.sh");
+const fakeSlowCloudControlPath = path.join(here, "fake-cloud-control-slow.sh");
 const buzzMeta = {
   buzz: {
     channelId: "4dcab690-a2ca-4a56-9e5d-d901d12f83c3",
@@ -30,7 +32,7 @@ test("version output does not load the adapter dependency graph", async (t) => {
   fs.copyFileSync(adapterPath, isolatedEntrypoint);
   fs.writeFileSync(
     path.join(root, "package.json"),
-    JSON.stringify({ type: "module", version: "0.2.4" }),
+    JSON.stringify({ type: "module", version: "0.2.5" }),
   );
   const child = spawn(process.execPath, [isolatedEntrypoint, "--version"], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -41,11 +43,12 @@ test("version output does not load the adapter dependency graph", async (t) => {
   child.stderr.on("data", (chunk) => (stderr += chunk));
   const [code] = await once(child, "close");
   assert.equal(code, 0, stderr);
-  assert.equal(stdout, "pi-acp 0.2.4\n");
+  assert.equal(stdout, "pi-acp 0.2.5\n");
 });
 
 function startHarness(mode = "complete") {
   const receiptDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-acp-test-"));
+  const piStartedFile = path.join(receiptDir, "pi-started");
   const child = spawn(process.execPath, [adapterPath], {
     cwd: here,
     env: {
@@ -55,7 +58,12 @@ function startHarness(mode = "complete") {
       FAKE_PI_MODE: mode,
       PI_ACP_BUZZ_COMMAND: fakeBuzzPath,
       PI_ACP_KANBAN_COMMAND: fakeBuzzPath,
+      PI_ACP_CLOUD_CONTROL_COMMAND:
+        mode === "control-cancel"
+          ? fakeSlowCloudControlPath
+          : fakeCloudControlPath,
       PI_ACP_RECEIPT_DIR: receiptDir,
+      FAKE_PI_STARTED_FILE: piStartedFile,
       BUZZ_PRIVATE_KEY: "1".repeat(64),
       FAKE_BUZZ_DELAY_MS: mode === "broker-cancel" ? "2000" : "0",
       FAKE_KANBAN_DELAY_MS: mode === "terminal-publication" ? "2000" : "0",
@@ -88,6 +96,7 @@ function startHarness(mode = "complete") {
   return {
     child,
     messages,
+    piStartedFile,
     send(message) {
       writeJsonl(child.stdin, message);
     },
@@ -131,7 +140,7 @@ async function handshake(harness) {
   assert.equal(initialized.result._meta.steering.supported, true);
   assert.equal(initialized.result._meta.pilot.liveCanaryValidated, true);
   assert.equal(initialized.result._meta.pilot.fleetApproved, false);
-  assert.equal(initialized.result.agentInfo.version, "0.2.4");
+  assert.equal(initialized.result.agentInfo.version, "0.2.5");
 
   harness.send({
     jsonrpc: "2.0",
@@ -190,6 +199,98 @@ test("maps ACP prompt to Pi text, tool, usage, and completion events", async (t)
   assert.equal(usage.params.update.accumulatedCacheWriteTokens, 5);
   assert.equal(usage.params.update.accumulatedTotalTokens, 205);
   assert.equal(usage.params.update.model, "fake/test-model");
+});
+
+test("handles authenticated cloud control without spawning Pi or emitting model usage", async (t) => {
+  const harness = startHarness();
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+
+  harness.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [
+        { type: "text", text: "wrapped Buzz prompt must not reach a model" },
+      ],
+      _meta: {
+        buzz: { ...buzzMeta.buzz, controlCommand: "-status" },
+      },
+    },
+  });
+  const completed = await harness.waitFor((message) => message.id === 3);
+  assert.equal(completed.result.stopReason, "end_turn");
+  assert.deepEqual(completed.result._meta.cloudControl, {
+    command: "-status",
+    deterministic: true,
+  });
+  assert.equal(fs.existsSync(harness.piStartedFile), false);
+  assert.equal(
+    harness.messages.some(
+      (message) => message.params?.update?.sessionUpdate === "usage_update",
+    ),
+    false,
+  );
+  assert.equal(
+    harness.messages.some(
+      (message) => message.params?.update?.sessionUpdate === "tool_call",
+    ),
+    false,
+  );
+  assert.ok(
+    harness.messages.some(
+      (message) =>
+        message.params?.update?.content?.text ===
+        `STATUS_LOCAL branch=cloud/handoff-test head=${"a".repeat(40)}`,
+    ),
+  );
+});
+
+test("cancels deterministic cloud control with a normal cancelled prompt result", async (t) => {
+  const harness = startHarness("control-cancel");
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+  harness.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "-cloud" }],
+      _meta: { buzz: { ...buzzMeta.buzz, controlCommand: "-cloud" } },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  harness.send({
+    jsonrpc: "2.0",
+    method: "session/cancel",
+    params: { sessionId },
+  });
+  const completed = await harness.waitFor((message) => message.id === 3);
+  assert.equal(completed.result.stopReason, "cancelled");
+  assert.equal(completed.error, undefined);
+  assert.equal(fs.existsSync(harness.piStartedFile), false);
+});
+
+test("rejects unknown authenticated control metadata without an LLM fallback", async (t) => {
+  const harness = startHarness();
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+  harness.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "-destroy" }],
+      _meta: { buzz: { ...buzzMeta.buzz, controlCommand: "-destroy" } },
+    },
+  });
+  const rejected = await harness.waitFor((message) => message.id === 3);
+  assert.equal(rejected.error.code, -32602);
+  assert.equal(fs.existsSync(harness.piStartedFile), false);
 });
 
 test("steers an active Pi prompt without starting a second ACP prompt", async (t) => {

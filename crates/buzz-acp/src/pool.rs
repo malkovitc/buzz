@@ -2464,6 +2464,14 @@ pub async fn run_prompt_task(
             .flatten()
             .collect();
         slash_command = crate::queue::slash_command_for_batch(b, &known_names);
+        if let Some(metadata) = buzz_prompt_metadata.as_mut() {
+            metadata.control_command = crate::prompt_metadata::cloud_control_for_batch(
+                b,
+                &known_names,
+                ctx.agent_owner_pubkey.as_ref(),
+                &ctx.agent_keys.public_key(),
+            );
+        }
         if let Some(ref cmd) = slash_command {
             tracing::info!(
                 target: "pool::prompt",

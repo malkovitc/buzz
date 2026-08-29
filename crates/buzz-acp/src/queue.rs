@@ -920,7 +920,7 @@ pub fn parse_thread_tags(event: &Event) -> ThreadTags {
 /// Returns `Some("/goal ship it")` when the first non-mention token starts
 /// with `/` followed by an ASCII alphanumeric; `None` otherwise. A `/`
 /// appearing later in the text (e.g. `"@Eva see /tmp/foo"`) never matches.
-pub fn extract_slash_command(content: &str, known_names: &[&str]) -> Option<String> {
+fn strip_leading_mentions<'a>(content: &'a str, known_names: &[&str]) -> Option<&'a str> {
     // Longest-first so "Dawn Smith" wins over "Dawn".
     let mut names: Vec<&str> = known_names
         .iter()
@@ -968,10 +968,32 @@ pub fn extract_slash_command(content: &str, known_names: &[&str]) -> Option<Stri
             break;
         }
     }
+    Some(rest)
+}
 
+pub fn extract_slash_command(content: &str, known_names: &[&str]) -> Option<String> {
+    let rest = strip_leading_mentions(content, known_names)?;
     let mut chars = rest.chars();
     (chars.next() == Some('/') && chars.next().is_some_and(|c| c.is_ascii_alphanumeric()))
         .then(|| rest.to_string())
+}
+
+/// Extract one exact cloud ownership command after leading presentation mentions.
+///
+/// The real `p`-tag and owner signature are validated by the caller. This parser
+/// deliberately accepts no arguments or natural-language variants: unknown text
+/// must remain an ordinary agent prompt rather than gaining control semantics.
+pub fn extract_cloud_control_command(content: &str, known_names: &[&str]) -> Option<String> {
+    let command = strip_leading_mentions(content, known_names)?.trim();
+    matches!(command, "-status" | "-cloud" | "-local").then(|| command.to_string())
+}
+
+/// Return the cloud control command for a single, non-cancelled batch.
+pub fn cloud_control_command_for_batch(batch: &FlushBatch, known_names: &[&str]) -> Option<String> {
+    if batch.events.len() != 1 || !batch.cancelled_events.is_empty() {
+        return None;
+    }
+    extract_cloud_control_command(&batch.events[0].event.content, known_names)
 }
 
 /// Return the slash command for a batch, if it qualifies for pass-through.
@@ -4643,6 +4665,52 @@ mod tests {
         assert_eq!(extract_slash_command("@ /goal", &[]), None);
         // Email-like text shouldn't strip.
         assert_eq!(extract_slash_command("user@host.com /x", &[]), None);
+    }
+
+    #[test]
+    fn test_extract_cloud_control_command_is_exact_and_mention_aware() {
+        for command in ["-status", "-cloud", "-local"] {
+            assert_eq!(
+                extract_cloud_control_command(command, &[]),
+                Some(command.to_string())
+            );
+            assert_eq!(
+                extract_cloud_control_command(
+                    &format!("@Caliper — AI Quality Engineer {command}"),
+                    &["Caliper — AI Quality Engineer"],
+                ),
+                Some(command.to_string())
+            );
+        }
+        assert_eq!(extract_cloud_control_command("-cloud check", &[]), None);
+        assert_eq!(extract_cloud_control_command("please -cloud", &[]), None);
+        assert_eq!(extract_cloud_control_command("-CLOUD", &[]), None);
+        assert_eq!(
+            extract_cloud_control_command("@Caliper -cloud", &["Other"]),
+            Some("-cloud".into())
+        );
+    }
+
+    #[test]
+    fn test_cloud_control_command_for_batch_gating() {
+        assert_eq!(
+            cloud_control_command_for_batch(&make_single_batch("@Caliper -status"), &[]),
+            Some("-status".to_string())
+        );
+        let mut multi = make_single_batch("-status");
+        multi.events.push(BatchEvent {
+            event: make_event("another message"),
+            prompt_tag: "test".into(),
+            received_at: Instant::now(),
+        });
+        assert_eq!(cloud_control_command_for_batch(&multi, &[]), None);
+        let mut cancelled = make_single_batch("-local");
+        cancelled.cancelled_events.push(BatchEvent {
+            event: make_event("interrupted"),
+            prompt_tag: "test".into(),
+            received_at: Instant::now(),
+        });
+        assert_eq!(cloud_control_command_for_batch(&cancelled, &[]), None);
     }
 
     #[test]

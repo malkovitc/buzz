@@ -11,6 +11,8 @@ const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_CONTENT_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 64 * 1024;
+const MAX_CONTROL_CONTENT_BYTES = 8 * 1024;
+const CLOUD_CONTROL_COMMANDS = new Set(["-status", "-cloud", "-local"]);
 
 function validateContext(context) {
   if (!context || !UUID.test(context.channelId || "")) {
@@ -38,6 +40,46 @@ function validateContext(context) {
 
 function toolText(text, details = {}) {
   return { content: [{ type: "text", text }], details };
+}
+
+function cloudControlEnvironment(env) {
+  return {
+    PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    ...Object.fromEntries(
+      ["HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL"]
+        .filter((name) => typeof env[name] === "string")
+        .map((name) => [name, env[name]]),
+    ),
+  };
+}
+
+function cloudControlTimeout(env) {
+  const value = Number.parseInt(env.PI_ACP_CLOUD_CONTROL_TIMEOUT_MS || "", 10);
+  return Number.isSafeInteger(value) && value >= 1_000 && value <= 900_000
+    ? value
+    : 600_000;
+}
+
+function parseCloudControlResponse(stdout) {
+  let response;
+  try {
+    response = JSON.parse(stdout);
+  } catch {
+    throw new Error("cloud control returned non-JSON output");
+  }
+  if (
+    !response ||
+    typeof response !== "object" ||
+    Array.isArray(response) ||
+    !["ok", "blocked"].includes(response.status) ||
+    typeof response.content !== "string" ||
+    response.content.trim().length === 0 ||
+    Buffer.byteLength(response.content, "utf8") > MAX_CONTROL_CONTENT_BYTES ||
+    Object.keys(response).some((key) => !["status", "content"].includes(key))
+  ) {
+    throw new Error("cloud control response violates the strict contract");
+  }
+  return response;
 }
 
 async function run(
@@ -325,6 +367,7 @@ export function createBuzzTools({
   runCommand = run,
   fileSystem = fs,
   platform = process.platform,
+  includeCloudControl = false,
 } = {}) {
   const buzzReply = defineTool({
     name: "buzz_reply",
@@ -419,6 +462,60 @@ export function createBuzzTools({
     },
   });
 
+  const cloudControl = defineTool({
+    name: "cloud_control",
+    label: "Run deterministic cloud ownership command",
+    description:
+      "Execute one authenticated, exact cloud ownership command without an LLM.",
+    parameters: Type.Object({
+      command: Type.Union([
+        Type.Literal("-status"),
+        Type.Literal("-cloud"),
+        Type.Literal("-local"),
+      ]),
+    }),
+    execute: async (_toolCallId, params, signal) => {
+      if (!CLOUD_CONTROL_COMMANDS.has(params.command)) {
+        throw new Error("unsupported cloud control command");
+      }
+      const context = validateContext(getContext?.());
+      const command = env.PI_ACP_CLOUD_CONTROL_COMMAND;
+      if (typeof command !== "string" || !path.isAbsolute(command)) {
+        throw new Error(
+          "PI_ACP_CLOUD_CONTROL_COMMAND must be an absolute executable path",
+        );
+      }
+      const input = `${JSON.stringify({
+        schemaVersion: 1,
+        command: params.command,
+        channelId: context.channelId,
+        replyTo: context.replyTo,
+        triggeringEventIds: context.triggeringEventIds,
+      })}\n`;
+      let result;
+      try {
+        result = await runCommand(command, [], {
+          input,
+          signal,
+          env: cloudControlEnvironment(env),
+          timeoutMs: cloudControlTimeout(env),
+        });
+      } catch (error) {
+        const failure = new Error("cloud control command failed");
+        if (error.code === "PI_ACP_SAFE_UNSTARTED")
+          failure.code = "PI_ACP_SAFE_UNSTARTED";
+        throw failure;
+      }
+      if (result.code !== 0) throw new Error("cloud control command failed");
+      const response = parseCloudControlResponse(result.stdout);
+      return toolText(response.content, {
+        command: params.command,
+        status: response.status,
+        deterministic: true,
+      });
+    },
+  });
+
   const kanbanTasks = defineTool({
     name: "kanban_tasks",
     label: "Read compact Kanban tasks",
@@ -455,7 +552,11 @@ export function createBuzzTools({
     },
   });
 
-  return [buzzReply, kanbanTasks];
+  return [
+    buzzReply,
+    ...(includeCloudControl ? [cloudControl] : []),
+    kanbanTasks,
+  ];
 }
 
 export const testOnly = {
@@ -466,4 +567,7 @@ export const testOnly = {
   ensureDirectoryDurable,
   syncRecordDurable,
   writeJsonAtomicDurable,
+  cloudControlEnvironment,
+  cloudControlTimeout,
+  parseCloudControlResponse,
 };
