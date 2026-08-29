@@ -14,6 +14,7 @@ const fakePiPath = path.join(here, "fake-pi.mjs");
 const fakeBuzzPath = path.join(here, "fake-buzz.mjs");
 const fakeCloudControlPath = path.join(here, "fake-cloud-control.sh");
 const fakeSlowCloudControlPath = path.join(here, "fake-cloud-control-slow.sh");
+const fakeSlowCommitPath = path.join(here, "fake-cloud-control-slow-commit.sh");
 const buzzMeta = {
   buzz: {
     channelId: "4dcab690-a2ca-4a56-9e5d-d901d12f83c3",
@@ -61,10 +62,13 @@ function startHarness(mode = "complete") {
       PI_ACP_CLOUD_CONTROL_COMMAND:
         mode === "control-cancel"
           ? fakeSlowCloudControlPath
-          : fakeCloudControlPath,
+          : mode === "control-commit-cancel"
+            ? fakeSlowCommitPath
+            : fakeCloudControlPath,
       PI_ACP_RECEIPT_DIR: receiptDir,
       FAKE_PI_STARTED_FILE: piStartedFile,
       BUZZ_PRIVATE_KEY: "1".repeat(64),
+      BUZZ_RELAY_URL: "wss://relay.example",
       FAKE_BUZZ_DELAY_MS: mode === "broker-cancel" ? "2000" : "0",
       FAKE_KANBAN_DELAY_MS: mode === "terminal-publication" ? "2000" : "0",
     },
@@ -97,6 +101,7 @@ function startHarness(mode = "complete") {
     child,
     messages,
     piStartedFile,
+    receiptDir,
     send(message) {
       writeJsonl(child.stdin, message);
     },
@@ -140,7 +145,7 @@ async function handshake(harness) {
   assert.equal(initialized.result._meta.steering.supported, true);
   assert.equal(initialized.result._meta.pilot.liveCanaryValidated, true);
   assert.equal(initialized.result._meta.pilot.fleetApproved, false);
-  assert.equal(initialized.result.agentInfo.version, "0.2.5");
+  assert.equal(initialized.result.agentInfo.version, "0.2.6");
 
   harness.send({
     jsonrpc: "2.0",
@@ -271,6 +276,40 @@ test("cancels deterministic cloud control with a normal cancelled prompt result"
   const completed = await harness.waitFor((message) => message.id === 3);
   assert.equal(completed.result.stopReason, "cancelled");
   assert.equal(completed.error, undefined);
+  assert.equal(fs.existsSync(harness.piStartedFile), false);
+});
+
+test("ignores late cancellation after the durable control reply boundary", async (t) => {
+  const harness = startHarness("control-commit-cancel");
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+  harness.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "-cloud" }],
+      _meta: { buzz: { ...buzzMeta.buzz, controlCommand: "-cloud" } },
+    },
+  });
+  const deadline = Date.now() + 10_000;
+  while (
+    !fs
+      .readdirSync(harness.receiptDir, { recursive: true })
+      .some((entry) => entry.endsWith("receipt.json"))
+  ) {
+    if (Date.now() >= deadline)
+      assert.fail("durable control receipt was not written");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  harness.send({
+    jsonrpc: "2.0",
+    method: "session/cancel",
+    params: { sessionId },
+  });
+  const completed = await harness.waitFor((message) => message.id === 3);
+  assert.equal(completed.result.stopReason, "end_turn");
   assert.equal(fs.existsSync(harness.piStartedFile), false);
 });
 

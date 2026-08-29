@@ -50,7 +50,7 @@ From a reviewed exact Buzz commit:
 
 ```bash
 npm install --global ./tools/pi-acp
-pi-acp --version  # pi-acp 0.2.5 or newer
+pi-acp --version  # pi-acp 0.2.6 or newer
 ```
 
 The adapter uses Pi's existing provider authentication. Run Pi interactively once if the host has
@@ -66,12 +66,27 @@ PI_ACP_CLOUD_CONTROL_COMMAND           # absolute trusted controller client path
 PI_ACP_CLOUD_CONTROL_TIMEOUT_MS        # 1000..900000; default 600000
 ```
 
-The cloud controller receives one JSON object on stdin and must return exactly
-`{"status":"ok|blocked","content":"..."}` on stdout. Its environment is reduced to basic
-process/user variables: Buzz and model secrets are not inherited. The controller must be
-idempotent by `triggeringEventIds`; a durable external daemon is required for transitions that
-stop the calling Desktop or container. Relative paths, extra response fields, oversized content,
-unknown commands, child failures, and malformed routing fail closed without an LLM fallback.
+The cloud controller receives a strict JSON object on stdin. A `prepare` request returns
+`{"status":"ok|noop|blocked","content":"...","operationId":"..."}`; `operationId` is required
+only for `ok`. Pi publishes `content` through durable `buzz_reply`, then sends a `commit` request
+bound to the operation and signed receipt event. The bundled `pi-cloud-control` executable writes
+that commit atomically for a model-free host supervisor. The local supervisor also reconstructs a
+missing commit from the signed receipt, so a shutdown immediately after publication cannot lose
+the accepted operation. Effects therefore begin only after the Buzz receipt boundary.
+
+The controller environment is reduced to basic process/user variables: Buzz and model secrets are
+not inherited. After buzz-acp validates the signed owner command and real Caliper `p`-tag, pi-acp embeds a
+receipt-bound HMAC capability that never enters the controller environment. The host supervisor
+verifies that capability with its host-mounted Caliper key, then correlates the exact relay
+community, approved channel, owner/agent pubkeys, receipt route, owner generation, and expiry
+before invoking a fixed handoff
+action. The normalized Buzz read API is not treated as independent signature evidence. Relative paths, extra fields, stale generations, forged events, oversized
+content, unknown commands, child failures, and malformed routing fail closed without an LLM
+fallback. `pi-cloud-control supervise-once` is designed for launchd/systemd scheduling; its
+location-specific mode-600 config and signing credentials remain host-mounted and out of Git.
+Supervisor claims serialize overlapping polls; configured handoff actions must remain idempotent by
+`operationId` and owner generation so a stale crash claim can safely reconcile against authoritative
+handoff state.
 
 The process accepts ACP JSON-RPC/NDJSON on stdin and writes only ACP frames to stdout. Diagnostics
 go to stderr. `PI_ACP_PI_COMMAND` and `PI_ACP_PI_ARGS_JSON` retain the non-shipping RPC subprocess
