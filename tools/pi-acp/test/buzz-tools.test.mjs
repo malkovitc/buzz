@@ -23,6 +23,7 @@ async function fixture(t, runCommand, options = {}) {
     PI_ACP_BUZZ_COMMAND: "/test/buzz",
     PI_ACP_KANBAN_COMMAND: "/test/kanban-ai",
     PI_ACP_CLOUD_CONTROL_COMMAND: "/test/cloud-control",
+    PI_CLOUD_CONTROL_CONFIG: "/test/cloud-control-config.json",
     ...(options.env ?? {}),
   };
   const tools = createBuzzTools({
@@ -536,11 +537,21 @@ test("cloud_control is absent from the default model-visible tool registry", () 
 
 test("cloud_control sends a strict authenticated request without secret environment", async (t) => {
   const calls = [];
+  const operationId = "11111111-1111-4111-8111-111111111111";
+  const receiptEventId = "f".repeat(64);
+  const authorization = "e".repeat(64);
+  const receiptContentSha256 = "d".repeat(64);
   const f = await fixture(t, async (command, args, options) => {
     calls.push({ command, args, options });
     return {
       code: 0,
-      stdout: JSON.stringify({ status: "ok", content: "CLOUD_ACTIVE" }),
+      stdout: JSON.stringify({
+        status: "ok",
+        content: options.input.includes('"phase":"commit"')
+          ? "COMMIT_QUEUED"
+          : "CLOUD_ACTIVE",
+        operationId,
+      }),
       stderr: "",
     };
   });
@@ -548,7 +559,9 @@ test("cloud_control sends a strict authenticated request without secret environm
   assert.equal(result.content[0].text, "CLOUD_ACTIVE");
   assert.deepEqual(result.details, {
     command: "-status",
+    phase: "prepare",
     status: "ok",
+    operationId,
     deterministic: true,
   });
   assert.equal(calls.length, 1);
@@ -556,12 +569,39 @@ test("cloud_control sends a strict authenticated request without secret environm
   assert.deepEqual(calls[0].args, []);
   assert.equal(calls[0].options.env.BUZZ_PRIVATE_KEY, undefined);
   assert.equal(calls[0].options.env.ANTHROPIC_API_KEY, undefined);
+  assert.equal(
+    calls[0].options.env.PI_CLOUD_CONTROL_CONFIG,
+    "/test/cloud-control-config.json",
+  );
   assert.deepEqual(JSON.parse(calls[0].options.input), {
     schemaVersion: 1,
+    phase: "prepare",
     command: "-status",
     channelId: context.channelId,
     replyTo: context.replyTo,
     triggeringEventIds: context.triggeringEventIds,
+  });
+
+  await f.control.execute("control-commit", {
+    command: "-status",
+    phase: "commit",
+    operationId,
+    receiptEventId,
+    authorization,
+    receiptContentSha256,
+  });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(JSON.parse(calls[1].options.input), {
+    schemaVersion: 1,
+    phase: "commit",
+    command: "-status",
+    channelId: context.channelId,
+    replyTo: context.replyTo,
+    triggeringEventIds: context.triggeringEventIds,
+    operationId,
+    receiptEventId,
+    authorization,
+    receiptContentSha256,
   });
 });
 
@@ -586,6 +626,15 @@ test("cloud_control rejects unsupported commands, paths, output, and child error
   await assert.rejects(
     f.control.execute("control-2", { command: "-destroy" }),
     /unsupported cloud control command/,
+  );
+  await assert.rejects(
+    f.control.execute("control-commit", {
+      command: "-local",
+      phase: "commit",
+      operationId: "invalid",
+      receiptEventId: "f".repeat(64),
+    }),
+    /commit binding is invalid/,
   );
   assert.equal(calls, 0);
 

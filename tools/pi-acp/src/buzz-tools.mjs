@@ -13,6 +13,7 @@ const MAX_CONTENT_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_CONTROL_CONTENT_BYTES = 8 * 1024;
 const CLOUD_CONTROL_COMMANDS = new Set(["-status", "-cloud", "-local"]);
+const CLOUD_CONTROL_PHASES = new Set(["prepare", "commit"]);
 
 function validateContext(context) {
   if (!context || !UUID.test(context.channelId || "")) {
@@ -46,7 +47,15 @@ function cloudControlEnvironment(env) {
   return {
     PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
     ...Object.fromEntries(
-      ["HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL"]
+      [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "PI_CLOUD_CONTROL_CONFIG",
+      ]
         .filter((name) => typeof env[name] === "string")
         .map((name) => [name, env[name]]),
     ),
@@ -71,11 +80,15 @@ function parseCloudControlResponse(stdout) {
     !response ||
     typeof response !== "object" ||
     Array.isArray(response) ||
-    !["ok", "blocked"].includes(response.status) ||
+    !["ok", "blocked", "noop"].includes(response.status) ||
     typeof response.content !== "string" ||
     response.content.trim().length === 0 ||
     Buffer.byteLength(response.content, "utf8") > MAX_CONTROL_CONTENT_BYTES ||
-    Object.keys(response).some((key) => !["status", "content"].includes(key))
+    Object.keys(response).some(
+      (key) => !["status", "content", "operationId"].includes(key),
+    ) ||
+    (response.operationId !== undefined && !UUID.test(response.operationId)) ||
+    (response.status === "ok" && !UUID.test(response.operationId || ""))
   ) {
     throw new Error("cloud control response violates the strict contract");
   }
@@ -473,10 +486,30 @@ export function createBuzzTools({
         Type.Literal("-cloud"),
         Type.Literal("-local"),
       ]),
+      phase: Type.Optional(
+        Type.Union([Type.Literal("prepare"), Type.Literal("commit")]),
+      ),
+      operationId: Type.Optional(Type.String()),
+      receiptEventId: Type.Optional(Type.String()),
+      authorization: Type.Optional(Type.String()),
+      receiptContentSha256: Type.Optional(Type.String()),
     }),
     execute: async (_toolCallId, params, signal) => {
       if (!CLOUD_CONTROL_COMMANDS.has(params.command)) {
         throw new Error("unsupported cloud control command");
+      }
+      const phase = params.phase || "prepare";
+      if (!CLOUD_CONTROL_PHASES.has(phase)) {
+        throw new Error("unsupported cloud control phase");
+      }
+      if (
+        phase === "commit" &&
+        (!UUID.test(params.operationId || "") ||
+          !HEX_EVENT.test(params.receiptEventId || "") ||
+          !HEX_EVENT.test(params.authorization || "") ||
+          !HEX_EVENT.test(params.receiptContentSha256 || ""))
+      ) {
+        throw new Error("cloud control commit binding is invalid");
       }
       const context = validateContext(getContext?.());
       const command = env.PI_ACP_CLOUD_CONTROL_COMMAND;
@@ -487,10 +520,19 @@ export function createBuzzTools({
       }
       const input = `${JSON.stringify({
         schemaVersion: 1,
+        phase,
         command: params.command,
         channelId: context.channelId,
         replyTo: context.replyTo,
         triggeringEventIds: context.triggeringEventIds,
+        ...(phase === "commit"
+          ? {
+              operationId: params.operationId,
+              receiptEventId: params.receiptEventId,
+              authorization: params.authorization,
+              receiptContentSha256: params.receiptContentSha256,
+            }
+          : {}),
       })}\n`;
       let result;
       try {
@@ -510,7 +552,9 @@ export function createBuzzTools({
       const response = parseCloudControlResponse(result.stdout);
       return toolText(response.content, {
         command: params.command,
+        phase,
         status: response.status,
+        operationId: response.operationId,
         deterministic: true,
       });
     },

@@ -18,6 +18,22 @@ const MAX_SYSTEM_PROMPT_BYTES = 64 * 1024;
 const MAX_TOOL_OUTPUT_BYTES = 16 * 1024;
 const CLOUD_CONTROL_COMMANDS = new Set(["-status", "-cloud", "-local"]);
 
+function canonicalRelayUrl(value) {
+  const relay = new URL(value);
+  if (
+    !["wss:", "https:"].includes(relay.protocol) ||
+    relay.username ||
+    relay.password
+  ) {
+    throw new Error("cloud control relay URL is invalid");
+  }
+  if (relay.protocol === "https:") relay.protocol = "wss:";
+  relay.hash = "";
+  relay.search = "";
+  relay.pathname = "/";
+  return relay.toString().replace(/\/$/, "");
+}
+
 function rpcResult(id, result) {
   return { jsonrpc: "2.0", id, result };
 }
@@ -85,6 +101,7 @@ export class PiAcpAdapter {
     this.piResponses = new Map();
     this.currentPrompt = null;
     this.shuttingDown = false;
+    this.backgroundControlCommits = new Set();
     this.brokerTools = new Map(
       createBuzzTools({
         getContext: () => this.currentPrompt?.buzzContext,
@@ -107,6 +124,8 @@ export class PiAcpAdapter {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.currentPrompt?.brokerAbortController.abort();
+    for (const controller of this.backgroundControlCommits) controller.abort();
+    this.backgroundControlCommits.clear();
     this.#stopPi();
   }
 
@@ -350,6 +369,7 @@ export class PiAcpAdapter {
       buzzContext,
       cancelled: false,
       controlOnly: true,
+      terminalPublished: false,
       brokerAbortController: abortController,
     };
     try {
@@ -359,17 +379,62 @@ export class PiAcpAdapter {
         throw new Error("deterministic cloud control tools are unavailable");
       const result = await controlTool.execute(
         `cloud-control-${crypto.randomUUID()}`,
-        { command },
+        { command, phase: "prepare" },
         abortController.signal,
       );
-      const content = result?.content?.[0]?.text;
+      let content = result?.content?.[0]?.text;
+      const operationId = result?.details?.operationId;
+      const controlStatus = result?.details?.status;
       if (typeof content !== "string" || content.trim().length === 0)
         throw new Error("cloud control produced no status content");
-      await replyTool.execute(
+      let authorization;
+      let receiptContentSha256;
+      if (
+        controlStatus === "ok" &&
+        (typeof operationId !== "string" ||
+          typeof this.env.BUZZ_PRIVATE_KEY !== "string" ||
+          this.env.BUZZ_PRIVATE_KEY.length === 0 ||
+          typeof this.env.BUZZ_RELAY_URL !== "string" ||
+          this.env.BUZZ_RELAY_URL.length === 0)
+      ) {
+        throw new Error("cloud control authorization binding is unavailable");
+      }
+      if (controlStatus === "ok") {
+        const baseContentSha256 = crypto
+          .createHash("sha256")
+          .update(content)
+          .digest("hex");
+        authorization = crypto
+          .createHmac("sha256", this.env.BUZZ_PRIVATE_KEY || "")
+          .update(
+            JSON.stringify({
+              schemaVersion: 1,
+              relayUrl: canonicalRelayUrl(this.env.BUZZ_RELAY_URL),
+              command,
+              channelId: buzzContext.channelId,
+              replyTo: buzzContext.replyTo,
+              triggeringEventIds: buzzContext.triggeringEventIds,
+              operationId,
+              baseContentSha256,
+            }),
+          )
+          .digest("hex");
+        content = `${content}\nauthorization=${authorization}`;
+        receiptContentSha256 = crypto
+          .createHash("sha256")
+          .update(content)
+          .digest("hex");
+      }
+      const replyResult = await replyTool.execute(
         `cloud-control-reply-${crypto.randomUUID()}`,
         { content },
         abortController.signal,
       );
+      const receiptEventId = replyResult?.details?.receipt?.event_id;
+      this.currentPrompt.terminalPublished = true;
+      if (controlStatus === "ok" && typeof receiptEventId !== "string") {
+        throw new Error("cloud control commit binding is unavailable");
+      }
       this.#send({
         jsonrpc: "2.0",
         method: "session/update",
@@ -387,6 +452,31 @@ export class PiAcpAdapter {
           _meta: { cloudControl: { command, deterministic: true } },
         }),
       );
+      if (controlStatus === "ok") {
+        const commitController = new AbortController();
+        this.backgroundControlCommits.add(commitController);
+        void controlTool
+          .execute(
+            `cloud-control-commit-${crypto.randomUUID()}`,
+            {
+              command,
+              phase: "commit",
+              operationId,
+              receiptEventId,
+              authorization,
+              receiptContentSha256,
+            },
+            commitController.signal,
+          )
+          .catch(() =>
+            this.#log(
+              "post-publication control commit deferred to receipt recovery",
+            ),
+          )
+          .finally(() =>
+            this.backgroundControlCommits.delete(commitController),
+          );
+      }
     } catch (error) {
       if (
         this.currentPrompt?.acpId === message.id &&
@@ -508,7 +598,8 @@ export class PiAcpAdapter {
   async #sessionCancel(params) {
     if (
       !this.sessions.has(params?.sessionId) ||
-      this.currentPrompt?.sessionId !== params?.sessionId
+      this.currentPrompt?.sessionId !== params?.sessionId ||
+      this.currentPrompt.terminalPublished
     )
       return;
     this.currentPrompt.cancelled = true;
