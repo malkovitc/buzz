@@ -22,12 +22,14 @@ async function fixture(t, runCommand, options = {}) {
     PI_ACP_RECEIPT_DIR: receiptDir,
     PI_ACP_BUZZ_COMMAND: "/test/buzz",
     PI_ACP_KANBAN_COMMAND: "/test/kanban-ai",
+    PI_ACP_CLOUD_CONTROL_COMMAND: "/test/cloud-control",
     ...(options.env ?? {}),
   };
   const tools = createBuzzTools({
     getContext: () => context,
     env,
     runCommand,
+    includeCloudControl: true,
     ...(options.fileSystem ? { fileSystem: options.fileSystem } : {}),
     ...(options.platform ? { platform: options.platform } : {}),
   });
@@ -35,6 +37,7 @@ async function fixture(t, runCommand, options = {}) {
     env,
     receiptDir,
     reply: tools.find((tool) => tool.name === "buzz_reply"),
+    control: tools.find((tool) => tool.name === "cloud_control"),
     kanban: tools.find((tool) => tool.name === "kanban_tasks"),
   };
 }
@@ -522,6 +525,102 @@ test("an exited wrapper cannot leave a background publisher alive", {
   ]);
   await new Promise((resolve) => setTimeout(resolve, 650));
   await assert.rejects(fs.access(marker));
+});
+
+test("cloud_control is absent from the default model-visible tool registry", () => {
+  const names = createBuzzTools({ getContext: () => context }).map(
+    (tool) => tool.name,
+  );
+  assert.deepEqual(names, ["buzz_reply", "kanban_tasks"]);
+});
+
+test("cloud_control sends a strict authenticated request without secret environment", async (t) => {
+  const calls = [];
+  const f = await fixture(t, async (command, args, options) => {
+    calls.push({ command, args, options });
+    return {
+      code: 0,
+      stdout: JSON.stringify({ status: "ok", content: "CLOUD_ACTIVE" }),
+      stderr: "",
+    };
+  });
+  const result = await f.control.execute("control-1", { command: "-status" });
+  assert.equal(result.content[0].text, "CLOUD_ACTIVE");
+  assert.deepEqual(result.details, {
+    command: "-status",
+    status: "ok",
+    deterministic: true,
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "/test/cloud-control");
+  assert.deepEqual(calls[0].args, []);
+  assert.equal(calls[0].options.env.BUZZ_PRIVATE_KEY, undefined);
+  assert.equal(calls[0].options.env.ANTHROPIC_API_KEY, undefined);
+  assert.deepEqual(JSON.parse(calls[0].options.input), {
+    schemaVersion: 1,
+    command: "-status",
+    channelId: context.channelId,
+    replyTo: context.replyTo,
+    triggeringEventIds: context.triggeringEventIds,
+  });
+});
+
+test("cloud_control rejects unsupported commands, paths, output, and child errors", async (t) => {
+  let calls = 0;
+  const f = await fixture(
+    t,
+    async () => {
+      calls += 1;
+      return {
+        code: 0,
+        stdout: '{"status":"ok","content":"x","extra":1}',
+        stderr: "",
+      };
+    },
+    { env: { PI_ACP_CLOUD_CONTROL_COMMAND: "relative-command" } },
+  );
+  await assert.rejects(
+    f.control.execute("control-1", { command: "-status" }),
+    /absolute executable path/,
+  );
+  await assert.rejects(
+    f.control.execute("control-2", { command: "-destroy" }),
+    /unsupported cloud control command/,
+  );
+  assert.equal(calls, 0);
+
+  const malformed = await fixture(t, async () => ({
+    code: 0,
+    stdout: '{"status":"ok","content":"x","extra":1}',
+    stderr: "",
+  }));
+  await assert.rejects(
+    malformed.control.execute("control-3", { command: "-status" }),
+    /strict contract/,
+  );
+
+  const nonzero = await fixture(t, async () => ({
+    code: 75,
+    stdout: '{"status":"ok","content":"must not publish"}',
+    stderr: "SECRET_CHILD_STDERR",
+  }));
+  await assert.rejects(
+    nonzero.control.execute("control-nonzero", { command: "-status" }),
+    (error) =>
+      error.message === "cloud control command failed" &&
+      !error.message.includes("SECRET_CHILD_STDERR"),
+  );
+
+  const failed = await fixture(t, async () => {
+    const error = new Error("SECRET_CHILD_STDERR");
+    throw error;
+  });
+  await assert.rejects(
+    failed.control.execute("control-4", { command: "-status" }),
+    (error) =>
+      error.message === "cloud control command failed" &&
+      !error.message.includes("SECRET_CHILD_STDERR"),
+  );
 });
 
 test("kanban_tasks emits one bounded filtered compact query", async (t) => {

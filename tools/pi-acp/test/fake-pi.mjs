@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 
+import fs from "node:fs";
 import { attachJsonlReader, writeJsonl } from "../src/jsonl.mjs";
+
+if (process.env.FAKE_PI_STARTED_FILE)
+  fs.writeFileSync(process.env.FAKE_PI_STARTED_FILE, `${process.pid}\n`);
 
 let active = false;
 let terminalReplyCompleted = false;
