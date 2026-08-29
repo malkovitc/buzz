@@ -13,6 +13,7 @@ const adapterPath = path.join(here, "../src/pi-acp-rpc.mjs");
 const fakePiPath = path.join(here, "fake-pi.mjs");
 const fakeBuzzPath = path.join(here, "fake-buzz.mjs");
 const fakeCloudControlPath = path.join(here, "fake-cloud-control.sh");
+const fakeSlowCloudControlPath = path.join(here, "fake-cloud-control-slow.sh");
 const buzzMeta = {
   buzz: {
     channelId: "4dcab690-a2ca-4a56-9e5d-d901d12f83c3",
@@ -57,7 +58,10 @@ function startHarness(mode = "complete") {
       FAKE_PI_MODE: mode,
       PI_ACP_BUZZ_COMMAND: fakeBuzzPath,
       PI_ACP_KANBAN_COMMAND: fakeBuzzPath,
-      PI_ACP_CLOUD_CONTROL_COMMAND: fakeCloudControlPath,
+      PI_ACP_CLOUD_CONTROL_COMMAND:
+        mode === "control-cancel"
+          ? fakeSlowCloudControlPath
+          : fakeCloudControlPath,
       PI_ACP_RECEIPT_DIR: receiptDir,
       FAKE_PI_STARTED_FILE: piStartedFile,
       BUZZ_PRIVATE_KEY: "1".repeat(64),
@@ -242,6 +246,32 @@ test("handles authenticated cloud control without spawning Pi or emitting model 
         `STATUS_LOCAL branch=cloud/handoff-test head=${"a".repeat(40)}`,
     ),
   );
+});
+
+test("cancels deterministic cloud control with a normal cancelled prompt result", async (t) => {
+  const harness = startHarness("control-cancel");
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+  harness.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "-cloud" }],
+      _meta: { buzz: { ...buzzMeta.buzz, controlCommand: "-cloud" } },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  harness.send({
+    jsonrpc: "2.0",
+    method: "session/cancel",
+    params: { sessionId },
+  });
+  const completed = await harness.waitFor((message) => message.id === 3);
+  assert.equal(completed.result.stopReason, "cancelled");
+  assert.equal(completed.error, undefined);
+  assert.equal(fs.existsSync(harness.piStartedFile), false);
 });
 
 test("rejects unknown authenticated control metadata without an LLM fallback", async (t) => {

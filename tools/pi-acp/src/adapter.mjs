@@ -388,13 +388,25 @@ export class PiAcpAdapter {
         }),
       );
     } catch (error) {
-      this.#send(
-        rpcError(
-          message.id,
-          INTERNAL_ERROR,
-          `deterministic cloud control failed: ${error.message}`,
-        ),
-      );
+      if (
+        this.currentPrompt?.acpId === message.id &&
+        this.currentPrompt.cancelled
+      ) {
+        this.#send(
+          rpcResult(message.id, {
+            stopReason: "cancelled",
+            _meta: { cloudControl: { command, deterministic: true } },
+          }),
+        );
+      } else {
+        this.#send(
+          rpcError(
+            message.id,
+            INTERNAL_ERROR,
+            `deterministic cloud control failed: ${error.message}`,
+          ),
+        );
+      }
     } finally {
       if (this.currentPrompt?.acpId === message.id) this.currentPrompt = null;
     }
