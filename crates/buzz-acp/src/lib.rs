@@ -654,7 +654,7 @@ fn spawn_broker_observer_publisher(
                 },
                 _ = publish_tick.tick() => {
                     if let Some(mut event) = queue.next_frame() {
-                        fit_observer_event_to_budget(&mut event);
+                        fit_broker_observer_event_to_budget(&mut event);
                         match serde_json::to_string(&event) {
                             Ok(payload) => {
                                 let frame = buzz_sdk::broker::ObserverFrame {
@@ -949,7 +949,38 @@ const OBSERVER_LEAF_RETAIN_BYTES: usize = 3_000;
 /// are out of this change's scope (buzz-core stays untouched). The clean `&mut`
 /// signature with one cheap redundant serialize is the deliberate tradeoff.
 fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
-    if serialized_len(event) <= OBSERVER_MAX_PLAINTEXT_LEN {
+    fit_observer_event_until(event, |event| {
+        serialized_len(event) <= OBSERVER_MAX_PLAINTEXT_LEN
+    });
+}
+
+/// Trim an observer event until its serialized payload also fits inside the
+/// complete broker `observer.emit` argument after JSON string escaping.
+fn fit_broker_observer_event_to_budget(event: &mut observer::ObserverEvent) {
+    fit_observer_event_until(event, broker_observer_event_fits);
+}
+
+fn broker_observer_event_fits(event: &observer::ObserverEvent) -> bool {
+    let Ok(payload) = serde_json::to_string(event) else {
+        return false;
+    };
+    buzz_sdk::broker::ObserverEmitArgs {
+        frames: vec![buzz_sdk::broker::ObserverFrame {
+            kind: event.kind.clone(),
+            payload,
+        }],
+    }
+    .validated()
+    .is_ok()
+}
+
+/// Apply the common deterministic elision algorithm until `fits` accepts the
+/// complete destination-specific envelope.
+fn fit_observer_event_until(
+    event: &mut observer::ObserverEvent,
+    fits: impl Fn(&observer::ObserverEvent) -> bool,
+) {
+    if fits(event) {
         return;
     }
 
@@ -965,7 +996,7 @@ fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
     // never be re-elided, so the loop is bounded by the leaf count.
     while let Some(leaf) = largest_shrinkable_leaf(&mut event.payload) {
         elide_leaf(leaf);
-        if serialized_len(event) <= OBSERVER_MAX_PLAINTEXT_LEN {
+        if fits(event) {
             return;
         }
     }
@@ -976,6 +1007,10 @@ fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
         "elided": format!("{} payload too large", event.kind),
         "originalBytes": original_payload_bytes,
     });
+    debug_assert!(
+        fits(event),
+        "observer elision stub must fit its destination"
+    );
 }
 
 fn serialized_len(event: &observer::ObserverEvent) -> usize {
@@ -8852,6 +8887,29 @@ mod observer_payload_trim_tests {
             before,
             "under-budget frame must not be mutated"
         );
+    }
+
+    #[test]
+    fn test_broker_frame_accounts_for_outer_json_escaping() {
+        let mut event = event_with_payload(
+            "acp_write",
+            serde_json::json!({ "body": "\"".repeat(30_000) }),
+        );
+        assert!(
+            serialized(&event).len() <= OBSERVER_MAX_PLAINTEXT_LEN,
+            "inner observer plaintext fits before broker wrapping"
+        );
+        assert!(
+            !broker_observer_event_fits(&event),
+            "outer broker JSON escaping must be part of the bound"
+        );
+
+        fit_broker_observer_event_to_budget(&mut event);
+
+        assert!(broker_observer_event_fits(&event));
+        assert!(event.payload["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("…[elided")));
     }
 
     #[test]

@@ -6,22 +6,26 @@
 //! correlation checks; this type never interprets a verdict.
 
 use buzz_sdk::broker::{
-    Action, BrokerClient, BrokerFuture, BrokerResponse, BrokerTransportError, Dispatch,
-    PreparedRequest, BROKER_ACTION_PATH, BROKER_CREDENTIAL_HEADER,
+    BrokerClient, BrokerFuture, BrokerResponse, BrokerTransportError, Dispatch, PreparedRequest,
+    BROKER_ACTION_PATH, BROKER_CREDENTIAL_HEADER,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CHANNEL_READ_MESSAGE_BYTES: usize = 128 * 1024;
 // A channel.read page may contain 500 messages whose content alone is up to
 // 64 KiB each. Keep the transport bounded while leaving room for the signed
 // event envelopes, tags, and JSON encoding around that contract-valid page.
 const MAX_CHANNEL_READ_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 fn max_response_bytes(request: &PreparedRequest) -> usize {
-    match request.action() {
-        Action::ChannelRead => MAX_CHANNEL_READ_RESPONSE_BYTES,
-        _ => MAX_RESPONSE_BYTES,
-    }
+    request
+        .channel_read_limit()
+        .map_or(MAX_RESPONSE_BYTES, |limit| {
+            MAX_RESPONSE_BYTES
+                .saturating_add((limit as usize).saturating_mul(MAX_CHANNEL_READ_MESSAGE_BYTES))
+                .min(MAX_CHANNEL_READ_RESPONSE_BYTES)
+        })
 }
 
 /// Invalid broker provisioning rejected before a bearer credential can leave
@@ -55,28 +59,18 @@ impl HttpBrokerClient {
         base_url: impl Into<String>,
         credential: impl Into<String>,
     ) -> Result<Self, BrokerClientConfigError> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| {
-                BrokerClientConfigError(format!("failed to build broker HTTP client: {error}"))
-            })?;
-        Self::with_client(base_url, credential, http)
+        Self::with_builder_timeout(
+            base_url,
+            credential,
+            reqwest::Client::builder(),
+            DEFAULT_REQUEST_TIMEOUT,
+        )
     }
 
-    /// As [`Self::new`], reusing an existing reqwest client and its pool.
-    pub fn with_client(
+    fn with_builder_timeout(
         base_url: impl Into<String>,
         credential: impl Into<String>,
-        http: reqwest::Client,
-    ) -> Result<Self, BrokerClientConfigError> {
-        Self::with_client_timeout(base_url, credential, http, DEFAULT_REQUEST_TIMEOUT)
-    }
-
-    fn with_client_timeout(
-        base_url: impl Into<String>,
-        credential: impl Into<String>,
-        http: reqwest::Client,
+        mut http: reqwest::ClientBuilder,
         request_timeout: std::time::Duration,
     ) -> Result<Self, BrokerClientConfigError> {
         let base_url = base_url.into();
@@ -112,6 +106,17 @@ impl HttpBrokerClient {
         }
         reqwest::header::HeaderValue::from_str(&format!("Bearer {credential}"))
             .map_err(|_| BrokerClientConfigError("broker credential is not header-safe".into()))?;
+
+        http = http.redirect(reqwest::redirect::Policy::none());
+        if parsed.scheme() == "http" && loopback {
+            // Plaintext loopback is safe only when it is structurally direct.
+            // System or explicitly configured proxies must never receive the
+            // bearer credential on this path.
+            http = http.no_proxy();
+        }
+        let http = http.build().map_err(|error| {
+            BrokerClientConfigError(format!("failed to build broker HTTP client: {error}"))
+        })?;
 
         Ok(Self {
             base_url,
@@ -200,7 +205,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::Response;
-    use axum::routing::post;
+    use axum::routing::{any, post};
     use axum::Router;
     use buzz_sdk::broker::actions::MAX_CONTENT_BYTES;
     use buzz_sdk::broker::{
@@ -241,6 +246,26 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen_auth)
+    }
+
+    async fn spawn_capture_proxy() -> (String, Arc<Mutex<Option<String>>>) {
+        let seen_auth = Arc::new(Mutex::new(None));
+        let state = seen_auth.clone();
+        let app = Router::new()
+            .fallback(any(
+                |State(seen): State<Arc<Mutex<Option<String>>>>, headers: HeaderMap| async move {
+                    *seen.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    StatusCode::BAD_GATEWAY
+                },
+            ))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), seen_auth)
     }
@@ -339,10 +364,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let client = HttpBrokerClient::with_client_timeout(
+        let client = HttpBrokerClient::with_builder_timeout(
             format!("http://{addr}"),
             CRED,
-            reqwest::Client::new(),
+            reqwest::Client::builder(),
             std::time::Duration::from_millis(20),
         )
         .unwrap();
@@ -358,6 +383,36 @@ mod tests {
         assert!(HttpBrokerClient::new("http://broker.example", CRED).is_err());
         assert!(HttpBrokerClient::new("https://broker.example", " ").is_err());
         assert!(HttpBrokerClient::new("http://localhost:8787", CRED).is_ok());
+    }
+
+    #[tokio::test]
+    async fn plaintext_loopback_never_sends_the_bearer_through_a_proxy() {
+        let request = post_request();
+        let body = format!(
+            r#"{{"type":"broker_result","protocolVersion":1,"requestId":"{}","status":"succeeded","action":"message.post","outcome":{{"eventId":"{}","kind":9,"createdAt":1700000000}}}}"#,
+            request.request_id(),
+            "a".repeat(64),
+        );
+        let (broker, broker_auth) = spawn(StatusCode::OK, body).await;
+        let (proxy, proxy_auth) = spawn_capture_proxy().await;
+        let client = HttpBrokerClient::with_builder_timeout(
+            broker,
+            CRED,
+            reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy).unwrap()),
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .unwrap();
+
+        client
+            .execute(&request)
+            .await
+            .expect("direct broker response");
+
+        assert_eq!(
+            broker_auth.lock().unwrap().as_deref(),
+            Some("Bearer test-cred")
+        );
+        assert_eq!(proxy_auth.lock().unwrap().as_deref(), None);
     }
 
     #[tokio::test]
@@ -402,5 +457,29 @@ mod tests {
             .expect("valid channel page");
 
         assert!(matches!(response.result(), BrokerResult::Succeeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn channel_read_limit_one_hundred_has_a_request_sized_response_cap() {
+        let request = channel_read_request();
+        let response_cap = max_response_bytes(&request);
+        assert_eq!(request.channel_read_limit(), Some(100));
+        assert_eq!(
+            response_cap,
+            MAX_RESPONSE_BYTES + 100 * MAX_CHANNEL_READ_MESSAGE_BYTES
+        );
+        assert!(response_cap < MAX_CHANNEL_READ_RESPONSE_BYTES);
+
+        let (base, _) = spawn(StatusCode::OK, "x".repeat(response_cap + 1)).await;
+        let error = HttpBrokerClient::new(base, CRED)
+            .unwrap()
+            .execute(&request)
+            .await
+            .expect_err("response over the requested page budget");
+        assert!(matches!(
+            error,
+            BrokerTransportError::NoEnvelope { detail, .. }
+                if detail.contains(&response_cap.to_string())
+        ));
     }
 }
