@@ -58,8 +58,7 @@ fn rejects_stale_and_accepts_brokered_release() {
         AcpAvailabilityStatus::AdapterOutdated
     );
 
-    std::fs::write(&bin, "#!/bin/sh\necho 'pi-acp 0.2.5'\n")
-        .expect("write pre-supervisor script");
+    std::fs::write(&bin, "#!/bin/sh\necho 'pi-acp 0.2.5'\n").expect("write pre-supervisor script");
     assert_eq!(
         pi_adapter_availability(&bin),
         AcpAvailabilityStatus::AdapterOutdated
