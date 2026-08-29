@@ -51,7 +51,8 @@ fn rejects_stale_and_accepts_brokered_release() {
         AcpAvailabilityStatus::AdapterOutdated
     );
 
-    std::fs::write(&bin, "#!/bin/sh\necho 'pi-acp 0.2.4'\n").expect("write model-backed control script");
+    std::fs::write(&bin, "#!/bin/sh\necho 'pi-acp 0.2.4'\n")
+        .expect("write model-backed control script");
     assert_eq!(
         pi_adapter_availability(&bin),
         AcpAvailabilityStatus::AdapterOutdated
