@@ -17,10 +17,13 @@ const fakeSlowCloudControlPath = path.join(here, "fake-cloud-control-slow.sh");
 const fakeSlowCommitPath = path.join(here, "fake-cloud-control-slow-commit.sh");
 const buzzMeta = {
   buzz: {
+    relayUrl: "wss://relay.example",
+    agentPubkey: "f".repeat(64),
     channelId: "4dcab690-a2ca-4a56-9e5d-d901d12f83c3",
     triggeringEventIds: ["a".repeat(64)],
     allowedReplyEventIds: ["a".repeat(64)],
     replyTo: "a".repeat(64),
+    taskThreadRoot: "a".repeat(64),
   },
 };
 
@@ -67,6 +70,7 @@ function startHarness(mode = "complete") {
             : fakeCloudControlPath,
       BUZZ_ACP_CLOUD_CONTROL_CHANNEL_ID: buzzMeta.buzz.channelId,
       PI_ACP_RECEIPT_DIR: receiptDir,
+      PI_ACP_TASK_SESSION_ROOT: path.join(receiptDir, "task-sessions"),
       FAKE_PI_STARTED_FILE: piStartedFile,
       BUZZ_PRIVATE_KEY: "1".repeat(64),
       BUZZ_RELAY_URL: "wss://relay.example",
@@ -146,7 +150,7 @@ async function handshake(harness) {
   assert.equal(initialized.result._meta.steering.supported, true);
   assert.equal(initialized.result._meta.pilot.liveCanaryValidated, true);
   assert.equal(initialized.result._meta.pilot.fleetApproved, false);
-  assert.equal(initialized.result.agentInfo.version, "0.2.7");
+  assert.equal(initialized.result.agentInfo.version, "0.2.8");
 
   harness.send({
     jsonrpc: "2.0",
@@ -387,9 +391,35 @@ test("steers an active Pi prompt without starting a second ACP prompt", async (t
   await new Promise((resolve) => setTimeout(resolve, 30));
   harness.send({
     jsonrpc: "2.0",
+    id: 5,
+    method: "_session/steering",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "wrong thread" }],
+      _meta: {
+        buzz: {
+          taskThreadRoot: "b".repeat(64),
+          deliveredEventIds: ["e".repeat(64)],
+        },
+      },
+    },
+  });
+  const rejected = await harness.waitFor((message) => message.id === 5);
+  assert.equal(rejected.error.code, -32602);
+  harness.send({
+    jsonrpc: "2.0",
     id: 4,
     method: "_session/steering",
-    params: { sessionId, prompt: [{ type: "text", text: "focus" }] },
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "focus" }],
+      _meta: {
+        buzz: {
+          taskThreadRoot: "a".repeat(64),
+          deliveredEventIds: ["c".repeat(64)],
+        },
+      },
+    },
   });
 
   const steered = await harness.waitFor((message) => message.id === 4);
@@ -422,7 +452,16 @@ test("queues startup steering until the SDK prompt is active", async (t) => {
     jsonrpc: "2.0",
     id: 4,
     method: "_session/steering",
-    params: { sessionId, prompt: [{ type: "text", text: "early focus" }] },
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "early focus" }],
+      _meta: {
+        buzz: {
+          taskThreadRoot: "a".repeat(64),
+          deliveredEventIds: ["d".repeat(64)],
+        },
+      },
+    },
   });
 
   const steered = await harness.waitFor((message) => message.id === 4);
@@ -520,6 +559,112 @@ test("creates a fresh Pi process for every task in one ACP session", async (t) =
     .map((message) => message.params.update.content.text);
   assert.equal(pids.length, 2);
   assert.notEqual(pids[0], pids[1]);
+});
+
+test("derives a stable isolated Pi session identity from relay, channel, and thread", async (t) => {
+  const harness = startHarness("task-id");
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+  const contexts = [
+    buzzMeta,
+    buzzMeta,
+    {
+      buzz: {
+        ...buzzMeta.buzz,
+        triggeringEventIds: ["b".repeat(64)],
+        allowedReplyEventIds: ["b".repeat(64)],
+        replyTo: "b".repeat(64),
+        taskThreadRoot: "b".repeat(64),
+      },
+    },
+    {
+      buzz: {
+        ...buzzMeta.buzz,
+        triggeringEventIds: ["c".repeat(64), "d".repeat(64)],
+        taskThreadRoot: undefined,
+      },
+    },
+  ];
+  for (const [index, metadata] of contexts.entries()) {
+    const id = index + 3;
+    harness.send({
+      jsonrpc: "2.0",
+      id,
+      method: "session/prompt",
+      params: {
+        sessionId,
+        prompt: [{ type: "text", text: `task-${id}` }],
+        _meta: metadata,
+      },
+    });
+    await harness.waitFor((message) => message.id === id);
+  }
+  const taskIds = harness.messages
+    .filter((message) =>
+      message.params?.update?.content?.text?.startsWith("task:"),
+    )
+    .map((message) => message.params.update.content.text);
+  assert.equal(taskIds.length, 4);
+  assert.equal(taskIds[0], taskIds[1]);
+  assert.notEqual(taskIds[1], taskIds[2]);
+  assert.match(taskIds[0], /^task:[0-9a-f]{64}$/);
+  assert.equal(taskIds[3], "task:missing");
+});
+
+test("propagates an explicit ACP rotation reset to the durable Pi session", async (t) => {
+  const harness = startHarness("task-reset");
+  t.after(() => harness.close());
+  harness.send({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: 2, clientCapabilities: {} },
+  });
+  await harness.waitFor((message) => message.id === 1);
+  harness.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "session/new",
+    params: {
+      cwd: here,
+      mcpServers: [],
+    },
+  });
+  const created = await harness.waitFor((message) => message.id === 2);
+  harness.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId: created.result.sessionId,
+      prompt: [{ type: "text", text: "after rotation" }],
+      _meta: {
+        buzz: { ...buzzMeta.buzz, resetTaskSession: true },
+      },
+    },
+  });
+  await harness.waitFor((message) => message.id === 3);
+  assert.ok(
+    harness.messages.some(
+      (message) => message.params?.update?.content?.text === "reset:1",
+    ),
+  );
+});
+
+test("reads empty durable delivery state without spawning Pi", async (t) => {
+  const harness = startHarness();
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+  harness.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "_session/task_state",
+    params: { sessionId, _meta: buzzMeta },
+  });
+  const state = await harness.waitFor((message) => message.id === 3);
+  assert.deepEqual(state.result.deliveredEventIds, []);
+  assert.deepEqual(state.result.processedTriggerEventIds, []);
+  assert.equal(fs.existsSync(harness.piStartedFile), false);
 });
 
 test("keeps the Buzz signing key out of the Pi subprocess", async (t) => {

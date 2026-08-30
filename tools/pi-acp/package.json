@@ -1,11 +1,12 @@
 {
   "name": "@buzz/pi-acp",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "private": true,
   "type": "module",
   "bin": {
     "pi-acp": "src/pi-acp-rpc.mjs",
-    "pi-cloud-control": "src/cloud-control-host.mjs"
+    "pi-cloud-control": "src/cloud-control-host.mjs",
+    "pi-continuation-capsule": "src/continuation-capsule-cli.mjs"
   },
   "scripts": {
     "check": "biome check .",

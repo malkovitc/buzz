@@ -118,6 +118,10 @@ pub struct SessionState {
     /// Per-channel turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
     pub turn_counts: HashMap<Uuid, u32>,
+    /// Task roots whose next Pi prompt must explicitly reset durable history.
+    pub pending_task_resets: HashSet<(Uuid, String)>,
+    /// Pool-owned resets copied into this worker and awaiting acknowledgement.
+    pub claimed_pool_resets: HashSet<(Uuid, String)>,
     /// Turn counter for the heartbeat session.
     pub heartbeat_turn_count: u32,
     /// Whether the live heartbeat session has successfully received `[Base]`.
@@ -132,9 +136,10 @@ pub struct SessionState {
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
     pub canvas_sections: HashMap<Uuid, String>,
-    /// Per-channel successful-delivery state. Created with the ACP session and
-    /// cleared atomically with every invalidation path.
+    /// Per-channel successful-delivery state for conventional ACP agents.
     pub deliveries: HashMap<Uuid, ChannelDeliveryState>,
+    /// Thread-scoped delivery state matching Pi's durable task-session boundary.
+    pub pi_task_deliveries: HashMap<(Uuid, String), ChannelDeliveryState>,
 }
 
 impl SessionState {
@@ -172,6 +177,7 @@ impl SessionState {
         self.core_sections.clear();
         self.canvas_sections.clear();
         self.deliveries.clear();
+        self.pi_task_deliveries.clear();
     }
 
     pub(crate) fn mark_channel_delivery_success(
@@ -183,6 +189,31 @@ impl SessionState {
         let delivery = self.deliveries.entry(channel_id).or_default();
         delivery.standing_context_sent |= standing_context_sent;
         delivery.delivered_event_ids.extend(event_ids);
+    }
+
+    pub(crate) fn mark_pi_task_delivery_success(
+        &mut self,
+        channel_id: Uuid,
+        task_root: String,
+        event_ids: impl IntoIterator<Item = String>,
+    ) {
+        let key = (channel_id, task_root);
+        if !self.pi_task_deliveries.contains_key(&key) && self.pi_task_deliveries.len() >= 256 {
+            if let Some(evicted) = self.pi_task_deliveries.keys().next().cloned() {
+                self.pi_task_deliveries.remove(&evicted);
+            }
+        }
+        let delivered = &mut self
+            .pi_task_deliveries
+            .entry(key)
+            .or_default()
+            .delivered_event_ids;
+        delivered.extend(event_ids);
+        while delivered.len() > 256 {
+            if let Some(evicted) = delivered.iter().next().cloned() {
+                delivered.remove(&evicted);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -299,6 +330,7 @@ pub struct AgentPool {
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
     turn_associations: HashMap<String, Arc<Mutex<Vec<String>>>>,
+    pending_pi_task_resets: HashSet<(Uuid, String)>,
 }
 
 /// Result returned by a completed prompt task.
@@ -418,6 +450,10 @@ pub struct SteerRequest {
     pub prompt_blocks: Vec<String>,
     /// Triggering event plus stable thread anchors for observer routing.
     pub association_event_ids: Vec<String>,
+    /// Event IDs actually rendered in the steer prompt (excludes observer anchors).
+    pub delivered_event_ids: Vec<String>,
+    /// Homogeneous task root used to prevent cross-thread durable Pi steering.
+    pub task_thread_root: Option<String>,
     /// Oneshot for the read loop to report the outcome.
     pub ack_tx: tokio::sync::oneshot::Sender<SteerAck>,
 }
@@ -664,7 +700,24 @@ impl AgentPool {
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
             turn_associations: HashMap::new(),
+            pending_pi_task_resets: HashSet::new(),
         }
+    }
+
+    pub fn preserve_agent_pending_pi_resets(&mut self, agent: &OwnedAgent) {
+        self.pending_pi_task_resets
+            .extend(agent.state.pending_task_resets.iter().cloned());
+    }
+
+    pub fn take_pending_pi_task_resets(&mut self) -> HashSet<(Uuid, String)> {
+        std::mem::take(&mut self.pending_pi_task_resets)
+    }
+
+    pub fn extend_pending_pi_task_resets(
+        &mut self,
+        resets: impl IntoIterator<Item = (Uuid, String)>,
+    ) {
+        self.pending_pi_task_resets.extend(resets);
     }
 
     /// Try to claim an idle agent for the given channel (or heartbeat if `None`).
@@ -682,17 +735,46 @@ impl AgentPool {
                     .unwrap_or(false)
             });
             if let Some(i) = idx {
-                return self.agents[i].take();
+                let agent = self.agents[i].take()?;
+                return Some(self.attach_pending_pi_resets(agent, cid));
             }
         }
 
         // Pass 2: first idle agent.
         let idx = self.agents.iter().position(|slot| slot.is_some());
-        idx.map(|i| self.agents[i].take().unwrap())
+        idx.and_then(|i| {
+            let agent = self.agents[i].take()?;
+            Some(match channel_id {
+                Some(cid) => self.attach_pending_pi_resets(agent, cid),
+                None => agent,
+            })
+        })
+    }
+
+    fn attach_pending_pi_resets(&mut self, mut agent: OwnedAgent, channel_id: Uuid) -> OwnedAgent {
+        let matching: Vec<(Uuid, String)> = self
+            .pending_pi_task_resets
+            .iter()
+            .filter(|(candidate, _)| *candidate == channel_id)
+            .cloned()
+            .collect();
+        for reset in matching {
+            agent.state.pending_task_resets.insert(reset.clone());
+            agent.state.claimed_pool_resets.insert(reset);
+        }
+        agent
     }
 
     /// Return an agent to its slot after a task completes.
-    pub fn return_agent(&mut self, agent: OwnedAgent) {
+    pub fn return_agent(&mut self, mut agent: OwnedAgent) {
+        let claimed = std::mem::take(&mut agent.state.claimed_pool_resets);
+        let acknowledged: Vec<(Uuid, String)> = claimed
+            .into_iter()
+            .filter(|reset| !agent.state.pending_task_resets.contains(reset))
+            .collect();
+        for reset in acknowledged {
+            self.pending_pi_task_resets.remove(&reset);
+        }
         let idx = agent.index;
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
@@ -906,6 +988,12 @@ impl AgentPool {
         count
     }
 
+    /// Mark one thread-scoped Pi task for durable reset on its next prompt.
+    pub fn mark_pi_task_reset(&mut self, channel_id: Uuid, task_root: Option<String>) {
+        self.pending_pi_task_resets
+            .insert((channel_id, task_root.unwrap_or_else(|| "*".into())));
+    }
+
     /// Idle-path model switch: set `desired_model` on the idle agent for
     /// `channel_id` and invalidate its session so the next turn re-creates the
     /// session under the new model.
@@ -951,6 +1039,12 @@ impl AgentPool {
         // Carry the pick's correlator so a deferred-validation miss on the next
         // turn's session creation emits a late frame the Desktop can match.
         agent.desired_model_request_id = request_id;
+        if agent.agent_name == "pi-acp" {
+            agent
+                .state
+                .pending_task_resets
+                .insert((channel_id, "*".into()));
+        }
         agent.state.invalidate_channel(&channel_id);
         IdleSwitchResult::Switched
     }
@@ -2393,6 +2487,7 @@ pub async fn run_prompt_task(
     // successful turn; failed/cancelled prompts must be retryable without loss.
     let mut pending_delivered_event_ids = HashSet::new();
     let mut buzz_prompt_metadata = None;
+    let mut pi_delivery_task_root: Option<String> = None;
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
@@ -2420,6 +2515,10 @@ pub async fn run_prompt_task(
         // Build prompt from batch with context enrichment.
         // Try startup cache first; lazy-fetch via REST for dynamic channels.
         let channel_info = ctx.channel_info.resolve(b.channel_id).await;
+        if agent.agent_name == "pi-acp" {
+            pi_delivery_task_root =
+                crate::prompt_metadata::task_thread_root_for_batch(b, channel_info.as_ref());
+        }
 
         let conversation_context = if ctx.context_message_limit > 0 {
             fetch_conversation_context(b, &channel_info, &ctx).await
@@ -2432,13 +2531,82 @@ pub async fn run_prompt_task(
             .chain(b.cancelled_events.iter())
             .map(|event| event.event.id.to_hex())
             .collect();
-        let delivered_ids = agent
-            .state
-            .deliveries
-            .get(&b.channel_id)
-            .map(|delivery| &delivery.delivered_event_ids)
-            .cloned()
-            .unwrap_or_default();
+        let mut persisted_trigger_ids = HashSet::new();
+        let delivered_ids = if let Some(task_root) = pi_delivery_task_root.as_ref() {
+            let reset_pending = agent
+                .state
+                .pending_task_resets
+                .contains(&(b.channel_id, task_root.clone()))
+                || agent
+                    .state
+                    .pending_task_resets
+                    .contains(&(b.channel_id, "*".into()));
+            if reset_pending {
+                HashSet::new()
+            } else {
+                let mut delivered = agent
+                    .state
+                    .pi_task_deliveries
+                    .get(&(b.channel_id, task_root.clone()))
+                    .map(|delivery| &delivery.delivered_event_ids)
+                    .cloned()
+                    .unwrap_or_default();
+                match agent
+                    .acp
+                    .session_task_delivered_event_ids(
+                        &session_id,
+                        &ctx.relay_url,
+                        &ctx.agent_keys.public_key().to_hex(),
+                        &b.channel_id.to_string(),
+                        task_root,
+                    )
+                    .await
+                {
+                    Ok((persisted, processed_triggers)) => {
+                        delivered.extend(persisted);
+                        persisted_trigger_ids = processed_triggers;
+                    }
+                    Err(error) => tracing::debug!(
+                        target: "pool::prompt",
+                        channel_id = %b.channel_id,
+                        "durable Pi delivery state unavailable: {error}"
+                    ),
+                }
+                delivered
+            }
+        } else if agent.agent_name == "pi-acp" {
+            HashSet::new()
+        } else {
+            agent
+                .state
+                .deliveries
+                .get(&b.channel_id)
+                .map(|delivery| &delivery.delivered_event_ids)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let triggering_batch_already_delivered = agent.agent_name == "pi-acp"
+            && pi_delivery_task_root.is_some()
+            && !rendered_batch_ids.is_empty()
+            && rendered_batch_ids
+                .iter()
+                .all(|event_id| persisted_trigger_ids.contains(event_id));
+        if triggering_batch_already_delivered {
+            tracing::info!(
+                target: "pool::prompt",
+                channel_id = %b.channel_id,
+                "durable Pi delivery receipt suppressed a replayed trigger batch"
+            );
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Ok(StopReason::EndTurn),
+                None,
+            );
+            return;
+        }
         let conversation_context_had_delivered_events =
             conversation_context.as_ref().is_some_and(|context| {
                 conversation_context_event_ids(Some(context))
@@ -2459,8 +2627,13 @@ pub async fn run_prompt_task(
 
         let profile_lookup =
             fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
-        buzz_prompt_metadata =
-            crate::prompt_metadata::for_batch(b, channel_info.as_ref(), profile_lookup.as_ref());
+        buzz_prompt_metadata = crate::prompt_metadata::for_batch(
+            b,
+            channel_info.as_ref(),
+            profile_lookup.as_ref(),
+            &ctx.agent_keys.public_key(),
+            &ctx.relay_url,
+        );
 
         let known_names: Vec<&str> = profile_lookup
             .iter()
@@ -2476,6 +2649,27 @@ pub async fn run_prompt_task(
                 ctx.agent_owner_pubkey.as_ref(),
                 &ctx.agent_keys.public_key(),
             );
+            metadata.delivered_event_ids = pending_delivered_event_ids.iter().cloned().collect();
+            metadata.delivered_event_ids.sort();
+            metadata.processed_trigger_event_ids = b
+                .events
+                .iter()
+                .chain(b.cancelled_events.iter())
+                .map(|event| event.event.id.to_hex())
+                .collect();
+            metadata.processed_trigger_event_ids.sort();
+            if metadata.control_command.is_none() {
+                if let Some(root) = metadata.task_thread_root.as_ref() {
+                    metadata.reset_task_session = agent
+                        .state
+                        .pending_task_resets
+                        .contains(&(b.channel_id, root.clone()))
+                        || agent
+                            .state
+                            .pending_task_resets
+                            .contains(&(b.channel_id, "*".into()));
+                }
+            }
         }
         if let Some(ref cmd) = slash_command {
             tracing::info!(
@@ -2622,6 +2816,22 @@ pub async fn run_prompt_task(
                     // Control signal received. Guard against Race 1: the turn may
                     // have completed naturally just as cancel fired.
                     if agent.acp.has_in_flight_prompt() {
+                        let reset_task_on_failure = if agent.agent_name == "pi-acp"
+                            && matches!(
+                                control_signal,
+                                ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
+                            )
+                        {
+                            match (&source, buzz_prompt_metadata.as_ref()) {
+                                (PromptSource::Channel(channel_id), Some(metadata)) => metadata
+                                    .task_thread_root
+                                    .as_ref()
+                                    .map(|root| (*channel_id, root.clone())),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
                         // Prompt is genuinely in-flight — cancel it.
                         match agent
                             .acp
@@ -2630,6 +2840,42 @@ pub async fn run_prompt_task(
                         {
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
+                                if agent.agent_name == "pi-acp"
+                                    && matches!(
+                                        control_signal,
+                                        ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
+                                    )
+                                {
+                                    if let (PromptSource::Channel(channel_id), Some(metadata)) =
+                                        (&source, buzz_prompt_metadata.as_ref())
+                                    {
+                                        if let Some(root) = metadata.task_thread_root.as_ref() {
+                                            match agent
+                                                .acp
+                                                .session_reset_task(&session_id, metadata)
+                                                .await
+                                            {
+                                                Ok(()) => {
+                                                    agent
+                                                        .state
+                                                        .pi_task_deliveries
+                                                        .remove(&(*channel_id, root.clone()));
+                                                }
+                                                Err(error) => {
+                                                    tracing::warn!(
+                                                        target: "pool::session",
+                                                        channel_id = %channel_id,
+                                                        "durable Pi task reset deferred after cancel error: {error}"
+                                                    );
+                                                    agent
+                                                        .state
+                                                        .pending_task_resets
+                                                        .insert((*channel_id, root.clone()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 agent.state.invalidate(&source);
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
@@ -2655,6 +2901,9 @@ pub async fn run_prompt_task(
                                 return;
                             }
                             Err(error) => {
+                                if let Some(reset) = reset_task_on_failure {
+                                    agent.state.pending_task_resets.insert(reset);
+                                }
                                 // Single production arm: classify the error→outcome
                                 // and outcome→batch-fate boundary once via the seam
                                 // shared with tests, then invalidate/publish/send once.
@@ -2722,13 +2971,78 @@ pub async fn run_prompt_task(
                         }
                         log_stop_reason(&source, &StopReason::EndTurn);
                         if let PromptSource::Channel(cid) = &source {
-                            let standing_sent = !agent.has_system_prompt_support();
-                            record_channel_delivery_success(
-                                &mut agent,
-                                *cid,
-                                standing_sent,
-                                &pending_delivered_event_ids,
-                            );
+                            if let Some(metadata) = buzz_prompt_metadata.as_ref() {
+                                if metadata.reset_task_session {
+                                    if let Some(root) = metadata.task_thread_root.as_ref() {
+                                        agent
+                                            .state
+                                            .pending_task_resets
+                                            .remove(&(*cid, root.clone()));
+                                        agent
+                                            .state
+                                            .pending_task_resets
+                                            .remove(&(*cid, "*".into()));
+                                    }
+                                }
+                            }
+                            if let Some(task_root) = pi_delivery_task_root.as_ref() {
+                                if buzz_prompt_metadata
+                                    .as_ref()
+                                    .is_some_and(|metadata| metadata.reset_task_session)
+                                {
+                                    agent
+                                        .state
+                                        .pi_task_deliveries
+                                        .remove(&(*cid, task_root.clone()));
+                                }
+                                agent.state.mark_pi_task_delivery_success(
+                                    *cid,
+                                    task_root.clone(),
+                                    pending_delivered_event_ids.iter().cloned(),
+                                );
+                            } else if agent.agent_name != "pi-acp" {
+                                let standing_sent = !agent.has_system_prompt_support();
+                                record_channel_delivery_success(
+                                    &mut agent,
+                                    *cid,
+                                    standing_sent,
+                                    &pending_delivered_event_ids,
+                                );
+                            }
+                            if agent.agent_name == "pi-acp"
+                                && matches!(
+                                    control_signal,
+                                    ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
+                                )
+                            {
+                                if let Some(metadata) = buzz_prompt_metadata.as_ref() {
+                                    if let Some(root) = metadata.task_thread_root.as_ref() {
+                                        match agent
+                                            .acp
+                                            .session_reset_task(&session_id, metadata)
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                agent
+                                                    .state
+                                                    .pi_task_deliveries
+                                                    .remove(&(*cid, root.clone()));
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(
+                                                    target: "pool::session",
+                                                    channel_id = %cid,
+                                                    "durable Pi task reset deferred after control error: {error}"
+                                                );
+                                                agent
+                                                    .state
+                                                    .pending_task_resets
+                                                    .insert((*cid, root.clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         apply_completed_before_control_signal(
                             &mut agent.state,
@@ -2764,14 +3078,48 @@ pub async fn run_prompt_task(
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
 
+            if let (PromptSource::Channel(channel_id), Some(metadata)) =
+                (&source, buzz_prompt_metadata.as_ref())
+            {
+                if metadata.reset_task_session {
+                    if let Some(root) = metadata.task_thread_root.as_ref() {
+                        agent
+                            .state
+                            .pending_task_resets
+                            .remove(&(*channel_id, root.clone()));
+                        agent
+                            .state
+                            .pending_task_resets
+                            .remove(&(*channel_id, "*".into()));
+                    }
+                }
+            }
+
             if let PromptSource::Channel(cid) = &source {
-                let standing_sent = !agent.has_system_prompt_support();
-                record_channel_delivery_success(
-                    &mut agent,
-                    *cid,
-                    standing_sent,
-                    &pending_delivered_event_ids,
-                );
+                if let Some(task_root) = pi_delivery_task_root.as_ref() {
+                    if buzz_prompt_metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.reset_task_session)
+                    {
+                        agent
+                            .state
+                            .pi_task_deliveries
+                            .remove(&(*cid, task_root.clone()));
+                    }
+                    agent.state.mark_pi_task_delivery_success(
+                        *cid,
+                        task_root.clone(),
+                        pending_delivered_event_ids.iter().cloned(),
+                    );
+                } else if agent.agent_name != "pi-acp" {
+                    let standing_sent = !agent.has_system_prompt_support();
+                    record_channel_delivery_success(
+                        &mut agent,
+                        *cid,
+                        standing_sent,
+                        &pending_delivered_event_ids,
+                    );
+                }
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
             }
@@ -2801,6 +3149,33 @@ pub async fn run_prompt_task(
             };
 
             if should_rotate {
+                if agent.agent_name == "pi-acp" {
+                    if let (PromptSource::Channel(channel_id), Some(metadata)) =
+                        (&source, buzz_prompt_metadata.as_ref())
+                    {
+                        if let Some(root) = metadata.task_thread_root.as_ref() {
+                            match agent.acp.session_reset_task(&session_id, metadata).await {
+                                Ok(()) => {
+                                    agent
+                                        .state
+                                        .pi_task_deliveries
+                                        .remove(&(*channel_id, root.clone()));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        target: "pool::session",
+                                        channel_id = %channel_id,
+                                        "durable Pi task reset deferred after error: {error}"
+                                    );
+                                    agent
+                                        .state
+                                        .pending_task_resets
+                                        .insert((*channel_id, root.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
                 tracing::info!(
                     target: "pool::session",
                     "rotating session for {source:?} after {stop_reason:?}",
@@ -6907,6 +7282,26 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         s.heartbeat_turn_count = 7;
         s.heartbeat_standing_context_sent = true;
         (s, ch_a, ch_b)
+    }
+
+    #[test]
+    fn pi_delivery_state_is_isolated_by_thread_root() {
+        let mut state = SessionState::default();
+        let channel = Uuid::new_v4();
+        state.mark_pi_task_delivery_success(channel, "root-a".into(), ["event-a".into()]);
+        state.mark_pi_task_delivery_success(channel, "root-b".into(), ["event-b".into()]);
+        assert!(state
+            .pi_task_deliveries
+            .get(&(channel, "root-a".into()))
+            .is_some_and(|delivery| delivery.delivered_event_ids.contains("event-a")));
+        assert!(state
+            .pi_task_deliveries
+            .get(&(channel, "root-b".into()))
+            .is_some_and(|delivery| delivery.delivered_event_ids.contains("event-b")));
+        assert!(!state
+            .pi_task_deliveries
+            .get(&(channel, "root-a".into()))
+            .is_some_and(|delivery| delivery.delivered_event_ids.contains("event-b")));
     }
 
     #[test]

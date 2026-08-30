@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import path from "node:path";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -13,6 +14,13 @@ import { attachJsonlReader, writeJsonl } from "./jsonl.mjs";
 import { BrokerRequestRegistry } from "./sdk-broker.mjs";
 import { TerminalPublicationLifecycle } from "./sdk-lifecycle.mjs";
 import { SteeringDeliveryGate } from "./sdk-steering.mjs";
+import {
+  acquireTaskLease,
+  openTaskSession,
+  resetTaskSession,
+  taskSessionDirectory,
+  taskSessionIdentity,
+} from "./task-session.mjs";
 
 function option(name) {
   const index = process.argv.indexOf(name);
@@ -36,6 +44,38 @@ let disposed = false;
 const brokerRequests = new BrokerRequestRegistry();
 const terminalPublication = new TerminalPublicationLifecycle();
 const steeringDelivery = new SteeringDeliveryGate();
+let sessionManager;
+let taskIdentity;
+let pendingDeliveryIds = [];
+let pendingTriggerIds = [];
+let releaseTaskLease;
+
+function configuredSessionManager() {
+  const raw = process.env.PI_ACP_TASK_IDENTITY_JSON;
+  if (!raw) return SessionManager.inMemory(process.cwd());
+  let supplied;
+  try {
+    supplied = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`PI_ACP_TASK_IDENTITY_JSON is invalid: ${error.message}`);
+  }
+  const normalized = taskSessionIdentity(supplied, supplied?.relayUrl);
+  if (normalized.digest !== supplied?.digest) {
+    throw new Error("PI_ACP_TASK_IDENTITY_JSON digest mismatch");
+  }
+  const root =
+    process.env.PI_ACP_TASK_SESSION_ROOT ||
+    path.join(getAgentDir(), "buzz-task-sessions");
+  taskIdentity = normalized;
+  releaseTaskLease = acquireTaskLease(
+    taskSessionDirectory(root, normalized),
+    "pi-session",
+  );
+  if (process.env.PI_ACP_RESET_TASK_SESSION === "1") {
+    return resetTaskSession(process.cwd(), root, normalized);
+  }
+  return openTaskSession(process.cwd(), root, normalized);
+}
 
 function callBroker(toolName, args, signal) {
   return brokerRequests.request(toolName, args, signal, (request) =>
@@ -102,18 +142,29 @@ const resourceLoader = new DefaultResourceLoader({
 
 const ready = (async () => {
   await resourceLoader.reload();
+  sessionManager = configuredSessionManager();
   const created = await createAgentSession({
     cwd: process.cwd(),
     tools,
     customTools,
     resourceLoader,
-    sessionManager: SessionManager.inMemory(process.cwd()),
+    sessionManager,
   });
   session = created.session;
   session.subscribe((event) => {
     if (event.type === "agent_start") streaming = true;
     if (event.type === "agent_settled") {
       streaming = false;
+      if (pendingDeliveryIds.length > 0) {
+        sessionManager.appendCustomEntry("buzz.delivery.v1", {
+          eventIds: pendingDeliveryIds,
+          triggerEventIds: pendingTriggerIds,
+        });
+        pendingDeliveryIds = [];
+        pendingTriggerIds = [];
+      }
+      releaseTaskLease?.();
+      releaseTaskLease = undefined;
       terminalPublication.endPrompt();
       steeringDelivery.rejectAll((command) =>
         response(
@@ -127,7 +178,18 @@ const ready = (async () => {
     if (event.type === "queue_update") {
       steeringDelivery.observeQueue(
         event.steering,
-        (command) => response(command, true),
+        (command) => {
+          const consumedIds = Array.isArray(command.deliveredEventIds)
+            ? command.deliveredEventIds
+            : [];
+          pendingDeliveryIds = [
+            ...new Set([...pendingDeliveryIds, ...consumedIds]),
+          ];
+          pendingTriggerIds = [
+            ...new Set([...pendingTriggerIds, ...consumedIds]),
+          ];
+          response(command, true);
+        },
         (command) =>
           response(
             command,
@@ -196,6 +258,9 @@ async function handle(command) {
           thinkingLevel: session.thinkingLevel,
           isStreaming: streaming,
           sessionId: session.sessionId,
+          sessionFile: session.sessionFile,
+          leafId: sessionManager.getLeafId(),
+          taskDigest: taskIdentity?.digest,
           autoCompactionEnabled: session.autoCompactionEnabled,
           budget: budget.snapshot(),
         });
@@ -206,6 +271,12 @@ async function handle(command) {
           break;
         }
         budget.reset();
+        pendingDeliveryIds = Array.isArray(command.deliveredEventIds)
+          ? [...new Set(command.deliveredEventIds)]
+          : [];
+        pendingTriggerIds = Array.isArray(command.processedTriggerEventIds)
+          ? [...new Set(command.processedTriggerEventIds)]
+          : [];
         terminalPublication.beginPrompt();
         response(command, true);
         void session.prompt(command.message).catch((error) => {
@@ -213,6 +284,8 @@ async function handle(command) {
             `[pi-acp-sdk] prompt failed: ${error.message}\n`,
           );
           streaming = false;
+          pendingDeliveryIds = [];
+          pendingTriggerIds = [];
           terminalPublication.endPrompt();
           steeringDelivery.rejectAll((pending) =>
             response(
@@ -247,6 +320,8 @@ async function handle(command) {
         break;
       }
       case "abort":
+        pendingDeliveryIds = [];
+        pendingTriggerIds = [];
         steeringDelivery.rejectAll((pending) =>
           response(
             pending,
@@ -301,6 +376,9 @@ async function shutdown() {
     session.dispose();
   } catch {
     // Startup or shutdown already failed.
+  } finally {
+    releaseTaskLease?.();
+    releaseTaskLease = undefined;
   }
 }
 

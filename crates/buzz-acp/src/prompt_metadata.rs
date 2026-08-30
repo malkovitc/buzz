@@ -52,10 +52,36 @@ pub(crate) fn cloud_control_for_batch(
     cloud_control_for_event(event, known_names, owner_pubkey, agent_pubkey)
 }
 
+pub(crate) fn task_thread_root_for_batch(
+    batch: &FlushBatch,
+    channel_info: Option<&PromptChannelInfo>,
+) -> Option<String> {
+    if channel_info.is_none_or(|info| info.channel_type == "dm") {
+        return None;
+    }
+    let roots: Vec<String> = batch
+        .cancelled_events
+        .iter()
+        .chain(batch.events.iter())
+        .map(|queued| {
+            let event_id = queued.event.id.to_hex();
+            parse_thread_tags(&queued.event)
+                .root_event_id
+                .unwrap_or(event_id)
+        })
+        .collect();
+    roots
+        .first()
+        .filter(|first| roots.iter().all(|root| root == *first))
+        .cloned()
+}
+
 pub(crate) fn for_batch(
     batch: &FlushBatch,
     channel_info: Option<&PromptChannelInfo>,
     profile_lookup: Option<&PromptProfileLookup>,
+    agent_pubkey: &nostr::PublicKey,
+    relay_url: &str,
 ) -> Option<BuzzPromptMetadata> {
     let last = batch
         .events
@@ -80,11 +106,18 @@ pub(crate) fn for_batch(
         )
         .unwrap_or_else(|| triggering_id.clone())
     };
+    let task_thread_root = task_thread_root_for_batch(batch, channel_info);
     Some(BuzzPromptMetadata {
+        relay_url: relay_url.to_string(),
+        agent_pubkey: agent_pubkey.to_hex(),
         channel_id: batch.channel_id.to_string(),
         triggering_event_ids,
         allowed_reply_event_ids: vec![reply_to.clone()],
+        delivered_event_ids: Vec::new(),
+        processed_trigger_event_ids: Vec::new(),
         reply_to,
+        task_thread_root,
+        reset_task_session: false,
         control_command: None,
     })
 }
@@ -98,6 +131,14 @@ mod tests {
 
     use super::*;
     use crate::queue::BatchEvent;
+
+    fn stream_info() -> PromptChannelInfo {
+        PromptChannelInfo {
+            name: "test".into(),
+            channel_type: "stream".into(),
+            description: None,
+        }
+    }
 
     fn batch(tags: Vec<Tag>) -> FlushBatch {
         let event = EventBuilder::new(Kind::Custom(9), "reply")
@@ -211,15 +252,87 @@ mod tests {
             Tag::parse(["e", &root, "", "root"]).unwrap(),
             Tag::parse(["e", &parent, "", "reply"]).unwrap(),
         ];
-        let metadata = for_batch(&batch(tags), None, None).unwrap();
+        let metadata = for_batch(
+            &batch(tags),
+            Some(&stream_info()),
+            None,
+            &Keys::generate().public_key(),
+            "wss://relay.example",
+        )
+        .unwrap();
         assert_eq!(metadata.reply_to, root);
+        assert_eq!(metadata.task_thread_root, Some(root.clone()));
         assert_ne!(metadata.reply_to, metadata.triggering_event_ids[0]);
         assert_eq!(metadata.allowed_reply_event_ids, vec![metadata.reply_to]);
     }
 
     #[test]
     fn top_level_publication_uses_the_triggering_event() {
-        let metadata = for_batch(&batch(Vec::new()), None, None).unwrap();
+        let metadata = for_batch(
+            &batch(Vec::new()),
+            Some(&stream_info()),
+            None,
+            &Keys::generate().public_key(),
+            "wss://relay.example",
+        )
+        .unwrap();
         assert_eq!(metadata.reply_to, metadata.triggering_event_ids[0]);
+        assert_eq!(
+            metadata.task_thread_root,
+            metadata.triggering_event_ids.first().cloned()
+        );
+    }
+
+    #[test]
+    fn mixed_thread_batches_are_not_durable_task_sessions() {
+        let root_a = "a".repeat(64);
+        let root_b = "b".repeat(64);
+        let event_a = EventBuilder::new(Kind::Custom(9), "a")
+            .tags([Tag::parse(["e", &root_a, "", "root"]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let event_b = EventBuilder::new(Kind::Custom(9), "b")
+            .tags([Tag::parse(["e", &root_b, "", "root"]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![
+                BatchEvent {
+                    event: event_a,
+                    prompt_tag: "test".into(),
+                    received_at: Instant::now(),
+                },
+                BatchEvent {
+                    event: event_b,
+                    prompt_tag: "test".into(),
+                    received_at: Instant::now(),
+                },
+            ],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        let metadata = for_batch(
+            &batch,
+            Some(&stream_info()),
+            None,
+            &Keys::generate().public_key(),
+            "wss://relay.example",
+        )
+        .unwrap();
+        assert_eq!(metadata.task_thread_root, None);
+    }
+
+    #[test]
+    fn unresolved_channel_type_is_ephemeral() {
+        let metadata = for_batch(
+            &batch(Vec::new()),
+            None,
+            None,
+            &Keys::generate().public_key(),
+            "wss://relay.example",
+        )
+        .unwrap();
+        assert_eq!(metadata.task_thread_root, None);
     }
 }

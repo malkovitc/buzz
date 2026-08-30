@@ -129,10 +129,14 @@ try {
       prompt: [{ type: "text", text: selected.prompt }],
       _meta: {
         buzz: {
+          relayUrl: "wss://benchmark.invalid",
+          agentPubkey: "f".repeat(64),
           channelId: "4dcab690-a2ca-4a56-9e5d-d901d12f83c3",
           triggeringEventIds: [eventId],
           allowedReplyEventIds: [eventId],
           replyTo: eventId,
+          taskThreadRoot: eventId,
+          deliveredEventIds: [eventId],
         },
       },
     },
