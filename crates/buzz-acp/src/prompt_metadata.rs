@@ -1,8 +1,35 @@
 use crate::acp::BuzzPromptMetadata;
 use crate::queue::{
-    cloud_control_command_for_batch, parse_thread_tags, resolve_reply_anchor, FlushBatch,
-    PromptChannelInfo, PromptProfileLookup,
+    parse_thread_tags, resolve_reply_anchor, FlushBatch, PromptChannelInfo, PromptProfileLookup,
 };
+
+pub(crate) fn is_authenticated_cloud_control_event(
+    event: &nostr::Event,
+    owner_pubkey: Option<&nostr::PublicKey>,
+    agent_pubkey: &nostr::PublicKey,
+) -> bool {
+    let Some(owner) = owner_pubkey else {
+        return false;
+    };
+    let agent_hex = agent_pubkey.to_hex();
+    event.kind.as_u16() == buzz_core::kind::KIND_STREAM_MESSAGE as u16
+        && event.pubkey == *owner
+        && event.tags.iter().any(|tag| {
+            tag.as_slice().first().map(String::as_str) == Some("p")
+                && tag.as_slice().get(1).map(String::as_str) == Some(agent_hex.as_str())
+        })
+}
+
+pub(crate) fn cloud_control_for_event(
+    event: &nostr::Event,
+    known_names: &[&str],
+    owner_pubkey: Option<&nostr::PublicKey>,
+    agent_pubkey: &nostr::PublicKey,
+) -> Option<String> {
+    is_authenticated_cloud_control_event(event, owner_pubkey, agent_pubkey)
+        .then(|| crate::queue::extract_cloud_control_command(&event.content, known_names))
+        .flatten()
+}
 
 pub(crate) fn cloud_control_for_batch(
     batch: &FlushBatch,
@@ -10,19 +37,19 @@ pub(crate) fn cloud_control_for_batch(
     owner_pubkey: Option<&nostr::PublicKey>,
     agent_pubkey: &nostr::PublicKey,
 ) -> Option<String> {
-    let event = &batch.events.first()?.event;
-    let owner = owner_pubkey?;
-    let agent_hex = agent_pubkey.to_hex();
-    if event.kind.as_u16() != buzz_core::kind::KIND_STREAM_MESSAGE as u16
-        || event.pubkey != *owner
-        || !event.tags.iter().any(|tag| {
-            tag.as_slice().first().map(String::as_str) == Some("p")
-                && tag.as_slice().get(1).map(String::as_str) == Some(agent_hex.as_str())
-        })
-    {
+    if batch.events.len() != 1 || !batch.cancelled_events.is_empty() {
         return None;
     }
-    cloud_control_command_for_batch(batch, known_names)
+    let event = &batch.events.first()?.event;
+    if !is_authenticated_cloud_control_event(event, owner_pubkey, agent_pubkey) {
+        return None;
+    }
+    if let Some(command) = batch.events[0].prompt_tag.strip_prefix("__buzz_control:") {
+        if matches!(command, "-status" | "-cloud" | "-local") {
+            return Some(command.to_string());
+        }
+    }
+    cloud_control_for_event(event, known_names, owner_pubkey, agent_pubkey)
 }
 
 pub(crate) fn for_batch(
@@ -135,6 +162,44 @@ mod tests {
             ),
             None,
             "the event must mention this exact agent"
+        );
+
+        let pre_admitted = EventBuilder::new(Kind::Custom(9), "@Unknown Multi Alias -status")
+            .tags([Tag::public_key(agent.public_key())])
+            .sign_with_keys(&owner)
+            .unwrap();
+        let pre_admitted_batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event: pre_admitted,
+                prompt_tag: "__buzz_control:-status".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        assert_eq!(
+            cloud_control_for_batch(
+                &pre_admitted_batch,
+                &[],
+                Some(&owner.public_key()),
+                &agent.public_key(),
+            ),
+            Some("-status".into())
+        );
+
+        let malformed = EventBuilder::new(Kind::Custom(9), "@Caliper -status check")
+            .tags([Tag::public_key(agent.public_key())])
+            .sign_with_keys(&owner)
+            .unwrap();
+        assert_eq!(
+            cloud_control_for_event(
+                &malformed,
+                &["Caliper"],
+                Some(&owner.public_key()),
+                &agent.public_key(),
+            ),
+            Some(crate::queue::REJECTED_CLOUD_CONTROL_COMMAND.into())
         );
     }
 

@@ -2445,8 +2445,13 @@ pub async fn run_prompt_task(
                     .iter()
                     .any(|event_id| delivered_ids.contains(event_id))
             });
-        let conversation_context =
-            conversation_context_delta(conversation_context, &delivered_ids, &rendered_batch_ids);
+        let conversation_context = conversation_context_delta(
+            conversation_context,
+            &delivered_ids,
+            &rendered_batch_ids,
+            ctx.agent_owner_pubkey.as_ref(),
+            &ctx.agent_keys.public_key(),
+        );
         pending_delivered_event_ids.extend(rendered_batch_ids);
         pending_delivered_event_ids.extend(conversation_context_event_ids(
             conversation_context.as_ref(),
@@ -3355,14 +3360,26 @@ fn conversation_context_delta(
     context: Option<ConversationContext>,
     delivered: &HashSet<String>,
     triggering: &HashSet<String>,
+    owner_pubkey: Option<&nostr::PublicKey>,
+    agent_pubkey: &nostr::PublicKey,
 ) -> Option<ConversationContext> {
     let filter = |messages: Vec<ContextMessage>| {
         messages
             .into_iter()
             .filter(|message| {
-                message.event_id.is_empty()
-                    || (!delivered.contains(&message.event_id)
-                        && !triggering.contains(&message.event_id))
+                let rejected_owner_control = owner_pubkey.is_some_and(|owner| {
+                    message.kind == buzz_core::kind::KIND_STREAM_MESSAGE
+                        && message.pubkey == owner.to_hex()
+                        && message
+                            .mentioned_pubkeys
+                            .iter()
+                            .any(|mentioned| mentioned == &agent_pubkey.to_hex())
+                        && crate::queue::contains_reserved_cloud_control_token(&message.content)
+                });
+                !rejected_owner_control
+                    && (message.event_id.is_empty()
+                        || (!delivered.contains(&message.event_id)
+                            && !triggering.contains(&message.event_id)))
             })
             .collect::<Vec<_>>()
     };
@@ -3912,17 +3929,35 @@ fn json_to_context_message(obj: &serde_json::Value) -> Option<ContextMessage> {
         })
         .unwrap_or_else(|| "unknown".to_string());
 
+    let kind = obj
+        .get("kind")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_default();
     let event_id = obj
         .get("id")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
 
+    let mentioned_pubkeys = obj
+        .get("tags")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|tag| tag.as_array())
+        .filter(|tag| tag.first().and_then(|value| value.as_str()) == Some("p"))
+        .filter_map(|tag| tag.get(1).and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+
     Some(ContextMessage {
         event_id,
+        kind,
         pubkey: pubkey.to_string(),
         timestamp,
         content: content.to_string(),
+        mentioned_pubkeys,
     })
 }
 
@@ -6040,9 +6075,11 @@ mod tests {
         let context = ConversationContext::Thread {
             messages: vec![ContextMessage {
                 event_id: String::new(),
+                kind: buzz_core::kind::KIND_STREAM_MESSAGE,
                 pubkey: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
                 timestamp: "2026-03-25T05:51:25Z".into(),
                 content: "follow up".into(),
+                mentioned_pubkeys: Vec::new(),
             }],
             total: 1,
             truncated: false,
@@ -6117,9 +6154,11 @@ mod tests {
     fn context_message(event_id: &str, content: &str) -> ContextMessage {
         ContextMessage {
             event_id: event_id.to_string(),
+            kind: buzz_core::kind::KIND_STREAM_MESSAGE,
             pubkey: "author".into(),
             timestamp: "2026-08-09T00:00:00Z".into(),
             content: content.into(),
+            mentioned_pubkeys: Vec::new(),
         }
     }
 
@@ -6709,19 +6748,37 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     fn conversation_context_delta_omits_delivered_and_triggering_events() {
         let delivered = HashSet::from(["old".to_string()]);
         let triggering = HashSet::from(["trigger".to_string()]);
+        let owner = Keys::generate().public_key();
+        let agent = Keys::generate().public_key();
+        let mut rejected = context_message("rejected", "@Caliper -cloud check");
+        rejected.pubkey = owner.to_hex();
+        rejected.mentioned_pubkeys = vec![agent.to_hex()];
+        let mut forum_reserved = context_message("forum-flag", "discuss -local semantics");
+        forum_reserved.kind = buzz_core::kind::KIND_FORUM_COMMENT;
+        forum_reserved.pubkey = owner.to_hex();
+        forum_reserved.mentioned_pubkeys = vec![agent.to_hex()];
         let context = ConversationContext::Thread {
             messages: vec![
                 context_message("old", "already sent"),
                 context_message("trigger", "rendered as trigger"),
+                rejected,
+                forum_reserved,
+                context_message("ordinary-flag", "please inspect the -status parser"),
                 context_message("new", "new context"),
             ],
-            total: 3,
+            total: 6,
             truncated: false,
             root_kind: Some(buzz_core::kind::KIND_FORUM_POST),
         };
 
-        let delta = conversation_context_delta(Some(context), &delivered, &triggering)
-            .expect("new context remains");
+        let delta = conversation_context_delta(
+            Some(context),
+            &delivered,
+            &triggering,
+            Some(&owner),
+            &agent,
+        )
+        .expect("new context remains");
         match delta {
             ConversationContext::Thread {
                 messages,
@@ -6729,9 +6786,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 truncated,
                 root_kind,
             } => {
-                assert_eq!(messages.len(), 1);
-                assert_eq!(messages[0].event_id, "new");
-                assert_eq!(total, 3);
+                assert_eq!(messages.len(), 3);
+                assert_eq!(messages[0].event_id, "forum-flag");
+                assert_eq!(messages[1].event_id, "ordinary-flag");
+                assert_eq!(messages[2].event_id, "new");
+                assert_eq!(total, 6);
                 assert!(!truncated);
                 assert_eq!(root_kind, Some(buzz_core::kind::KIND_FORUM_POST));
             }
@@ -6748,7 +6807,15 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             truncated: false,
         };
 
-        assert!(conversation_context_delta(Some(context), &delivered, &HashSet::new()).is_none());
+        let agent = Keys::generate().public_key();
+        assert!(conversation_context_delta(
+            Some(context),
+            &delivered,
+            &HashSet::new(),
+            None,
+            &agent,
+        )
+        .is_none());
     }
 
     #[test]
@@ -6759,9 +6826,15 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             truncated: false,
         };
 
-        assert!(
-            conversation_context_delta(Some(context), &HashSet::new(), &HashSet::new()).is_some()
-        );
+        let agent = Keys::generate().public_key();
+        assert!(conversation_context_delta(
+            Some(context),
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+            &agent,
+        )
+        .is_some());
     }
 
     #[test]

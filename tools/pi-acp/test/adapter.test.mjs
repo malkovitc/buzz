@@ -65,6 +65,7 @@ function startHarness(mode = "complete") {
           : mode === "control-commit-cancel"
             ? fakeSlowCommitPath
             : fakeCloudControlPath,
+      BUZZ_ACP_CLOUD_CONTROL_CHANNEL_ID: buzzMeta.buzz.channelId,
       PI_ACP_RECEIPT_DIR: receiptDir,
       FAKE_PI_STARTED_FILE: piStartedFile,
       BUZZ_PRIVATE_KEY: "1".repeat(64),
@@ -145,7 +146,7 @@ async function handshake(harness) {
   assert.equal(initialized.result._meta.steering.supported, true);
   assert.equal(initialized.result._meta.pilot.liveCanaryValidated, true);
   assert.equal(initialized.result._meta.pilot.fleetApproved, false);
-  assert.equal(initialized.result.agentInfo.version, "0.2.6");
+  assert.equal(initialized.result.agentInfo.version, "0.2.7");
 
   harness.send({
     jsonrpc: "2.0",
@@ -330,6 +331,42 @@ test("rejects unknown authenticated control metadata without an LLM fallback", a
   const rejected = await harness.waitFor((message) => message.id === 3);
   assert.equal(rejected.error.code, -32602);
   assert.equal(fs.existsSync(harness.piStartedFile), false);
+});
+
+test("drops malformed and wrong-channel reserved commands before controller or model", async (t) => {
+  const harness = startHarness();
+  t.after(() => harness.close());
+  const sessionId = await handshake(harness);
+  for (const [id, controlCommand, channelId] of [
+    [3, "__buzz_rejected_cloud_control__", buzzMeta.buzz.channelId],
+    [4, "-status", "11111111-1111-4111-8111-111111111111"],
+  ]) {
+    harness.send({
+      jsonrpc: "2.0",
+      id,
+      method: "session/prompt",
+      params: {
+        sessionId,
+        prompt: [{ type: "text", text: "reserved command attempt" }],
+        _meta: { buzz: { ...buzzMeta.buzz, channelId, controlCommand } },
+      },
+    });
+    const completed = await harness.waitFor((message) => message.id === id);
+    assert.equal(completed.result.stopReason, "end_turn");
+    assert.deepEqual(completed.result._meta.cloudControl, {
+      rejected: true,
+      deterministic: true,
+    });
+  }
+  assert.equal(fs.existsSync(harness.piStartedFile), false);
+  assert.equal(
+    harness.messages.some((message) =>
+      ["agent_message_chunk", "usage_update", "tool_call"].includes(
+        message.params?.update?.sessionUpdate,
+      ),
+    ),
+    false,
+  );
 });
 
 test("steers an active Pi prompt without starting a second ACP prompt", async (t) => {

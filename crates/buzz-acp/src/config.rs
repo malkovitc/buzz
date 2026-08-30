@@ -1292,6 +1292,17 @@ pub fn load_rules(path: &std::path::Path) -> Result<Vec<SubscriptionRule>, Confi
                 "rule name must not be empty".into(),
             ));
         }
+        if rule.name.starts_with("__buzz_control:")
+            || rule
+                .prompt_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("__buzz_control:"))
+        {
+            return Err(ConfigError::ConfigFile(format!(
+                "rule '{}': reserved prompt tag prefix",
+                rule.name
+            )));
+        }
         if !seen_names.insert(rule.name.clone()) {
             return Err(ConfigError::ConfigFile(format!(
                 "duplicate rule name: {}",
@@ -2135,6 +2146,27 @@ channels = "all"
 
         let err = load_rules(&path).unwrap_err();
         assert!(err.to_string().contains("name must not be empty"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_rules_reserved_control_tag_rejected() {
+        let dir = std::env::temp_dir().join("buzz-acp-test-reserved-control-tag");
+        let path = dir.join("rules.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"
+[[rules]]
+name = "catch-all"
+channels = "all"
+prompt_tag = "__buzz_control:-cloud"
+"#,
+        )
+        .unwrap();
+
+        let err = load_rules(&path).unwrap_err();
+        assert!(err.to_string().contains("reserved prompt tag prefix"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

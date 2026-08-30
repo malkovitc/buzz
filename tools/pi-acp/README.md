@@ -50,7 +50,7 @@ From a reviewed exact Buzz commit:
 
 ```bash
 npm install --global ./tools/pi-acp
-pi-acp --version  # pi-acp 0.2.6 or newer
+pi-acp --version  # pi-acp 0.2.7 or newer
 ```
 
 The adapter uses Pi's existing provider authentication. Run Pi interactively once if the host has
@@ -64,6 +64,7 @@ PI_ACP_MAX_PROCESSED_TOKENS
 PI_ACP_REQUIRE_POWER_LOSS_DURABILITY  # Linux-only strict receipt mode
 PI_ACP_CLOUD_CONTROL_COMMAND           # absolute trusted controller client path
 PI_ACP_CLOUD_CONTROL_TIMEOUT_MS        # 1000..900000; default 600000
+BUZZ_ACP_CLOUD_CONTROL_CHANNEL_ID       # one approved channel UUID; all others reject pre-controller
 ```
 
 The cloud controller receives a strict JSON object on stdin. A `prepare` request returns

@@ -49,6 +49,8 @@ pub struct QueuedEvent {
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
+    /// Authenticated exact ownership command; acts as a strict queue barrier.
+    pub is_cloud_control: bool,
 }
 
 /// A single event inside a [`FlushBatch`].
@@ -57,6 +59,13 @@ pub struct BatchEvent {
     pub event: Event,
     pub prompt_tag: String,
     pub received_at: Instant,
+}
+
+fn control_precedes(queued: &QueuedEvent, event: &BatchEvent) -> bool {
+    queued.is_cloud_control
+        && (queued.event.created_at < event.event.created_at
+            || (queued.event.created_at == event.event.created_at
+                && queued.received_at <= event.received_at))
 }
 
 /// Why a batch's prior turn was cancelled — controls how `format_prompt`
@@ -137,6 +146,7 @@ pub struct FlushBatch {
 pub struct EventQueue {
     queues: HashMap<Uuid, VecDeque<QueuedEvent>>,
     in_flight_channels: HashSet<Uuid>,
+    in_flight_cloud_control: HashSet<Uuid>,
     /// Per-channel deadline for auto-expiring stuck in-flight entries.
     in_flight_deadlines: HashMap<Uuid, Instant>,
     /// Number of events in each in-flight batch (for expiry logging).
@@ -180,6 +190,7 @@ impl EventQueue {
         Self {
             queues: HashMap::new(),
             in_flight_channels: HashSet::new(),
+            in_flight_cloud_control: HashSet::new(),
             in_flight_deadlines: HashMap::new(),
             in_flight_batch_sizes: HashMap::new(),
             retry_after: HashMap::new(),
@@ -229,6 +240,7 @@ impl EventQueue {
     /// Returns `true` if the event was accepted, `false` if dropped.
     pub fn push(&mut self, event: QueuedEvent) -> bool {
         if matches!(self.dedup_mode, DedupMode::Drop)
+            && !event.is_cloud_control
             && self.in_flight_channels.contains(&event.channel_id)
         {
             tracing::debug!(
@@ -238,16 +250,39 @@ impl EventQueue {
             return false;
         }
         let queue = self.queues.entry(event.channel_id).or_default();
-        // Enforce per-channel depth cap: drop oldest to make room.
+        // Preserve privileged control barriers under backlog pressure: evict
+        // the oldest ordinary item, never a queued ownership command.
         if queue.len() >= MAX_PENDING_PER_CHANNEL {
-            queue.pop_front();
-            tracing::warn!(
-                channel_id = %event.channel_id,
-                limit = MAX_PENDING_PER_CHANNEL,
-                "queue depth cap reached — dropped oldest event"
-            );
+            if let Some(index) = queue.iter().position(|queued| !queued.is_cloud_control) {
+                queue.remove(index);
+                tracing::warn!(
+                    channel_id = %event.channel_id,
+                    limit = MAX_PENDING_PER_CHANNEL,
+                    "queue depth cap reached — dropped oldest ordinary event"
+                );
+            } else {
+                tracing::warn!(
+                    channel_id = %event.channel_id,
+                    limit = MAX_PENDING_PER_CHANNEL,
+                    "queue depth cap contains only controls — rejected new event"
+                );
+                return false;
+            }
         }
-        queue.push_back(event);
+        if event.is_cloud_control {
+            let event_as_batch = BatchEvent {
+                event: event.event.clone(),
+                prompt_tag: event.prompt_tag.clone(),
+                received_at: event.received_at,
+            };
+            let insert_at = queue
+                .iter()
+                .take_while(|queued| control_precedes(queued, &event_as_batch))
+                .count();
+            queue.insert(insert_at, event);
+        } else {
+            queue.push_back(event);
+        }
         true
     }
 
@@ -277,6 +312,7 @@ impl EventQueue {
                  auto-releasing; {lost_events} dispatched event(s) orphaned"
             );
             self.in_flight_channels.remove(&id);
+            self.in_flight_cloud_control.remove(&id);
             self.in_flight_deadlines.remove(&id);
             // Recover any withheld goose-native steer events for the expired
             // channel back to the queue front so normal dispatch delivers
@@ -308,7 +344,12 @@ impl EventQueue {
                 let cancelled_id = self
                     .cancelled_batches
                     .keys()
-                    .find(|id| !self.in_flight_channels.contains(id))
+                    .find(|id| {
+                        !self.in_flight_channels.contains(id)
+                            && !self.queues.get(id).is_some_and(|queue| {
+                                queue.iter().any(|event| event.is_cloud_control)
+                            })
+                    })
                     .copied();
                 match cancelled_id {
                     Some(id) => {
@@ -332,9 +373,20 @@ impl EventQueue {
             }
         };
 
-        // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
+        // Reserved control-shaped events are strict batch boundaries. This
+        // prevents a delayed exact command from ever merging with ordinary
+        // model input while it waits for a worker.
+        let first_reserved = self
+            .queues
+            .get(&channel_id)
+            .and_then(|queue| queue.iter().position(|queued| queued.is_cloud_control));
+        let draining_cloud_control = first_reserved == Some(0);
         let queue = self.queues.entry(channel_id).or_default();
-        let drain_count = MAX_BATCH_EVENTS.min(queue.len());
+        let drain_count = match first_reserved {
+            Some(0) => 1,
+            Some(index) => MAX_BATCH_EVENTS.min(index),
+            None => MAX_BATCH_EVENTS.min(queue.len()),
+        };
         let mut events: Vec<BatchEvent> = queue
             .drain(..drain_count)
             .map(|qe| BatchEvent {
@@ -355,20 +407,29 @@ impl EventQueue {
         }
 
         self.in_flight_channels.insert(channel_id);
+        if draining_cloud_control {
+            self.in_flight_cloud_control.insert(channel_id);
+        }
         self.in_flight_deadlines
             .insert(channel_id, now + self.in_flight_deadline);
         self.in_flight_batch_sizes.insert(channel_id, events.len());
 
-        // Merge any cancelled events stored by requeue_as_cancelled().
-        let cancelled_events = self
-            .cancelled_batches
-            .remove(&channel_id)
-            .unwrap_or_default();
-        let cancel_reason = if cancelled_events.is_empty() {
-            self.cancel_reasons.remove(&channel_id);
-            None
+        // A control barrier executes before cancelled model carryover. The
+        // carryover remains stored and flushes normally after the control.
+        let (cancelled_events, cancel_reason) = if draining_cloud_control {
+            (Vec::new(), None)
         } else {
-            self.cancel_reasons.remove(&channel_id)
+            let cancelled_events = self
+                .cancelled_batches
+                .remove(&channel_id)
+                .unwrap_or_default();
+            let cancel_reason = if cancelled_events.is_empty() {
+                self.cancel_reasons.remove(&channel_id);
+                None
+            } else {
+                self.cancel_reasons.remove(&channel_id)
+            };
+            (cancelled_events, cancel_reason)
         };
 
         Some(FlushBatch {
@@ -391,6 +452,7 @@ impl EventQueue {
     /// Also cleans up any already-expired `retry_after` entry.
     pub fn mark_complete(&mut self, channel_id: Uuid) {
         self.in_flight_channels.remove(&channel_id);
+        self.in_flight_cloud_control.remove(&channel_id);
         self.in_flight_deadlines.remove(&channel_id);
         self.in_flight_batch_sizes.remove(&channel_id);
         let now = Instant::now();
@@ -426,6 +488,56 @@ impl EventQueue {
     ///
     /// Note: does NOT remove from `in_flight_channels` — caller must call
     /// `mark_complete` separately.
+    fn batch_event_is_control(&self, event: &BatchEvent) -> bool {
+        event.prompt_tag.starts_with("__buzz_control:")
+    }
+
+    fn reinsert_events(&mut self, channel_id: Uuid, events: Vec<BatchEvent>) {
+        let mut controls = Vec::new();
+        let mut ordinary = Vec::new();
+        for event in events {
+            if self.batch_event_is_control(&event) {
+                controls.push(event);
+            } else {
+                ordinary.push(event);
+            }
+        }
+        controls.sort_by_key(|event| (event.event.created_at, event.received_at));
+        let queue = self.queues.entry(channel_id).or_default();
+        for event in controls {
+            let insert_at = queue
+                .iter()
+                .take_while(|queued| control_precedes(queued, &event))
+                .count();
+            queue.insert(
+                insert_at,
+                QueuedEvent {
+                    channel_id,
+                    event: event.event,
+                    received_at: event.received_at,
+                    prompt_tag: event.prompt_tag,
+                    is_cloud_control: true,
+                },
+            );
+        }
+        let ordinary_start = queue
+            .iter()
+            .take_while(|queued| queued.is_cloud_control)
+            .count();
+        for (offset, event) in ordinary.into_iter().enumerate() {
+            queue.insert(
+                ordinary_start + offset,
+                QueuedEvent {
+                    channel_id,
+                    event: event.event,
+                    received_at: event.received_at,
+                    prompt_tag: event.prompt_tag,
+                    is_cloud_control: false,
+                },
+            );
+        }
+    }
+
     pub fn requeue(&mut self, batch: FlushBatch) -> Option<FlushBatch> {
         let channel_id = batch.channel_id;
         let attempt = {
@@ -472,25 +584,20 @@ impl EventQueue {
             "requeueing failed batch with backoff"
         );
 
+        self.reinsert_events(channel_id, batch.events);
         let queue = self.queues.entry(channel_id).or_default();
-        // Push to front in reverse order so original order is preserved.
-        for be in batch.events.into_iter().rev() {
-            queue.push_front(QueuedEvent {
-                channel_id,
-                event: be.event,
-                prompt_tag: be.prompt_tag,
-                received_at: be.received_at, // preserve original timestamp (#46)
-            });
-        }
         // Enforce per-channel cap: trim oldest (back) events if requeue pushed
         // the queue over the limit. Without this, repeated requeue+push cycles
         // can grow the queue unboundedly.
         while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
+            let Some(index) = queue.iter().rposition(|event| !event.is_cloud_control) else {
+                break;
+            };
+            queue.remove(index);
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
-                "requeue overflow — dropped oldest event to enforce cap"
+                "requeue overflow — dropped ordinary event to preserve control barrier"
             );
         }
         self.retry_after.insert(channel_id, Instant::now() + delay);
@@ -507,23 +614,18 @@ impl EventQueue {
     /// caller must call `mark_complete` separately.
     pub fn requeue_preserve_timestamps(&mut self, batch: FlushBatch) {
         let channel_id = batch.channel_id;
+        self.reinsert_events(channel_id, batch.events);
         let queue = self.queues.entry(channel_id).or_default();
-        // Push to front in reverse order so original order is preserved.
-        for be in batch.events.into_iter().rev() {
-            queue.push_front(QueuedEvent {
-                channel_id,
-                event: be.event,
-                prompt_tag: be.prompt_tag,
-                received_at: be.received_at,
-            });
-        }
         // Enforce per-channel cap: trim newest (back) events if over limit.
         while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
+            let Some(index) = queue.iter().rposition(|event| !event.is_cloud_control) else {
+                break;
+            };
+            queue.remove(index);
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
-                "requeue_preserve overflow — dropped newest event to enforce cap"
+                "requeue_preserve overflow — dropped ordinary event to preserve control barrier"
             );
         }
     }
@@ -540,11 +642,44 @@ impl EventQueue {
     /// the generic queue — they are stored separately and merged by
     /// `flush_next()`. No retry throttle, no backoff.
     pub fn requeue_as_cancelled(&mut self, batch: FlushBatch, reason: CancelReason) {
-        let entry = self.cancelled_batches.entry(batch.channel_id).or_default();
-        // Preserve any already-cancelled events from a prior cancel (double-cancel).
-        entry.extend(batch.cancelled_events);
-        entry.extend(batch.events);
-        self.cancel_reasons.insert(batch.channel_id, reason);
+        let channel_id = batch.channel_id;
+        let mut controls = Vec::new();
+        let mut ordinary = Vec::new();
+        for event in batch.cancelled_events.into_iter().chain(batch.events) {
+            if self.batch_event_is_control(&event) {
+                controls.push(event);
+            } else {
+                ordinary.push(event);
+            }
+        }
+        let entry = self.cancelled_batches.entry(channel_id).or_default();
+        entry.extend(ordinary);
+        if entry.is_empty() {
+            self.cancelled_batches.remove(&channel_id);
+            self.cancel_reasons.remove(&channel_id);
+        } else {
+            self.cancel_reasons.insert(channel_id, reason);
+        }
+        if !controls.is_empty() {
+            controls.sort_by_key(|event| (event.event.created_at, event.received_at));
+            let queue = self.queues.entry(channel_id).or_default();
+            for event in controls {
+                let insert_at = queue
+                    .iter()
+                    .take_while(|queued| control_precedes(queued, &event))
+                    .count();
+                queue.insert(
+                    insert_at,
+                    QueuedEvent {
+                        channel_id,
+                        event: event.event,
+                        received_at: event.received_at,
+                        prompt_tag: event.prompt_tag,
+                        is_cloud_control: true,
+                    },
+                );
+            }
+        }
     }
 
     /// Returns `true` if any channel has pending events that are not in-flight
@@ -573,6 +708,7 @@ impl EventQueue {
                  auto-releasing; {lost_events} dispatched event(s) orphaned"
             );
             self.in_flight_channels.remove(&id);
+            self.in_flight_cloud_control.remove(&id);
             self.in_flight_deadlines.remove(&id);
             // Symmetric with the flush_next expiry block: recover withheld
             // goose-native steer events for the expired channel so they are
@@ -656,7 +792,7 @@ impl EventQueue {
     /// Returns the event IDs of dropped events so the caller can clean up
     /// any reactions (👀) that were added at queue-push time.
     pub fn drain_channel(&mut self, channel_id: Uuid) -> Vec<String> {
-        let ids = self
+        let ids: Vec<String> = self
             .queues
             .remove(&channel_id)
             .map(|q| q.into_iter().map(|e| e.event.id.to_hex()).collect())
@@ -677,6 +813,15 @@ impl EventQueue {
     /// Whether a prompt is currently in-flight for the given channel.
     pub fn is_channel_in_flight(&self, channel_id: Uuid) -> bool {
         self.in_flight_channels.contains(&channel_id)
+    }
+
+    /// Whether an authenticated control command is queued or currently executing.
+    pub fn has_cloud_control_barrier(&self, channel_id: Uuid) -> bool {
+        self.in_flight_cloud_control.contains(&channel_id)
+            || self
+                .queues
+                .get(&channel_id)
+                .is_some_and(|queue| queue.iter().any(|event| event.is_cloud_control))
     }
 
     /// Whether any channel currently has a turn in flight.
@@ -752,13 +897,19 @@ impl EventQueue {
         if entries.is_empty() {
             self.withheld_native_steer.remove(&channel_id);
         }
-        // Push to FRONT so original `received_at` keeps the event at the head
-        // of the channel's queue. Per-channel cap is enforced below in case
-        // a flood of events arrived during the ack window.
+        // A queued ownership command is a hard barrier; restore ordinary
+        // steer work immediately after all leading controls.
         let queue = self.queues.entry(channel_id).or_default();
-        queue.push_front(qe);
+        let insert_at = queue
+            .iter()
+            .take_while(|event| event.is_cloud_control)
+            .count();
+        queue.insert(insert_at, qe);
         while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
+            let Some(index) = queue.iter().rposition(|event| !event.is_cloud_control) else {
+                break;
+            };
+            queue.remove(index);
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
@@ -807,11 +958,18 @@ impl EventQueue {
         };
         let n = entries.len();
         let queue = self.queues.entry(channel_id).or_default();
-        for qe in entries.into_iter().rev() {
-            queue.push_front(qe);
+        let insert_at = queue
+            .iter()
+            .take_while(|event| event.is_cloud_control)
+            .count();
+        for (offset, event) in entries.into_iter().enumerate() {
+            queue.insert(insert_at + offset, event);
         }
         while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
+            let Some(index) = queue.iter().rposition(|event| !event.is_cloud_control) else {
+                break;
+            };
+            queue.remove(index);
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
@@ -978,22 +1136,38 @@ pub fn extract_slash_command(content: &str, known_names: &[&str]) -> Option<Stri
         .then(|| rest.to_string())
 }
 
-/// Extract one exact cloud ownership command after leading presentation mentions.
-///
-/// The real `p`-tag and owner signature are validated by the caller. This parser
-/// deliberately accepts no arguments or natural-language variants: unknown text
-/// must remain an ordinary agent prompt rather than gaining control semantics.
-pub fn extract_cloud_control_command(content: &str, known_names: &[&str]) -> Option<String> {
-    let command = strip_leading_mentions(content, known_names)?.trim();
-    matches!(command, "-status" | "-cloud" | "-local").then(|| command.to_string())
+/// Internal sentinel for authenticated but malformed reserved control input.
+pub const REJECTED_CLOUD_CONTROL_COMMAND: &str = "__buzz_rejected_cloud_control__";
+
+/// Detect reserved control tokens, including punctuation-wrapped malformed variants.
+pub fn contains_reserved_cloud_control_token(content: &str) -> bool {
+    let normalized = content.to_ascii_lowercase();
+    ["-status", "-cloud", "-local"].iter().any(|reserved| {
+        normalized.match_indices(reserved).any(|(index, _)| {
+            index == 0
+                || normalized[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| !character.is_ascii_alphanumeric())
+        })
+    })
 }
 
-/// Return the cloud control command for a single, non-cancelled batch.
-pub fn cloud_control_command_for_batch(batch: &FlushBatch, known_names: &[&str]) -> Option<String> {
-    if batch.events.len() != 1 || !batch.cancelled_events.is_empty() {
-        return None;
+/// Extract an exact cloud ownership command after leading presentation mentions.
+///
+/// The caller authenticates the owner signature and real agent `p` tag. Inputs
+/// that begin with a reserved command but are not exact return the rejection
+/// sentinel; unrelated natural language returns `None`.
+pub fn extract_cloud_control_command(content: &str, known_names: &[&str]) -> Option<String> {
+    let command = strip_leading_mentions(content, known_names)?.trim();
+    if matches!(command, "-status" | "-cloud" | "-local") {
+        return Some(command.to_string());
     }
-    extract_cloud_control_command(&batch.events[0].event.content, known_names)
+    let normalized = command.to_ascii_lowercase();
+    ["-status", "-cloud", "-local"]
+        .iter()
+        .any(|reserved| normalized.starts_with(reserved))
+        .then(|| REJECTED_CLOUD_CONTROL_COMMAND.to_string())
 }
 
 /// Return the slash command for a batch, if it qualifies for pass-through.
@@ -1033,9 +1207,11 @@ pub struct ContextMessage {
     /// Nostr event ID. Legacy REST fixtures may omit it, in which case it is
     /// empty and cannot participate in delivery deduplication.
     pub event_id: String,
+    pub kind: u32,
     pub pubkey: String,
     pub timestamp: String,
     pub content: String,
+    pub mentioned_pubkeys: Vec<String>,
 }
 
 /// Channel metadata for prompt formatting.
@@ -1809,11 +1985,17 @@ mod tests {
 
     /// Build a QueuedEvent for the given channel.
     fn make_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
+        let is_cloud_control = matches!(content, "-status" | "-cloud" | "-local");
         QueuedEvent {
             channel_id,
             event: make_event(content),
             received_at: Instant::now(),
-            prompt_tag: "test".into(),
+            prompt_tag: if is_cloud_control {
+                format!("__buzz_control:{content}")
+            } else {
+                "test".into()
+            },
+            is_cloud_control,
         }
     }
 
@@ -1824,6 +2006,7 @@ mod tests {
             event: make_event(content),
             received_at: Instant::now() - age,
             prompt_tag: "test".into(),
+            is_cloud_control: false,
         }
     }
 
@@ -1844,6 +2027,7 @@ mod tests {
             event,
             received_at: Instant::now(),
             prompt_tag: "test".into(),
+            is_cloud_control: false,
         }
     }
 
@@ -1943,6 +2127,28 @@ mod tests {
         // All drained.
         assert_eq!(pending_count(&q), 0);
         assert_eq!(q.queues.len(), 0);
+    }
+
+    #[test]
+    fn reserved_control_events_are_isolated_from_ordinary_batches() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "ordinary-before"));
+        q.push(make_queued(ch, "-status"));
+        q.push(make_queued(ch, "ordinary-after"));
+        assert!(q.has_cloud_control_barrier(ch));
+
+        let control = q.flush_next().unwrap();
+        assert_eq!(control.events.len(), 1);
+        assert_eq!(control.events[0].event.content, "-status");
+        assert!(q.has_cloud_control_barrier(ch));
+        q.mark_complete(ch);
+        assert!(!q.has_cloud_control_barrier(ch));
+
+        let last = q.flush_next().unwrap();
+        assert_eq!(last.events.len(), 2);
+        assert_eq!(last.events[0].event.content, "ordinary-before");
+        assert_eq!(last.events[1].event.content, "ordinary-after");
     }
 
     #[test]
@@ -2764,9 +2970,11 @@ mod tests {
         let ctx = ConversationContext::Thread {
             messages: vec![ContextMessage {
                 event_id: String::new(),
+                kind: buzz_core::kind::KIND_STREAM_MESSAGE,
                 pubkey: "npub1test".into(),
                 content: "prior message".into(),
                 timestamp: "2024-01-01T00:00:00Z".into(),
+                mentioned_pubkeys: Vec::new(),
             }],
             total: 1,
             truncated: false,
@@ -2977,6 +3185,104 @@ mod tests {
     }
 
     #[test]
+    fn replayed_controls_execute_in_signed_chronological_order() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let mut newer = make_queued_created_at(ch, "-local", 2_000);
+        newer.is_cloud_control = true;
+        let mut older = make_queued_created_at(ch, "-cloud", 1_000);
+        older.is_cloud_control = true;
+        q.push(newer);
+        q.push(older);
+
+        let first = q.flush_next().unwrap();
+        assert_eq!(first.events[0].event.content, "-cloud");
+        q.mark_complete(ch);
+        let second = q.flush_next().unwrap();
+        assert_eq!(second.events[0].event.content, "-local");
+    }
+
+    #[test]
+    fn native_steer_release_stays_behind_control_barrier() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "active"));
+        let _active = q.flush_next().unwrap();
+        let steer = make_queued(ch, "steered ordinary");
+        let steer_id = steer.event.id.to_hex();
+        q.push(steer);
+        assert!(q.mark_native_steer_pending(ch, &steer_id));
+        q.push(make_queued(ch, "-cloud"));
+        q.release_native_steer(ch, &steer_id);
+        q.mark_complete(ch);
+
+        let control = q.flush_next().unwrap();
+        assert_eq!(control.events[0].event.content, "-cloud");
+        q.mark_complete(ch);
+        let ordinary = q.flush_next().unwrap();
+        assert_eq!(ordinary.events[0].event.content, "steered ordinary");
+    }
+
+    #[test]
+    fn queue_cap_never_evicts_control_barrier() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "-status"));
+        for index in 0..MAX_PENDING_PER_CHANNEL {
+            q.push(make_queued(ch, &format!("ordinary-{index}")));
+        }
+        let control = q.flush_next().unwrap();
+        assert_eq!(control.events.len(), 1);
+        assert_eq!(control.events[0].event.content, "-status");
+    }
+
+    #[test]
+    fn cancelled_control_requeues_behind_its_barrier() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "-local"));
+        let batch = q.flush_next().unwrap();
+        q.requeue_as_cancelled(batch, CancelReason::Steer);
+        q.mark_complete(ch);
+        assert!(q.has_cloud_control_barrier(ch));
+        let retried = q.flush_next().unwrap();
+        assert_eq!(retried.events.len(), 1);
+        assert_eq!(retried.events[0].event.content, "-local");
+        assert!(retried.cancelled_events.is_empty());
+    }
+
+    #[test]
+    fn cancelled_control_keeps_order_ahead_of_newer_control() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "-cloud"));
+        let first = q.flush_next().unwrap();
+        q.push(make_queued(ch, "-local"));
+        q.requeue_as_cancelled(first, CancelReason::Steer);
+        q.mark_complete(ch);
+
+        let retried = q.flush_next().unwrap();
+        assert_eq!(retried.events[0].event.content, "-cloud");
+        q.mark_complete(ch);
+        let newer = q.flush_next().unwrap();
+        assert_eq!(newer.events[0].event.content, "-local");
+    }
+
+    #[test]
+    fn no_worker_requeue_preserves_control_barrier() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "-cloud"));
+        let batch = q.flush_next().unwrap();
+        q.requeue_preserve_timestamps(batch);
+        q.mark_complete(ch);
+        assert!(q.has_cloud_control_barrier(ch));
+        let retried = q.flush_next().unwrap();
+        assert_eq!(retried.events.len(), 1);
+        assert_eq!(retried.events[0].event.content, "-cloud");
+    }
+
+    #[test]
     fn test_requeue_preserve_timestamps() {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
@@ -2987,6 +3293,7 @@ mod tests {
             event: make_event("old-msg"),
             received_at: old_time,
             prompt_tag: "test".into(),
+            is_cloud_control: false,
         });
 
         let batch = q.flush_next().expect("flush");
@@ -3408,15 +3715,19 @@ mod tests {
             messages: vec![
                 ContextMessage {
                     event_id: String::new(),
+                    kind: buzz_core::kind::KIND_STREAM_MESSAGE,
                     pubkey: "npub1xyz".into(),
                     timestamp: "2026-03-15T16:30:00Z".into(),
                     content: "Let's refactor auth".into(),
+                    mentioned_pubkeys: Vec::new(),
                 },
                 ContextMessage {
                     event_id: String::new(),
+                    kind: buzz_core::kind::KIND_STREAM_MESSAGE,
                     pubkey: "npub1def".into(),
                     timestamp: "2026-03-15T16:35:00Z".into(),
                     content: "yes go ahead".into(),
+                    mentioned_pubkeys: Vec::new(),
                 },
             ],
             total: 5,
@@ -3460,9 +3771,11 @@ mod tests {
         let ctx = ConversationContext::Dm {
             messages: vec![ContextMessage {
                 event_id: String::new(),
+                kind: buzz_core::kind::KIND_STREAM_MESSAGE,
                 pubkey: "npub1abc".into(),
                 timestamp: "2026-03-15T16:00:00Z".into(),
                 content: "Can you deploy?".into(),
+                mentioned_pubkeys: Vec::new(),
             }],
             total: 1,
             truncated: false,
@@ -3506,9 +3819,11 @@ mod tests {
         let ctx = ConversationContext::Thread {
             messages: vec![ContextMessage {
                 event_id: String::new(),
+                kind: buzz_core::kind::KIND_STREAM_MESSAGE,
                 pubkey: author_hex.clone(),
                 timestamp: "2026-03-25T05:51:25Z".into(),
                 content: "follow up".into(),
+                mentioned_pubkeys: Vec::new(),
             }],
             total: 1,
             truncated: false,
@@ -3721,9 +4036,11 @@ mod tests {
         let ctx = ConversationContext::Thread {
             messages: vec![ContextMessage {
                 event_id: String::new(),
+                kind: buzz_core::kind::KIND_STREAM_MESSAGE,
                 pubkey: "npub1xyz".into(),
                 timestamp: "2026-03-15T16:30:00Z".into(),
                 content: "Should I deploy?".into(),
+                mentioned_pubkeys: Vec::new(),
             }],
             total: 1,
             truncated: false,
@@ -4682,35 +4999,30 @@ mod tests {
                 Some(command.to_string())
             );
         }
-        assert_eq!(extract_cloud_control_command("-cloud check", &[]), None);
+        for malformed in ["-cloud check", "-CLOUD", "-cloudy"] {
+            assert_eq!(
+                extract_cloud_control_command(malformed, &[]),
+                Some(REJECTED_CLOUD_CONTROL_COMMAND.into())
+            );
+        }
         assert_eq!(extract_cloud_control_command("please -cloud", &[]), None);
-        assert_eq!(extract_cloud_control_command("-CLOUD", &[]), None);
+        assert_eq!(
+            extract_cloud_control_command("@Unknown Multi Word Alias -status", &[]),
+            None
+        );
+        assert!(contains_reserved_cloud_control_token(
+            "@Unknown Alias -cloud check"
+        ));
+        assert!(contains_reserved_cloud_control_token("@Caliper (`-local`)"));
+        assert!(contains_reserved_cloud_control_token("@Caliper,-cloud"));
+        assert!(contains_reserved_cloud_control_token("@Caliper --cloud"));
+        assert!(!contains_reserved_cloud_control_token(
+            "review multi-cloud support"
+        ));
         assert_eq!(
             extract_cloud_control_command("@Caliper -cloud", &["Other"]),
             Some("-cloud".into())
         );
-    }
-
-    #[test]
-    fn test_cloud_control_command_for_batch_gating() {
-        assert_eq!(
-            cloud_control_command_for_batch(&make_single_batch("@Caliper -status"), &[]),
-            Some("-status".to_string())
-        );
-        let mut multi = make_single_batch("-status");
-        multi.events.push(BatchEvent {
-            event: make_event("another message"),
-            prompt_tag: "test".into(),
-            received_at: Instant::now(),
-        });
-        assert_eq!(cloud_control_command_for_batch(&multi, &[]), None);
-        let mut cancelled = make_single_batch("-local");
-        cancelled.cancelled_events.push(BatchEvent {
-            event: make_event("interrupted"),
-            prompt_tag: "test".into(),
-            received_at: Instant::now(),
-        });
-        assert_eq!(cloud_control_command_for_batch(&cancelled, &[]), None);
     }
 
     #[test]
