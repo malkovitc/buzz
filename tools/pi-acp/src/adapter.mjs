@@ -17,6 +17,30 @@ const INTERNAL_ERROR = -32603;
 const MAX_SYSTEM_PROMPT_BYTES = 64 * 1024;
 const MAX_TOOL_OUTPUT_BYTES = 16 * 1024;
 const CLOUD_CONTROL_COMMANDS = new Set(["-status", "-cloud", "-local"]);
+const REJECTED_CLOUD_CONTROL_COMMAND = "__buzz_rejected_cloud_control__";
+
+function canonicalUuid(value) {
+  if (typeof value !== "string") return null;
+  let normalized = value.trim().toLowerCase();
+  if (normalized.startsWith("urn:uuid:")) normalized = normalized.slice(9);
+  if (normalized.startsWith("{") && normalized.endsWith("}")) {
+    normalized = normalized.slice(1, -1);
+  }
+  normalized = normalized.replaceAll("-", "");
+  if (!/^[0-9a-f]{32}$/.test(normalized)) return null;
+  return [
+    normalized.slice(0, 8),
+    normalized.slice(8, 12),
+    normalized.slice(12, 16),
+    normalized.slice(16, 20),
+    normalized.slice(20),
+  ].join("-");
+}
+
+function sameControlChannel(configured, actual) {
+  const expected = canonicalUuid(configured);
+  return expected !== null && expected === canonicalUuid(actual);
+}
 
 function canonicalRelayUrl(value) {
   const relay = new URL(value);
@@ -533,7 +557,8 @@ export class PiAcpAdapter {
         !Array.isArray(buzzContext.triggeringEventIds) ||
         typeof buzzContext.replyTo !== "string" ||
         (buzzContext.controlCommand !== undefined &&
-          !CLOUD_CONTROL_COMMANDS.has(buzzContext.controlCommand)))
+          !CLOUD_CONTROL_COMMANDS.has(buzzContext.controlCommand) &&
+          buzzContext.controlCommand !== REJECTED_CLOUD_CONTROL_COMMAND))
     ) {
       this.#send(
         rpcError(
@@ -541,6 +566,22 @@ export class PiAcpAdapter {
           INVALID_PARAMS,
           "session/prompt: malformed authenticated _meta.buzz routing context",
         ),
+      );
+      return;
+    }
+    if (
+      buzzContext?.controlCommand === REJECTED_CLOUD_CONTROL_COMMAND ||
+      (buzzContext?.controlCommand &&
+        !sameControlChannel(
+          this.env.BUZZ_ACP_CLOUD_CONTROL_CHANNEL_ID,
+          buzzContext.channelId,
+        ))
+    ) {
+      this.#send(
+        rpcResult(message.id, {
+          stopReason: "end_turn",
+          _meta: { cloudControl: { rejected: true, deterministic: true } },
+        }),
       );
       return;
     }

@@ -1947,6 +1947,15 @@ async fn tokio_main() -> Result<()> {
         .init();
 
     let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+    if std::env::var_os("BUZZ_ACP_CLOUD_CONTROL_CHANNEL_ID").is_some()
+        && std::env::var("BUZZ_ACP_DISPLAY_NAME")
+            .ok()
+            .is_none_or(|name| name.trim().is_empty())
+    {
+        anyhow::bail!(
+            "BUZZ_ACP_DISPLAY_NAME is required when deterministic cloud control is enabled"
+        );
+    }
 
     // ── Setup-mode early branch ───────────────────────────────────────────────
     //
@@ -2055,6 +2064,21 @@ async fn tokio_main() -> Result<()> {
             }
             _ => {} // anyone/nobody don't depend on owner
         }
+    }
+    let control_channel = std::env::var("BUZZ_ACP_CLOUD_CONTROL_CHANNEL_ID")
+        .ok()
+        .map(|value| value.trim().parse::<Uuid>())
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("BUZZ_ACP_CLOUD_CONTROL_CHANNEL_ID must be a UUID"))?;
+    if control_channel.is_some()
+        && startup_owner
+            .as_deref()
+            .and_then(|owner| nostr::PublicKey::from_hex(owner).ok())
+            .is_none()
+    {
+        anyhow::bail!(
+            "a valid authenticated agent owner is required for deterministic cloud control"
+        );
     }
     let owner_cache = OwnerCache::new(startup_owner.clone());
 
@@ -2914,6 +2938,54 @@ async fn tokio_main() -> Result<()> {
                                     continue;
                                 }
                             };
+                            // Reserved ownership commands are admitted before queueing or
+                            // native steering so malformed/wrong-channel variants can never
+                            // become model input, even during an active turn.
+                            let configured_control_channel = control_channel;
+                            let display_name = std::env::var("BUZZ_ACP_DISPLAY_NAME").ok();
+                            let known_names: Vec<&str> =
+                                display_name.iter().map(String::as_str).collect();
+                            let owner_pubkey = owner_cache
+                                .get()
+                                .and_then(|value| nostr::PublicKey::from_hex(value).ok());
+                            let agent_pubkey = config.keys.public_key();
+                            let mut exact_control_event = false;
+                            let mut exact_control_command = None;
+                            if crate::prompt_metadata::is_authenticated_cloud_control_event(
+                                &buzz_event.event,
+                                owner_pubkey.as_ref(),
+                                &agent_pubkey,
+                            ) {
+                                let directive = crate::queue::extract_cloud_control_command(
+                                    &buzz_event.event.content,
+                                    &known_names,
+                                );
+                                let contains_reserved_token =
+                                    crate::queue::contains_reserved_cloud_control_token(
+                                        &buzz_event.event.content,
+                                    );
+                                let wrong_channel = configured_control_channel
+                                    != Some(buzz_event.channel_id);
+                                let exact_control = directive.as_deref().is_some_and(|value| {
+                                    matches!(value, "-status" | "-cloud" | "-local")
+                                });
+                                let rejected = directive.as_deref()
+                                    == Some(crate::queue::REJECTED_CLOUD_CONTROL_COMMAND)
+                                    || (directive.is_some() && wrong_channel)
+                                    || (directive.is_none() && contains_reserved_token);
+                                if rejected {
+                                    tracing::info!(
+                                        channel_id = %buzz_event.channel_id,
+                                        "reserved cloud control event rejected before model admission"
+                                    );
+                                    continue;
+                                }
+                                exact_control_event = exact_control;
+                                if exact_control {
+                                    exact_control_command = directive;
+                                }
+                            }
+
                             // Capture author pubkey before queue.push() moves
                             // buzz_event.event (needed for mode gate below).
                             let author_hex = buzz_event.event.pubkey.to_hex();
@@ -2928,6 +3000,10 @@ async fn tokio_main() -> Result<()> {
                             // accepted event goes through `queue.push`
                             // first. `nostr::Event::clone` is cheap (Arc-
                             // backed payload) so the cost is negligible.
+                            let prompt_tag = exact_control_command
+                                .as_deref()
+                                .map(|command| format!("__buzz_control:{command}"))
+                                .unwrap_or(prompt_tag);
                             let event_for_steer = buzz_event.event.clone();
                             let prompt_tag_for_steer = prompt_tag.clone();
                             let accepted = queue.push(QueuedEvent {
@@ -2935,6 +3011,7 @@ async fn tokio_main() -> Result<()> {
                                 event: buzz_event.event,
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
+                                is_cloud_control: exact_control_event,
                             });
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -2951,7 +3028,11 @@ async fn tokio_main() -> Result<()> {
                             // Event is already queued. If mode requires it AND
                             // the channel has an in-flight task, fire cancel —
                             // OR take the non-cancelling (ACP steer) fork for Steer signals.
-                            if accepted && queue.is_channel_in_flight(buzz_event.channel_id) {
+                            if accepted
+                                && !exact_control_event
+                                && !queue.has_cloud_control_barrier(buzz_event.channel_id)
+                                && queue.is_channel_in_flight(buzz_event.channel_id)
+                            {
                                 // Author eligibility (owner ∪ allowlist ∪ siblings)
                                 // is already enforced by the inbound author gate
                                 // above, so the mid-turn signal fires for every
@@ -8085,6 +8166,7 @@ mod error_outcome_emission_tests {
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
             prompt_tag: "test".into(),
+            is_cloud_control: false,
         });
         let config = test_config();
         let mut heartbeat_in_flight = false;
