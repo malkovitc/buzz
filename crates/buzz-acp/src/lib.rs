@@ -526,6 +526,28 @@ impl ObserverPublishQueue {
     /// Pending coalesced chunks are flushed into the queue first, so a
     /// publish slot never leaves merged chunk text stranded behind the tick.
     fn next_frame(&mut self) -> Option<observer::ObserverEvent> {
+        self.next_frame_fitting(
+            |_| {},
+            |frame| serialized_len(frame) <= OBSERVER_MAX_PLAINTEXT_LEN,
+        )
+    }
+
+    /// Pack one frame against the broker action's encoded argument budget.
+    /// Individual oversized events may be elided, but a batch that only
+    /// overflows because of the broker's outer JSON escaping is split and its
+    /// overflow remains queued for the next publish slot.
+    fn next_broker_frame(&mut self) -> Option<observer::ObserverEvent> {
+        self.next_frame_fitting(
+            fit_broker_observer_event_to_budget,
+            broker_observer_event_fits,
+        )
+    }
+
+    fn next_frame_fitting(
+        &mut self,
+        mut fit_single: impl FnMut(&mut observer::ObserverEvent),
+        frame_fits: impl Fn(&observer::ObserverEvent) -> bool,
+    ) -> Option<observer::ObserverEvent> {
         for (source_events, ready) in self.coalescer.flush() {
             self.enqueue(source_events, ready);
         }
@@ -535,18 +557,21 @@ impl ObserverPublishQueue {
         let mut kept: VecDeque<(usize, u64, observer::ObserverEvent)> =
             VecDeque::with_capacity(self.events.len());
         let mut gathering = true;
-        while let Some((bytes, source_events, event)) = self.events.pop_front() {
+        while let Some((old_bytes, source_events, mut event)) = self.events.pop_front() {
+            fit_single(&mut event);
+            let bytes = serialized_len(&event);
+            self.pending_bytes = self.pending_bytes - old_bytes + bytes;
             if gathering && event.channel_id == channel {
                 picked.push(event);
-                if picked.len() > 1
-                    && serialized_len(&batch_envelope(&picked)) > OBSERVER_MAX_PLAINTEXT_LEN
-                {
+                let candidate = seal_batch(picked.clone());
+                if picked.len() > 1 && !frame_fits(&candidate) {
                     // Frame full: the overflow event stays queued and leads
                     // its channel's next slot.
                     let event = picked.pop().expect("len > 1");
                     kept.push_back((bytes, source_events, event));
                     gathering = false;
                 } else {
+                    debug_assert!(frame_fits(&candidate));
                     self.pending_bytes -= bytes;
                 }
             } else {
@@ -653,8 +678,7 @@ fn spawn_broker_observer_publisher(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => closed = true,
                 },
                 _ = publish_tick.tick() => {
-                    if let Some(mut event) = queue.next_frame() {
-                        fit_broker_observer_event_to_budget(&mut event);
+                    if let Some(event) = queue.next_broker_frame() {
                         match serde_json::to_string(&event) {
                             Ok(payload) => {
                                 let frame = buzz_sdk::broker::ObserverFrame {
@@ -6439,6 +6463,41 @@ mod observer_publish_queue_tests {
             [1, 2, 3, 4, 5, 6],
             "no event lost or reordered by splitting"
         );
+    }
+
+    /// A broker frame has another JSON layer around the observer payload.
+    /// Many individually small, quote-heavy events can fit the relay
+    /// plaintext limit as one batch while exceeding the encoded broker action
+    /// limit. The overflow must remain queued, not collapse the whole batch to
+    /// an elision stub.
+    #[test]
+    fn broker_batches_split_before_outer_json_overflow_without_losing_events() {
+        let mut queue = queue_of(
+            (1..=31)
+                .map(|seq| {
+                    let mut e = event(seq, "tool_call", Some("chan-a"));
+                    e.payload = serde_json::json!({ "body": "\"".repeat(900) });
+                    e
+                })
+                .collect(),
+        );
+
+        let mut frames = Vec::new();
+        while !queue.is_empty() {
+            frames.push(queue.next_broker_frame().expect("queue not empty"));
+        }
+
+        assert!(frames.len() > 1, "outer encoding must split this batch");
+        assert!(frames.iter().all(broker_observer_event_fits));
+        assert!(
+            frames
+                .iter()
+                .all(|frame| !serde_json::to_string(frame).unwrap().contains("[elided")),
+            "small source events must not be elided"
+        );
+        let published: Vec<u64> = frames.iter().flat_map(frame_seqs).collect();
+        assert_eq!(published, (1..=31).collect::<Vec<_>>());
+        assert_eq!(queue.dropped_events, 0);
     }
 
     /// The queue preserves the coalescer's ordering rule: a non-chunk event

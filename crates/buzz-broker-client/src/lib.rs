@@ -5,6 +5,7 @@
 //! back. Callers use [`buzz_sdk::broker::BrokerClientExt::execute`], which adds
 //! correlation checks; this type never interprets a verdict.
 
+use buzz_sdk::broker::actions::MAX_ENCODED_MESSAGE_BYTES;
 use buzz_sdk::broker::{
     BrokerClient, BrokerFuture, BrokerResponse, BrokerTransportError, Dispatch, PreparedRequest,
     BROKER_ACTION_PATH, BROKER_CREDENTIAL_HEADER,
@@ -12,19 +13,13 @@ use buzz_sdk::broker::{
 
 const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_CHANNEL_READ_MESSAGE_BYTES: usize = 128 * 1024;
-// A channel.read page may contain 500 messages whose content alone is up to
-// 64 KiB each. Keep the transport bounded while leaving room for the signed
-// event envelopes, tags, and JSON encoding around that contract-valid page.
-const MAX_CHANNEL_READ_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 fn max_response_bytes(request: &PreparedRequest) -> usize {
     request
         .channel_read_limit()
         .map_or(MAX_RESPONSE_BYTES, |limit| {
             MAX_RESPONSE_BYTES
-                .saturating_add((limit as usize).saturating_mul(MAX_CHANNEL_READ_MESSAGE_BYTES))
-                .min(MAX_CHANNEL_READ_RESPONSE_BYTES)
+                .saturating_add((limit as usize).saturating_mul(MAX_ENCODED_MESSAGE_BYTES))
         })
 }
 
@@ -76,12 +71,12 @@ impl HttpBrokerClient {
         let base_url = base_url.into();
         let parsed = reqwest::Url::parse(&base_url)
             .map_err(|error| BrokerClientConfigError(format!("invalid broker URL: {error}")))?;
-        let loopback = parsed.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        });
+        let loopback = match parsed.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        };
         if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
             return Err(BrokerClientConfigError(
                 "broker URL must use HTTPS (plain HTTP is allowed only for loopback)".into(),
@@ -207,7 +202,7 @@ mod tests {
     use axum::response::Response;
     use axum::routing::{any, post};
     use axum::Router;
-    use buzz_sdk::broker::actions::MAX_CONTENT_BYTES;
+    use buzz_sdk::broker::actions::{MAX_CONTENT_BYTES, MAX_ENCODED_MESSAGE_BYTES};
     use buzz_sdk::broker::{
         ActionArgs, ActionOutcome, BrokerClientExt, BrokerMessage, BrokerRequest, BrokerResult,
         ChannelReadArgs, MessagePage, MessagePostArgs,
@@ -383,6 +378,7 @@ mod tests {
         assert!(HttpBrokerClient::new("http://broker.example", CRED).is_err());
         assert!(HttpBrokerClient::new("https://broker.example", " ").is_err());
         assert!(HttpBrokerClient::new("http://localhost:8787", CRED).is_ok());
+        assert!(HttpBrokerClient::new("http://[::1]:8787", CRED).is_ok());
     }
 
     #[tokio::test]
@@ -447,7 +443,7 @@ mod tests {
         ))
         .unwrap();
         assert!(body.len() > MAX_RESPONSE_BYTES);
-        assert!(body.len() < MAX_CHANNEL_READ_RESPONSE_BYTES);
+        assert!(body.len() < max_response_bytes(&request));
         let (base, _) = spawn(StatusCode::OK, body).await;
 
         let response = HttpBrokerClient::new(base, CRED)
@@ -466,9 +462,8 @@ mod tests {
         assert_eq!(request.channel_read_limit(), Some(100));
         assert_eq!(
             response_cap,
-            MAX_RESPONSE_BYTES + 100 * MAX_CHANNEL_READ_MESSAGE_BYTES
+            MAX_RESPONSE_BYTES + 100 * MAX_ENCODED_MESSAGE_BYTES
         );
-        assert!(response_cap < MAX_CHANNEL_READ_RESPONSE_BYTES);
 
         let (base, _) = spawn(StatusCode::OK, "x".repeat(response_cap + 1)).await;
         let error = HttpBrokerClient::new(base, CRED)
@@ -481,5 +476,35 @@ mod tests {
             BrokerTransportError::NoEnvelope { detail, .. }
                 if detail.contains(&response_cap.to_string())
         ));
+    }
+
+    #[tokio::test]
+    async fn valid_maximally_escaped_channel_page_fits_the_request_cap() {
+        let request = channel_read_request();
+        let message = BrokerMessage(
+            EventBuilder::new(Kind::Custom(9), "\u{001b}".repeat(MAX_CONTENT_BYTES))
+                .tags([nostr::Tag::parse(["h", CHANNEL]).unwrap()])
+                .sign_with_keys(&Keys::generate())
+                .expect("fixture event signs"),
+        );
+        assert!(serde_json::to_vec(&message).unwrap().len() <= MAX_ENCODED_MESSAGE_BYTES);
+        let outcome = ActionOutcome::ChannelRead(MessagePage {
+            messages: vec![message; 100],
+            next_cursor: None,
+        });
+        let body = serde_json::to_string(&BrokerResponse::new(
+            request.request_id(),
+            BrokerResult::succeeded(outcome),
+        ))
+        .unwrap();
+        assert!(body.len() > 32 * 1024 * 1024);
+        assert!(body.len() <= max_response_bytes(&request));
+        let (base, _) = spawn(StatusCode::OK, body).await;
+
+        HttpBrokerClient::new(base, CRED)
+            .unwrap()
+            .execute(&request)
+            .await
+            .expect("contract-valid escaped page");
     }
 }

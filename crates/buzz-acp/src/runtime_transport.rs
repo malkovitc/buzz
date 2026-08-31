@@ -4,7 +4,8 @@
 //! mode polls `channel.read` and routes keyless storage and live signals back
 //! through the broker. Capabilities with no broker action remain relay-only.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use buzz_broker_client::HttpBrokerClient;
@@ -103,13 +104,22 @@ pub struct BrokerRuntime {
     client: HttpBrokerClient,
     channel_ids: Vec<Uuid>,
     filters: HashMap<Uuid, ChannelFilter>,
+    filter_tx: tokio::sync::watch::Sender<HashMap<Uuid, ChannelFilter>>,
+    event_rx: tokio::sync::mpsc::Receiver<BuzzEvent>,
+    poll_task: tokio::task::JoinHandle<()>,
+    placeholder_keys: Keys,
+    terminal_error: Arc<Mutex<Option<String>>>,
+}
+
+struct BrokerPoller {
+    client: HttpBrokerClient,
+    channel_ids: Vec<Uuid>,
+    filter_rx: tokio::sync::watch::Receiver<HashMap<Uuid, ChannelFilter>>,
     cursors: HashMap<Uuid, String>,
-    pending: VecDeque<BuzzEvent>,
     seen_current: HashSet<String>,
     seen_previous: HashSet<String>,
     poll: tokio::time::Interval,
-    placeholder_keys: Keys,
-    terminal_error: Option<String>,
+    terminal_error: Arc<Mutex<Option<String>>>,
 }
 
 /// Cloneable handle for broker-backed capabilities used outside the polling
@@ -251,23 +261,57 @@ impl BrokerRuntime {
         let agent_pubkey = address.author_pubkey.as_str().to_string();
         let mut poll = tokio::time::interval(poll_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let filters = HashMap::new();
+        let (filter_tx, filter_rx) = tokio::sync::watch::channel(filters.clone());
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+        let terminal_error = Arc::new(Mutex::new(None));
+        let poller = BrokerPoller {
+            client: client.clone(),
+            channel_ids: channel_ids.clone(),
+            filter_rx,
+            cursors: HashMap::new(),
+            seen_current: HashSet::new(),
+            seen_previous: HashSet::new(),
+            poll,
+            terminal_error: Arc::clone(&terminal_error),
+        };
+        let poll_task = tokio::spawn(poller.run(event_tx));
         Ok((
             Self {
                 client,
                 channel_ids,
-                filters: HashMap::new(),
-                cursors: HashMap::new(),
-                pending: VecDeque::new(),
-                seen_current: HashSet::new(),
-                seen_previous: HashSet::new(),
-                poll,
+                filters,
+                filter_tx,
+                event_rx,
+                poll_task,
                 placeholder_keys,
-                terminal_error: None,
+                terminal_error,
             },
             agent_pubkey,
         ))
     }
 
+    fn set_filter(&mut self, channel_id: Uuid, filter: Option<ChannelFilter>) {
+        if let Some(filter) = filter {
+            self.filters.insert(channel_id, filter);
+        } else {
+            self.filters.remove(&channel_id);
+        }
+        self.filter_tx.send_replace(self.filters.clone());
+    }
+
+    async fn next_event(&mut self) -> Option<BuzzEvent> {
+        self.event_rx.recv().await
+    }
+}
+
+impl Drop for BrokerRuntime {
+    fn drop(&mut self) {
+        self.poll_task.abort();
+    }
+}
+
+impl BrokerPoller {
     fn remember(&mut self, event_id: String) -> bool {
         if self.seen_current.contains(&event_id) || self.seen_previous.contains(&event_id) {
             return false;
@@ -279,17 +323,15 @@ impl BrokerRuntime {
         true
     }
 
-    async fn next_event(&mut self) -> Option<BuzzEvent> {
+    async fn run(mut self, event_tx: tokio::sync::mpsc::Sender<BuzzEvent>) {
         loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Some(event);
-            }
             self.poll.tick().await;
+            let filters = self.filter_rx.borrow().clone();
             let subscriptions: Vec<(Uuid, bool)> = self
                 .channel_ids
                 .iter()
                 .filter_map(|channel_id| {
-                    self.filters
+                    filters
                         .get(channel_id)
                         .map(|filter| (*channel_id, filter.require_mention))
                 })
@@ -314,8 +356,9 @@ impl BrokerRuntime {
                     }
                     Err(error) if error.code == Some(BrokerErrorCode::Unauthenticated) => {
                         tracing::error!(%channel_id, "broker credential was rejected: {error}");
-                        self.terminal_error = Some(error.to_string());
-                        return None;
+                        *self.terminal_error.lock().expect("terminal error lock") =
+                            Some(error.to_string());
+                        return;
                     }
                     Err(error) => {
                         tracing::warn!(%channel_id, "broker channel.read failed: {error}");
@@ -343,8 +386,13 @@ impl BrokerRuntime {
                         tracing::warn!(%channel_id, "broker returned an event for a different channel");
                         continue;
                     }
-                    if self.remember(event.id.to_hex()) {
-                        self.pending.push_back(BuzzEvent { channel_id, event });
+                    if self.remember(event.id.to_hex())
+                        && event_tx
+                            .send(BuzzEvent { channel_id, event })
+                            .await
+                            .is_err()
+                    {
+                        return;
                     }
                 }
             }
@@ -466,7 +514,7 @@ impl RuntimeTransport {
         match self {
             Self::Local(relay) => relay.subscribe_channel(channel_id, filter).await,
             Self::Broker(runtime) => {
-                runtime.filters.insert(channel_id, filter);
+                runtime.set_filter(channel_id, Some(filter));
                 Ok(())
             }
         }
@@ -485,7 +533,7 @@ impl RuntimeTransport {
                     .await
             }
             Self::Broker(runtime) => {
-                runtime.filters.insert(channel_id, filter);
+                runtime.set_filter(channel_id, Some(filter));
                 Ok(())
             }
         }
@@ -495,7 +543,7 @@ impl RuntimeTransport {
         match self {
             Self::Local(relay) => relay.unsubscribe_channel(channel_id).await,
             Self::Broker(runtime) => {
-                runtime.filters.remove(&channel_id);
+                runtime.set_filter(channel_id, None);
                 Ok(())
             }
         }
@@ -511,10 +559,12 @@ impl RuntimeTransport {
     pub async fn reconnect(&mut self) -> Result<(), RelayError> {
         match self {
             Self::Local(relay) => relay.reconnect().await,
-            Self::Broker(runtime) => match &runtime.terminal_error {
-                Some(error) => Err(RelayError::Http(error.clone())),
-                None => Ok(()),
-            },
+            Self::Broker(runtime) => {
+                match &*runtime.terminal_error.lock().expect("terminal error lock") {
+                    Some(error) => Err(RelayError::Http(error.clone())),
+                    None => Ok(()),
+                }
+            }
         }
     }
 
@@ -573,6 +623,7 @@ mod tests {
     use axum::response::Response;
     use axum::routing::post;
     use axum::Router;
+    use nostr::{EventBuilder, Kind, Tag};
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
 
@@ -673,5 +724,94 @@ mod tests {
                 "liveness.ping",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn polling_survives_main_loop_timer_cancellation_and_reaches_later_channels() {
+        let slow_channel = Uuid::new_v4();
+        let ready_channel = Uuid::new_v4();
+        let keys = Keys::generate();
+        let ready_event = EventBuilder::new(Kind::Custom(9), "ready")
+            .tags([Tag::parse(["h", &ready_channel.to_string()]).unwrap()])
+            .sign_with_keys(&keys)
+            .unwrap();
+        let pubkey = keys.public_key().to_hex();
+        let app = Router::new().route(
+            "/v1/action",
+            post(move |body: Bytes| {
+                let ready_event = ready_event.clone();
+                let pubkey = pubkey.clone();
+                async move {
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let request_id = request["requestId"].as_str().unwrap();
+                    let action = request["action"].as_str().unwrap();
+                    let outcome = if action == "storage.address" {
+                        serde_json::json!({
+                            "authorPubkey": pubkey,
+                            "kind": 30078,
+                            "dTag": "a".repeat(64),
+                        })
+                    } else {
+                        let channel = request["args"]["channelId"].as_str().unwrap();
+                        if channel == slow_channel.to_string() {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            serde_json::json!({ "messages": [] })
+                        } else {
+                            serde_json::json!({ "messages": [ready_event] })
+                        }
+                    };
+                    let response = serde_json::json!({
+                        "type": "broker_result",
+                        "protocolVersion": 1,
+                        "requestId": request_id,
+                        "status": "succeeded",
+                        "action": action,
+                        "outcome": outcome,
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(response.to_string()))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (mut runtime, _) = BrokerRuntime::connect(
+            format!("http://{address}"),
+            "credential".into(),
+            vec![slow_channel, ready_channel],
+            Duration::from_millis(1),
+            Keys::generate(),
+        )
+        .await
+        .unwrap();
+        let filter = ChannelFilter {
+            kinds: Some(vec![9]),
+            require_mention: false,
+        };
+        runtime.set_filter(slow_channel, Some(filter.clone()));
+        runtime.set_filter(ready_channel, Some(filter));
+
+        let mut typing_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        let received = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                tokio::select! {
+                    _ = typing_timer.tick() => {}
+                    event = runtime.next_event() => break event,
+                }
+            }
+        })
+        .await
+        .expect("timer ticks must not restart the slow first channel")
+        .expect("poller stays open");
+
+        assert_eq!(received.channel_id, ready_channel);
+        assert_eq!(received.event.content, "ready");
     }
 }
