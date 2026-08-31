@@ -88,6 +88,22 @@ attachJsonlReader(
           timer = setTimeout(() => complete("unsteered"), 500);
         else if (mode === "pid")
           timer = setTimeout(() => complete(`pid:${process.pid}`), 10);
+        else if (mode === "task-reset")
+          timer = setTimeout(
+            () =>
+              complete(`reset:${process.env.PI_ACP_RESET_TASK_SESSION || "0"}`),
+            10,
+          );
+        else if (mode === "task-id")
+          timer = setTimeout(() => {
+            let digest = "missing";
+            try {
+              digest = JSON.parse(process.env.PI_ACP_TASK_IDENTITY_JSON).digest;
+            } catch {
+              // Report a missing or malformed identity through the fixture output.
+            }
+            complete(`task:${digest}`);
+          }, 10);
         else if (mode === "key-check")
           timer = setTimeout(
             () =>

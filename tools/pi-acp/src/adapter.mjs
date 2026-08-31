@@ -4,7 +4,14 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import packageMetadata from "../package.json" with { type: "json" };
 import { createBuzzTools } from "./buzz-tools.mjs";
+import {
+  canonicalCloudRelayUrl,
+  rpcError,
+  rpcResult,
+  sameControlChannel,
+} from "./control-identifiers.mjs";
 import { attachJsonlReader, writeJsonl } from "./jsonl.mjs";
+import { executeTaskControl, taskSessionIdentity } from "./task-session.mjs";
 
 const SDK_BRIDGE_PATH = fileURLToPath(
   new URL("./sdk-bridge.mjs", import.meta.url),
@@ -18,53 +25,6 @@ const MAX_SYSTEM_PROMPT_BYTES = 64 * 1024;
 const MAX_TOOL_OUTPUT_BYTES = 16 * 1024;
 const CLOUD_CONTROL_COMMANDS = new Set(["-status", "-cloud", "-local"]);
 const REJECTED_CLOUD_CONTROL_COMMAND = "__buzz_rejected_cloud_control__";
-
-function canonicalUuid(value) {
-  if (typeof value !== "string") return null;
-  let normalized = value.trim().toLowerCase();
-  if (normalized.startsWith("urn:uuid:")) normalized = normalized.slice(9);
-  if (normalized.startsWith("{") && normalized.endsWith("}")) {
-    normalized = normalized.slice(1, -1);
-  }
-  normalized = normalized.replaceAll("-", "");
-  if (!/^[0-9a-f]{32}$/.test(normalized)) return null;
-  return [
-    normalized.slice(0, 8),
-    normalized.slice(8, 12),
-    normalized.slice(12, 16),
-    normalized.slice(16, 20),
-    normalized.slice(20),
-  ].join("-");
-}
-
-function sameControlChannel(configured, actual) {
-  const expected = canonicalUuid(configured);
-  return expected !== null && expected === canonicalUuid(actual);
-}
-
-function canonicalRelayUrl(value) {
-  const relay = new URL(value);
-  if (
-    !["wss:", "https:"].includes(relay.protocol) ||
-    relay.username ||
-    relay.password
-  ) {
-    throw new Error("cloud control relay URL is invalid");
-  }
-  if (relay.protocol === "https:") relay.protocol = "wss:";
-  relay.hash = "";
-  relay.search = "";
-  relay.pathname = "/";
-  return relay.toString().replace(/\/$/, "");
-}
-
-function rpcResult(id, result) {
-  return { jsonrpc: "2.0", id, result };
-}
-
-function rpcError(id, code, message) {
-  return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
-}
 
 function promptText(blocks) {
   if (!Array.isArray(blocks)) return null;
@@ -199,6 +159,12 @@ export class PiAcpAdapter {
         case "_session/steering":
           await this.#steer(message);
           break;
+        case "_session/reset_task":
+          this.#taskControl(message, "reset");
+          break;
+        case "_session/task_state":
+          this.#taskControl(message, "state");
+          break;
         default:
           if (message.id !== undefined)
             this.#send(
@@ -316,7 +282,7 @@ export class PiAcpAdapter {
     this.#send(rpcResult(message.id, { sessionId }));
   }
 
-  async #spawnPi(cwd, systemPrompt) {
+  async #spawnPi(cwd, systemPrompt, buzzContext) {
     const command = this.env.PI_ACP_PI_COMMAND || process.execPath;
     let configuredArgs;
     try {
@@ -343,6 +309,17 @@ export class PiAcpAdapter {
     const childEnv = { ...this.env };
     delete childEnv.BUZZ_PRIVATE_KEY;
     delete childEnv.BUZZ_AUTH_TAG;
+    delete childEnv.PI_ACP_RESET_TASK_SESSION;
+    if (buzzContext?.taskThreadRoot) {
+      if (buzzContext.resetTaskSession)
+        childEnv.PI_ACP_RESET_TASK_SESSION = "1";
+      else delete childEnv.PI_ACP_RESET_TASK_SESSION;
+      childEnv.PI_ACP_TASK_IDENTITY_JSON = JSON.stringify(
+        taskSessionIdentity(buzzContext, buzzContext.relayUrl),
+      );
+    } else {
+      delete childEnv.PI_ACP_TASK_IDENTITY_JSON;
+    }
     const child = spawn(command, args, {
       cwd,
       env: childEnv,
@@ -433,7 +410,7 @@ export class PiAcpAdapter {
           .update(
             JSON.stringify({
               schemaVersion: 1,
-              relayUrl: canonicalRelayUrl(this.env.BUZZ_RELAY_URL),
+              relayUrl: canonicalCloudRelayUrl(this.env.BUZZ_RELAY_URL),
               command,
               channelId: buzzContext.channelId,
               replyTo: buzzContext.replyTo,
@@ -553,8 +530,27 @@ export class PiAcpAdapter {
     const buzzContext = message.params?._meta?.buzz ?? null;
     if (
       buzzContext !== null &&
-      (typeof buzzContext.channelId !== "string" ||
+      (((buzzContext.relayUrl !== undefined ||
+        buzzContext.agentPubkey !== undefined) &&
+        (typeof buzzContext.relayUrl !== "string" ||
+          typeof buzzContext.agentPubkey !== "string" ||
+          !/^[0-9a-f]{64}$/.test(buzzContext.agentPubkey))) ||
+        typeof buzzContext.channelId !== "string" ||
+        (buzzContext.taskThreadRoot !== undefined &&
+          !/^[0-9a-f]{64}$/.test(buzzContext.taskThreadRoot)) ||
+        (buzzContext.resetTaskSession !== undefined &&
+          typeof buzzContext.resetTaskSession !== "boolean") ||
         !Array.isArray(buzzContext.triggeringEventIds) ||
+        (buzzContext.deliveredEventIds !== undefined &&
+          (!Array.isArray(buzzContext.deliveredEventIds) ||
+            buzzContext.deliveredEventIds.some(
+              (eventId) => !/^[0-9a-f]{64}$/.test(eventId),
+            ))) ||
+        (buzzContext.processedTriggerEventIds !== undefined &&
+          (!Array.isArray(buzzContext.processedTriggerEventIds) ||
+            buzzContext.processedTriggerEventIds.some(
+              (eventId) => !/^[0-9a-f]{64}$/.test(eventId),
+            ))) ||
         typeof buzzContext.replyTo !== "string" ||
         (buzzContext.controlCommand !== undefined &&
           !CLOUD_CONTROL_COMMANDS.has(buzzContext.controlCommand) &&
@@ -611,14 +607,18 @@ export class PiAcpAdapter {
       finalStopReason: "end_turn",
     };
     try {
-      // A fresh SDK process/session for every task prevents history and cached
-      // context from crossing inbound event boundaries.
-      await this.#spawnPi(session.cwd, session.systemPrompt);
+      // A fresh SDK process isolates each turn. Authenticated Buzz tasks reopen
+      // only their own durable Pi session, keyed by relay/channel/thread.
+      await this.#spawnPi(session.cwd, session.systemPrompt, buzzContext);
       if (this.currentPrompt?.cancelled) {
         this.#settlePrompt();
         return;
       }
-      await this.#sendPiCommand("prompt", { message: text });
+      await this.#sendPiCommand("prompt", {
+        message: text,
+        deliveredEventIds: buzzContext?.deliveredEventIds ?? [],
+        processedTriggerEventIds: buzzContext?.processedTriggerEventIds ?? [],
+      });
       this.currentPrompt?.resolveSdkPromptStart(true);
     } catch (error) {
       const prompt = this.currentPrompt;
@@ -653,6 +653,34 @@ export class PiAcpAdapter {
     }
   }
 
+  #taskControl(message, type) {
+    const session = this.#sessionFor(
+      message.params,
+      message.id,
+      `task ${type}`,
+    );
+    if (!session) return;
+    if (this.currentPrompt) {
+      this.#send(
+        rpcError(message.id, INVALID_PARAMS, `task ${type}: adapter is busy`),
+      );
+      return;
+    }
+    try {
+      const result = executeTaskControl(
+        type,
+        session.cwd,
+        message.params?._meta?.buzz,
+        this.env,
+      );
+      this.#send(rpcResult(message.id, result));
+    } catch (error) {
+      this.#send(
+        rpcError(message.id, INVALID_PARAMS, `task ${type}: ${error.message}`),
+      );
+    }
+  }
+
   async #steer(message) {
     const session = this.#sessionFor(message.params, message.id, "steering");
     if (!session) return;
@@ -674,6 +702,25 @@ export class PiAcpAdapter {
       return;
     }
     const prompt = this.currentPrompt;
+    const steerContext = message.params?._meta?.buzz;
+    const durableTaskRoot = prompt.buzzContext?.taskThreadRoot;
+    if (
+      typeof durableTaskRoot === "string" &&
+      (steerContext?.taskThreadRoot !== durableTaskRoot ||
+        !Array.isArray(steerContext.deliveredEventIds) ||
+        steerContext.deliveredEventIds.some(
+          (eventId) => !/^[0-9a-f]{64}$/.test(eventId),
+        ))
+    ) {
+      this.#send(
+        rpcError(
+          message.id,
+          INVALID_PARAMS,
+          "steering: task root differs from the active durable Pi task",
+        ),
+      );
+      return;
+    }
     const started = await prompt.sdkPromptStart;
     if (!started || this.currentPrompt !== prompt) {
       this.#send(
@@ -681,7 +728,10 @@ export class PiAcpAdapter {
       );
       return;
     }
-    await this.#sendPiCommand("steer", { message: text });
+    await this.#sendPiCommand("steer", {
+      message: text,
+      deliveredEventIds: steerContext?.deliveredEventIds ?? [],
+    });
     this.#send(rpcResult(message.id, { outcome: "injected" }));
   }
 

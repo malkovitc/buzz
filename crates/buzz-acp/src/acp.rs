@@ -822,6 +822,66 @@ impl AcpClient {
             .session_id)
     }
 
+    /// Read event-delivery state persisted with a durable Pi task session.
+    pub async fn session_task_delivered_event_ids(
+        &mut self,
+        session_id: &str,
+        relay_url: &str,
+        agent_pubkey: &str,
+        channel_id: &str,
+        task_thread_root: &str,
+    ) -> Result<
+        (
+            std::collections::HashSet<String>,
+            std::collections::HashSet<String>,
+        ),
+        AcpError,
+    > {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "_meta": {
+                "buzz": {
+                    "relayUrl": relay_url,
+                    "agentPubkey": agent_pubkey,
+                    "channelId": channel_id,
+                    "taskThreadRoot": task_thread_root,
+                }
+            },
+        });
+        let result = self.send_request("_session/task_state", params).await?;
+        let parse_ids = |field: &str| -> Result<std::collections::HashSet<String>, AcpError> {
+            let event_ids = result[field]
+                .as_array()
+                .ok_or_else(|| AcpError::Protocol(format!("task state missing {field}")))?;
+            Ok(event_ids
+                .iter()
+                .filter_map(|event_id| event_id.as_str())
+                .filter(|event_id| {
+                    event_id.len() == 64 && event_id.chars().all(|c| c.is_ascii_hexdigit())
+                })
+                .map(str::to_string)
+                .collect())
+        };
+        Ok((
+            parse_ids("deliveredEventIds")?,
+            parse_ids("processedTriggerEventIds")?,
+        ))
+    }
+
+    /// Reset the current task's adapter-owned durable history after rotation.
+    pub async fn session_reset_task(
+        &mut self,
+        session_id: &str,
+        metadata: &BuzzPromptMetadata,
+    ) -> Result<(), AcpError> {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "_meta": { "buzz": metadata },
+        });
+        self.send_request("_session/reset_task", params).await?;
+        Ok(())
+    }
+
     /// Replace Goose's native system prompt after `session/new`.
     pub async fn session_set_goose_system_prompt(
         &mut self,
@@ -1589,7 +1649,12 @@ impl AcpClient {
                         (None, true) => Some((
                             SteerTransport::AcpExtension,
                             ACP_STEER_METHOD,
-                            build_acp_steer_params(session_id, &prompt_block_refs),
+                            build_acp_steer_params(
+                                session_id,
+                                &prompt_block_refs,
+                                req.task_thread_root.as_deref(),
+                                &req.delivered_event_ids,
+                            ),
                         )),
                         (None, false) => None,
                     };
@@ -2197,13 +2262,27 @@ impl AcpClient {
 }
 
 /// Build `session/prompt` params from one or more text content blocks.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuzzPromptMetadata {
+    pub relay_url: String,
+    pub agent_pubkey: String,
     pub channel_id: String,
     pub triggering_event_ids: Vec<String>,
     pub allowed_reply_event_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_event_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processed_trigger_event_ids: Vec<String>,
     pub reply_to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_thread_root: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reset_task_session: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_command: Option<String>,
 }
@@ -2261,10 +2340,21 @@ fn build_goose_steer_params(
 /// Deliberately carries **no** `expectedRunId`: the cross-adapter method
 /// steers whatever turn is currently running and neither claude-agent-acp nor
 /// codex-acp emits a run id to target.
-fn build_acp_steer_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::Value {
+fn build_acp_steer_params(
+    session_id: &str,
+    prompt_blocks: &[&str],
+    task_thread_root: Option<&str>,
+    delivered_event_ids: &[String],
+) -> serde_json::Value {
     serde_json::json!({
         "sessionId": session_id,
         "prompt": steer_prompt_blocks(prompt_blocks),
+        "_meta": {
+            "buzz": {
+                "taskThreadRoot": task_thread_root,
+                "deliveredEventIds": delivered_event_ids,
+            }
+        },
     })
 }
 
@@ -2773,16 +2863,40 @@ mod tests {
     #[test]
     fn prompt_metadata_is_nested_under_buzz_meta() {
         let metadata = BuzzPromptMetadata {
+            relay_url: "wss://relay.example".into(),
+            agent_pubkey: "f".repeat(64),
             channel_id: "4dcab690-a2ca-4a56-9e5d-d901d12f83c3".into(),
             triggering_event_ids: vec!["a".repeat(64), "b".repeat(64)],
             allowed_reply_event_ids: vec!["b".repeat(64)],
+            delivered_event_ids: vec!["a".repeat(64)],
+            processed_trigger_event_ids: vec!["b".repeat(64)],
             reply_to: "b".repeat(64),
+            task_thread_root: Some("b".repeat(64)),
+            reset_task_session: true,
             control_command: Some("-status".into()),
         };
         let params = build_prompt_params("session", &["hello"], Some(&metadata));
+        assert_eq!(params["_meta"]["buzz"]["relayUrl"], metadata.relay_url);
+        assert_eq!(
+            params["_meta"]["buzz"]["agentPubkey"],
+            metadata.agent_pubkey
+        );
         assert_eq!(params["_meta"]["buzz"]["channelId"], metadata.channel_id);
         assert_eq!(params["_meta"]["buzz"]["replyTo"], metadata.reply_to);
+        assert_eq!(
+            params["_meta"]["buzz"]["taskThreadRoot"],
+            serde_json::json!(metadata.task_thread_root)
+        );
+        assert_eq!(params["_meta"]["buzz"]["resetTaskSession"], true);
         assert_eq!(params["_meta"]["buzz"]["controlCommand"], "-status");
+        assert_eq!(
+            params["_meta"]["buzz"]["processedTriggerEventIds"],
+            serde_json::json!(metadata.processed_trigger_event_ids)
+        );
+        assert_eq!(
+            params["_meta"]["buzz"]["deliveredEventIds"],
+            serde_json::json!(metadata.delivered_event_ids)
+        );
         assert_eq!(
             params["_meta"]["buzz"]["allowedReplyEventIds"],
             serde_json::json!(metadata.allowed_reply_event_ids)
@@ -4305,6 +4419,8 @@ mod tests {
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
                     association_event_ids: vec![],
+                    delivered_event_ids: vec![],
+                    task_thread_root: None,
                     ack_tx,
                 })
                 .await
@@ -4375,6 +4491,8 @@ mod tests {
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
                     association_event_ids: vec![],
+                    delivered_event_ids: vec![],
+                    task_thread_root: None,
                     ack_tx,
                 })
                 .await
@@ -4448,6 +4566,8 @@ mod tests {
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     association_event_ids: vec![],
+                    delivered_event_ids: vec![],
+                    task_thread_root: None,
                     ack_tx,
                 })
                 .await
@@ -4523,6 +4643,8 @@ mod tests {
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     association_event_ids: vec![],
+                    delivered_event_ids: vec![],
+                    task_thread_root: None,
                     ack_tx,
                 })
                 .await
@@ -4774,6 +4896,8 @@ mod tests {
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     association_event_ids: vec![],
+                    delivered_event_ids: vec![],
+                    task_thread_root: None,
                     ack_tx,
                 })
                 .await
@@ -4836,6 +4960,8 @@ mod tests {
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     association_event_ids: vec!["post-b".into()],
+                    delivered_event_ids: vec!["post-b".into()],
+                    task_thread_root: Some("a".repeat(64)),
                     ack_tx,
                 })
                 .await

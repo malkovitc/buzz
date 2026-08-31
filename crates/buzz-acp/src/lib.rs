@@ -2867,6 +2867,10 @@ async fn tokio_main() -> Result<()> {
                             if is_rotate {
                                 if let Some(owner) = owner_cache.get() {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        let task_root = crate::queue::parse_thread_tags(
+                                            &buzz_event.event,
+                                        )
+                                        .root_event_id;
                                         let fired = signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
@@ -2878,6 +2882,10 @@ async fn tokio_main() -> Result<()> {
                                                 "!rotate received — cancelling in-flight turn and rotating session"
                                             );
                                         } else {
+                                            pool.mark_pi_task_reset(
+                                                buzz_event.channel_id,
+                                                task_root,
+                                            );
                                             let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id);
                                             tracing::info!(
                                                 channel_id = %buzz_event.channel_id,
@@ -3473,9 +3481,12 @@ async fn tokio_main() -> Result<()> {
                 }
                 match completion {
                     Ok(()) => {
-                        pool = pool_lifecycle
+                        let pending_pi_resets = pool.take_pending_pi_task_resets();
+                        let mut ready_pool = pool_lifecycle
                             .take_ready()
                             .expect("successful wake stores a ready pool");
+                        ready_pool.extend_pending_pi_task_resets(pending_pi_resets);
+                        pool = ready_pool;
                         pool_ready = true;
                         emit_runtime_lifecycle(
                             observer.as_ref(),
@@ -3770,6 +3781,10 @@ fn try_native_steer(
     let (header, closing) = queue::native_steer_framing();
     let event_id_hex = event.id.to_hex();
     let typing_scope = typing_scope_for_event(&event);
+    let task_thread_root = typing_scope
+        .root_event_id
+        .clone()
+        .or_else(|| Some(event_id_hex.clone()));
     let mut association_event_ids = vec![event_id_hex.clone()];
     if let Some(root) = typing_scope.root_event_id.clone() {
         association_event_ids.push(root);
@@ -3790,6 +3805,8 @@ fn try_native_steer(
     let request = pool::SteerRequest {
         prompt_blocks: vec![body],
         association_event_ids,
+        delivered_event_ids: vec![event_id_hex.clone()],
+        task_thread_root,
         ack_tx,
     };
 
@@ -4258,6 +4275,7 @@ fn handle_prompt_result(
             };
             emit_turn_error(&death_message, None);
 
+            pool.preserve_agent_pending_pi_resets(&result.agent);
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
             if !spawn_respawn_task(
@@ -4298,6 +4316,7 @@ fn handle_prompt_result(
             );
             emit_turn_error(&death_message, None);
 
+            pool.preserve_agent_pending_pi_resets(&result.agent);
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
             if !spawn_respawn_task(
@@ -4363,6 +4382,7 @@ fn handle_prompt_result(
                 );
                 emit_turn_error(&e.to_string(), error_code);
 
+                pool.preserve_agent_pending_pi_resets(&result.agent);
                 let index = result.agent.index;
                 let slot_history = &mut crash_history[index];
                 if !spawn_respawn_task(
