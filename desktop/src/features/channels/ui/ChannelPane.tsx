@@ -4,6 +4,7 @@ import { Hash, LogIn } from "lucide-react";
 import { AnimatePresence } from "motion/react";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useMediaUpload } from "@/features/messages/lib/useMediaUpload";
+import { useCloudControlState } from "@/features/channels/ui/useCloudControlState";
 import { ComposerDockBackdrop } from "@/features/messages/ui/ComposerDockBackdrop";
 import { ComposerUploadProgressOverlay } from "@/features/messages/ui/ComposerUploadProgressOverlay";
 import { MessageComposer } from "@/features/messages/ui/MessageComposer";
@@ -47,7 +48,10 @@ import {
   WelcomeComposerGuidanceLayer,
 } from "@/features/channels/ui/WelcomeComposerBanner";
 import { useWelcomeComposerBanner } from "@/features/channels/ui/useWelcomeComposerBanner";
-import { mentionsKnownAgent } from "@/features/channels/ui/ChannelPane.helpers";
+import {
+  findLastOwnEditableMessage,
+  mentionsKnownAgent,
+} from "@/features/channels/ui/ChannelPane.helpers";
 import { HuddleStartingView, HuddleTranscriptIntro } from "@/features/huddle";
 import { useChannelIntro } from "@/features/channels/ui/useChannelIntro";
 import type { ChannelPaneProps } from "@/features/channels/ui/ChannelPane.types";
@@ -58,7 +62,6 @@ import { Button } from "@/shared/ui/button";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
 import type { TimelineMessage } from "@/features/messages/types";
 import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/onboarding/welcome";
-import { KIND_SYSTEM_MESSAGE } from "@/shared/constants/kinds";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
@@ -185,6 +188,13 @@ export const ChannelPane = React.memo(function ChannelPane({
     !activeChannel.archivedAt;
   const hasMainComposerOverlay = !isNonMemberView;
   const activeChannelId = activeChannel?.id ?? null;
+  const cloudControls = useCloudControlState({
+    channelId: activeChannelId,
+    currentPubkey: currentPubkey ?? null,
+    historyPending: threadMessagesPending,
+    threadHead: threadHeadMessage,
+    threadMessages: threadAllMessages,
+  });
   const activeChannelIdRef = React.useRef(activeChannelId);
   const channelPaneMountedRef = React.useRef(false);
   activeChannelIdRef.current = activeChannelId;
@@ -231,23 +241,8 @@ export const ChannelPane = React.memo(function ChannelPane({
   const mainEditTarget = editTarget && !isEditInThread ? editTarget : null;
   const threadEditTarget = editTarget && isEditInThread ? editTarget : null;
   const findLastOwnEditable = React.useCallback(
-    (candidates: TimelineMessage[]): TimelineMessage | null => {
-      if (!onEdit || !currentPubkey) return null;
-      let best: TimelineMessage | null = null;
-      for (const message of candidates) {
-        if (
-          message.kind === KIND_SYSTEM_MESSAGE ||
-          message.pubkey !== currentPubkey ||
-          message.pending
-        ) {
-          continue;
-        }
-        if (!best || message.createdAt >= best.createdAt) {
-          best = message;
-        }
-      }
-      return best;
-    },
+    (candidates: TimelineMessage[]) =>
+      findLastOwnEditableMessage(candidates, currentPubkey, Boolean(onEdit)),
     [onEdit, currentPubkey],
   );
 
@@ -857,6 +852,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                 channel={activeChannel}
                 channelId={activeChannel?.id ?? null}
                 channelName={activeChannel?.name ?? "channel"}
+                cloudControls={cloudControls}
                 currentPubkey={currentPubkey}
                 disabled={isComposerDisabled}
                 editTarget={threadEditTarget}

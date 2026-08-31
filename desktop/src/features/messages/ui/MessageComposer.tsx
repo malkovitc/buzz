@@ -1,4 +1,5 @@
 import * as React from "react";
+import { toast } from "sonner";
 import { EditorContent } from "@tiptap/react";
 import {
   useChannelLinks,
@@ -19,7 +20,6 @@ import {
   restoreImetaMediaDisplayLabels,
   stripImetaMediaLines,
 } from "@/features/messages/lib/imetaMediaMarkdown";
-import { useAttachmentEditing } from "@/features/messages/lib/useAttachmentEditing";
 import { useMediaUpload } from "@/features/messages/lib/useMediaUpload";
 import {
   cancelBackgroundMediaUploads,
@@ -42,7 +42,6 @@ import {
   hasMentionClipboardHtml,
   normalizeMentionClipboardHtml,
 } from "@/features/messages/lib/normalizeMentionClipboard";
-import { CUSTOM_EMOJI_NODE_NAME } from "@/features/messages/lib/customEmojiNode";
 import {
   type AutocompleteEdit,
   type LinkSelectionInfo,
@@ -70,15 +69,20 @@ import { useAutoPinMentionedAgents } from "./useAutoPinMentionedAgents";
 import { useComposerContentState } from "./useComposerContentState";
 import { useDraftPersistLifecycle } from "./useDraftPersistSnapshot";
 import { submitMessageEdit } from "./submitMessageEdit";
+import { submitComposerCloudControl } from "./submitComposerCloudControl";
 import { prepareBackgroundLinkPreviews } from "@/features/messages/lib/linkPreviewPreparationStore";
 import { useComposerLinkPreviews } from "./useComposerLinkPreviews";
 import { scheduleSettleGatedAutoSubmit } from "./messageComposerAutoSubmit";
+import { useComposerAttachmentActions } from "./useComposerAttachmentActions";
+import { useComposerCloudControls } from "./useComposerCloudControls";
+import { useComposerEmojiInsert } from "./useComposerEmojiInsert";
 import type { MessageComposerProps } from "./MessageComposer.types";
 function MessageComposerImpl({
   audienceContext = null,
   channelId = null,
   channelName,
   channelType = null,
+  cloudControls,
   containerClassName,
   layoutMode = "standalone",
   disabled = false,
@@ -165,6 +169,8 @@ function MessageComposerImpl({
   );
   const internalMedia = useMediaUpload({ deferUploadsUntilSend: true });
   const media = mediaController ?? internalMedia;
+  const hasControlBlockingMedia =
+    media.pendingImeta.length > 0 || media.queuedAttachments.length > 0;
   const [isDeferredEditPending, setDeferredEditPending] = React.useState(false);
   const composerDisabled = disabled || isDeferredEditPending;
   const isEditSubmissionLocked =
@@ -229,10 +235,9 @@ function MessageComposerImpl({
   extractMentionPubkeysRef.current = mentions.extractMentionPubkeys;
   ownerPubkeyRef.current = ownerPubkey;
   const isAutocompleteOpenRef = React.useRef(false);
-  isAutocompleteOpenRef.current =
-    mentions.isMentionOpen ||
-    channelLinks.isChannelOpen ||
-    emojiAutocomplete.isEmojiAutocompleteOpen;
+  const cloudControlUpdateRef = React.useRef(
+    (_text: string, _cursor: number) => {},
+  );
   const submitMessageRef = React.useRef<() => void>(() => {});
   const composerScrollRef = React.useRef<HTMLDivElement>(null);
   const onEditLinkRef = React.useRef<
@@ -279,11 +284,27 @@ function MessageComposerImpl({
       mentions.updateMentionQuery(text, cursor);
       channelLinks.updateChannelQuery(text, cursor);
       emojiAutocomplete.updateEmojiQuery(text, cursor);
+      cloudControlUpdateRef.current(text, cursor);
       if (text.trim().length > 0) {
         notifyTyping();
       }
     },
   });
+  const cloudControl = useComposerCloudControls({
+    config: cloudControls,
+    contentEmpty: isContentEmpty,
+    disabled: composerDisabled || media.isUploading,
+    editing: editTarget != null,
+    mediaBlocked: hasControlBlockingMedia,
+    richText,
+    toolbarExtraActions,
+  });
+  cloudControlUpdateRef.current = cloudControl.onEditorUpdate;
+  isAutocompleteOpenRef.current =
+    mentions.isMentionOpen ||
+    channelLinks.isChannelOpen ||
+    emojiAutocomplete.isEmojiAutocompleteOpen ||
+    cloudControl.isAutocompleteOpen;
   const linkEditor = useLinkEditor(richText);
   syncContentRefFromEditorRef.current = () => {
     const markdown = richText.getMarkdown();
@@ -377,15 +398,11 @@ function MessageComposerImpl({
       setSpoileredAttachmentUrls(restoredSpoileredAttachmentUrls);
     }
   }, [editTarget?.id]);
-  // ── Focus on reply ──────────────────────────────────────────────────
-  // Use focusPreserve so that re-renders (e.g. new messages arriving in
-  // a thread) don't yank the cursor to the end while the user is editing.
   React.useEffect(() => {
     if (!replyTarget || composerDisabled) return;
     richText.focusPreserve();
   }, [composerDisabled, replyTarget, richText.focusPreserve]);
   useComposerAutofocus(richText.focus, effectiveDraftKey, composerDisabled);
-  // Hooks return a plain-text edit descriptor; `replacePlainTextRange`
   // applies it as a single ProseMirror transaction (no markdown round-trip).
   const applyAutocompleteEdit = React.useCallback(
     (edit: AutocompleteEdit) => {
@@ -436,42 +453,12 @@ function MessageComposerImpl({
       richText.getPlainTextAndCursor,
     ],
   );
-  // ── Emoji insertion ─────────────────────────────────────────────────
-  const insertEmoji = React.useCallback(
-    (emoji: string) => {
-      if (!richText.editor) return;
-      // A `:shortcode:` for a known custom emoji becomes a selectable atom
-      // node (same as the input rule / autocomplete), so it can be selected,
-      // copied, and deleted as one unit. Everything else (native unicode)
-      // inserts as plain content.
-      const match = /^:([^:\s]+):$/.exec(emoji);
-      const shortcode = match?.[1]?.toLowerCase();
-      const known =
-        shortcode &&
-        customEmoji.some((e) => e.shortcode.toLowerCase() === shortcode);
-      if (known && shortcode) {
-        richText.editor
-          .chain()
-          .focus()
-          .insertContent({
-            type: CUSTOM_EMOJI_NODE_NAME,
-            attrs: {
-              shortcode,
-              src:
-                customEmoji.find((e) => e.shortcode.toLowerCase() === shortcode)
-                  ?.url ?? "",
-            },
-          })
-          .insertContent(" ")
-          .run();
-      } else {
-        richText.editor.chain().focus().insertContent(emoji).run();
-      }
-      setIsEmojiPickerOpen(false);
-      mentions.clearMentions();
-    },
-    [richText.editor, mentions.clearMentions, customEmoji],
-  );
+  const insertEmoji = useComposerEmojiInsert({
+    clearMentions: mentions.clearMentions,
+    customEmoji,
+    editor: richText.editor,
+    setPickerOpen: setIsEmojiPickerOpen,
+  });
   const openMentionPicker = useComposerMentionPicker({
     mentions,
     richText,
@@ -493,7 +480,14 @@ function MessageComposerImpl({
     onToggle: toggleAlwaysAddressAgent,
   });
   const submitMessage = React.useCallback(async () => {
-    const trimmed = syncComposerContentFromEditor().trim();
+    const composerText = syncComposerContentFromEditor().trim();
+    const plainComposerText = richText.getPlainTextAndCursor().text.trim();
+    const cloudCommand =
+      editTargetRef.current == null && cloudControls
+        ? cloudControl.commandFromText(plainComposerText)
+        : null;
+    if (cloudCommand && cloudControl.isCommandBlocked(cloudCommand)) return;
+    const trimmed = cloudCommand?.wire ?? composerText;
     // Edit mode
     if (editTargetRef.current && onEditSaveRef.current) {
       if (isEditSubmissionLocked) return;
@@ -538,11 +532,11 @@ function MessageComposerImpl({
       });
       return;
     }
-    // Normal send
     const currentPendingImeta = media.pendingImetaRef.current;
     const currentQueuedAttachments = media.queuedAttachmentsRef.current;
     const hasMedia =
       currentPendingImeta.length > 0 || currentQueuedAttachments.length > 0;
+    if (cloudCommand && hasMedia) return;
     if (
       (!trimmed && !hasMedia) ||
       disabledRef.current ||
@@ -558,6 +552,35 @@ function MessageComposerImpl({
       capturedThreadContext !== null &&
       !capturedThreadContext.parentEventId
     ) {
+      return;
+    }
+    if (cloudCommand && cloudControls) {
+      if (!capturedThreadContext) return;
+      const submittedDraftKey = effectiveDraftKeyRef.current;
+      await submitComposerCloudControl({
+        agentPubkey: cloudControls.agentPubkey,
+        channelId,
+        clearCurrentComposer: () => {
+          setComposerContent("");
+          richText.clearContent();
+          mentions.clearMentions();
+          channelLinks.clearChannels();
+          emojiAutocomplete.clearEmojis();
+          cloudControl.reset();
+        },
+        getCurrentContent: syncComposerContentFromEditor,
+        markDraftSent: drafts.markDraftSent,
+        command: cloudCommand,
+        currentDraftKeyRef: effectiveDraftKeyRef,
+        onError: () => toast.error("Could not send location command."),
+        onPreparingChange: onPreparingMentionSendChange,
+        send: onSendRef.current,
+        sentDraftKey: resolveSentDraftKey(submittedDraftKey, drafts.loadDraft),
+        submitLockedRef: isSubmitLockedRef,
+        submittedContent: composerText,
+        submittedDraftKey,
+        threadContext: capturedThreadContext,
+      });
       return;
     }
     isSubmitLockedRef.current = true;
@@ -594,8 +617,13 @@ function MessageComposerImpl({
   }, [
     channelId,
     channelLinks.clearChannels,
+    cloudControl.commandFromText,
+    cloudControl.isCommandBlocked,
+    cloudControl.reset,
+    cloudControls,
     customEmoji,
     drafts.loadDraft,
+    drafts.markDraftSent,
     emojiAutocomplete.clearEmojis,
     getLiveLinkPreviewCandidates,
     getReadyLinkPreviewTags,
@@ -609,6 +637,7 @@ function MessageComposerImpl({
     mentionSendFlow.sendMessageWithMentionFlow,
     mentions.clearMentions,
     richText.clearContent,
+    richText.getPlainTextAndCursor,
     richText.setContent,
     setComposerContent,
     spoileredAttachmentUrls,
@@ -650,14 +679,11 @@ function MessageComposerImpl({
     },
     [submitMessage],
   );
-  // ── Keyboard handling ───────────────────────────────────────────────
-  // Tiptap handles formatting shortcuts (⌘B, ⌘I, etc.) natively.
-  // Plain Enter → submit is now handled inside the Tiptap `submitOnEnter`
-  // extension (fires before ProseMirror's splitBlock). This wrapper only
   // handles autocomplete arrow/enter keys and Escape for edit mode.
   const handleEditorKeyDown = React.useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>) => {
       if (handleAlwaysAddressShortcut(event)) return;
+      if (cloudControl.handleKeyDown(event)) return;
       // Let autocomplete handle keys first
       const emojiResult = emojiAutocomplete.handleEmojiKeyDown(event);
       if (emojiResult.handled) {
@@ -701,6 +727,7 @@ function MessageComposerImpl({
     },
     [
       handleAlwaysAddressShortcut,
+      cloudControl.handleKeyDown,
       emojiAutocomplete.handleEmojiKeyDown,
       applyEmojiInsert,
       channelLinks.handleChannelKeyDown,
@@ -781,47 +808,19 @@ function MessageComposerImpl({
       },
     });
   }, [media.setPendingImeta, richText.editor, scrollComposerToBottom]);
-  // ── Send button state ───────────────────────────────────────────────
   const sendDisabled =
     composerDisabled ||
     media.isUploading ||
     mentionSendFlow.isPreparingMentionSend ||
+    cloudControl.isSendBlocked ||
+    (cloudControl.isCommandDraft && hasControlBlockingMedia) ||
     (isContentEmpty &&
       media.pendingImeta.length === 0 &&
       media.queuedAttachments.length === 0);
-  const handleCaptureSelection = React.useCallback(() => {}, []);
-  const handlePaperclipClick = React.useCallback(() => {
-    void media.handlePaperclip();
-  }, [media.handlePaperclip]);
-  const handleRemoveAttachment = React.useCallback(
-    (url: string) => {
-      setSpoileredAttachmentUrls((current) => {
-        if (!current.has(url)) return current;
-        const next = new Set(current);
-        next.delete(url);
-        return next;
-      });
-      media.removeAttachment(url);
-    },
-    [media.removeAttachment],
-  );
-  const { handleAttachmentEditSave, handleAttachmentRevert } =
-    useAttachmentEditing({
-      revertAttachment: media.revertAttachment,
-      setSpoileredAttachmentUrls,
-      uploadEditedAttachment: media.uploadEditedAttachment,
-    });
-  const handleToggleAttachmentSpoiler = React.useCallback((url: string) => {
-    setSpoileredAttachmentUrls((current) => {
-      const next = new Set(current);
-      if (next.has(url)) {
-        next.delete(url);
-      } else {
-        next.add(url);
-      }
-      return next;
-    });
-  }, []);
+  const attachmentActions = useComposerAttachmentActions({
+    media,
+    setSpoileredUrls: setSpoileredAttachmentUrls,
+  });
   return (
     <>
       <footer
@@ -878,6 +877,7 @@ function MessageComposerImpl({
             }}
           >
             {ownsDropZone && media.isDragOver && <DropZoneOverlay />}
+            {cloudControl.autocomplete}
             <EmojiAutocomplete
               onSelect={applyEmojiInsert}
               selectedIndex={emojiAutocomplete.emojiSelectedIndex}
@@ -952,11 +952,11 @@ function MessageComposerImpl({
                     queuedPreviews={media.queuedPreviews}
                     uploadingCount={media.uploadingCount}
                     uploadingPreviews={media.uploadingPreviews}
-                    onEditSave={handleAttachmentEditSave}
-                    onRemove={handleRemoveAttachment}
-                    onRevert={handleAttachmentRevert}
+                    onEditSave={attachmentActions.handleAttachmentEditSave}
+                    onRemove={attachmentActions.onRemove}
+                    onRevert={attachmentActions.handleAttachmentRevert}
                     originalUrlByUrl={media.originalUrlByUrl}
-                    onToggleSpoiler={handleToggleAttachmentSpoiler}
+                    onToggleSpoiler={attachmentActions.onToggleSpoiler}
                     spoileredUrls={spoileredAttachmentUrls}
                   />
                 ) : null}
@@ -976,19 +976,19 @@ function MessageComposerImpl({
               layoutMode={layoutMode}
               composerDisabled={composerDisabled}
               editor={richText.editor}
-              extraActions={toolbarExtraActions}
+              extraActions={cloudControl.toolbarActions}
               formattingDisabled={composerDisabled}
               isEmojiPickerOpen={isEmojiPickerOpen}
               isFormattingOpen={isFormattingOpen}
               isSending={isSending || mentionSendFlow.isPreparingMentionSend}
               isUploading={media.isUploading}
-              onCaptureSelection={handleCaptureSelection}
+              onCaptureSelection={attachmentActions.onCaptureSelection}
               onEmojiPickerOpenChange={setIsEmojiPickerOpen}
               onEmojiSelect={insertEmoji}
               onFormattingToggle={handleFormattingToggle}
               onLinkButton={linkEditor.openFromToolbar}
               onOpenMentionPicker={openMentionSettings}
-              onPaperclip={handlePaperclipClick}
+              onPaperclip={attachmentActions.onPaperclip}
               onRemoveAddressedAgent={removeAddressedAgent}
               pulseVersionByPubkey={addressPulse.pulseVersionByPubkey}
               sendDisabled={sendDisabled}
