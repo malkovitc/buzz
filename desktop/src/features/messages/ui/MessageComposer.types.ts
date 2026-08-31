@@ -5,6 +5,7 @@ import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
 import type { MediaUploadController } from "@/features/messages/lib/useMediaUpload";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ChannelType } from "@/shared/api/types";
+import type { CloudControlUiState } from "@/features/messages/lib/cloudControlCommands";
 
 export type MessageComposerEditTarget = {
   author: string;
@@ -23,6 +24,11 @@ export type MessageComposerEditTarget = {
   unresolvedMentionPubkeys?: string[];
 };
 
+export type MessageComposerCloudControls = {
+  agentPubkey: string;
+  state: CloudControlUiState;
+};
+
 export type MessageComposerProps = {
   audienceContext?: {
     type: "channel" | "thread";
@@ -30,6 +36,8 @@ export type MessageComposerProps = {
   channelId?: string | null;
   channelName: string;
   channelType?: ChannelType | null;
+  /** Caliper-only deterministic local/cloud controls for an approved task thread. */
+  cloudControls?: MessageComposerCloudControls;
   containerClassName?: string;
   /**
    * `dock` delegates backdrop blur and bottom-rail geometry to a surrounding
