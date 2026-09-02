@@ -445,7 +445,9 @@ test("source fence is durable before grant publication and retries idempotently"
     const decision = admittedDecision(offer);
     const request = hostRequest(offer, decision);
     let fenceCalls = 0;
+    let decisionsRead = false;
     const fence = async (command, input) => {
+      if (command[0] === "/fake/decisions") decisionsRead = true;
       const key = protocolCommandResult(command, offer);
       if (key) return key;
       fenceCalls += 1;
@@ -457,7 +459,10 @@ test("source fence is durable before grant publication and retries idempotently"
       };
     };
     const prepared = await prepareGrant(request, hostConfig("source", root), {
-      now: NOW,
+      now: () => {
+        assert.equal(decisionsRead, true);
+        return NOW;
+      },
       commandRunner: fence,
     });
     assert.equal(prepared.status, "publish");

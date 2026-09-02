@@ -8,6 +8,7 @@ import { canonicalJson } from "./continuation-canonical.mjs";
 const MAX_INPUT_BYTES = 256 * 1024;
 const MAX_STATE_FILES = 512;
 const MAX_STATE_BYTES = 64 * 1024 * 1024;
+const DELEGATION_HOST_PLATFORMS = new Set(["darwin", "linux"]);
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -318,9 +319,12 @@ export function reserveStateCapacity(directory) {
 }
 
 export async function runVector(vector, input, { lease } = {}) {
+  if (!DELEGATION_HOST_PLATFORMS.has(process.platform)) {
+    throw new Error("delegation commands are unsupported on this platform");
+  }
   return await new Promise((resolve, reject) => {
     const child = spawn(vector[0], vector.slice(1), {
-      detached: process.platform !== "win32",
+      detached: true,
       env: {
         HOME: os.homedir(),
         PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -335,8 +339,7 @@ export async function runVector(vector, input, { lease } = {}) {
     let timer;
     const terminate = () => {
       try {
-        if (process.platform === "win32") child.kill("SIGKILL");
-        else if (child.pid) process.kill(-child.pid, "SIGKILL");
+        if (child.pid) process.kill(-child.pid, "SIGKILL");
       } catch {}
     };
     const settle = (error, value) => {

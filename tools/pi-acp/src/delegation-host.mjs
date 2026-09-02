@@ -350,19 +350,33 @@ async function loadDecisionEvents(request, config, commandRunner) {
   return result.events;
 }
 
+function observeTrustedTime(now) {
+  const observedAt = typeof now === "function" ? now() : (now ?? Date.now());
+  if (!Number.isFinite(observedAt)) {
+    throw new Error("delegation trusted clock is invalid");
+  }
+  return observedAt;
+}
+
 async function admitReady(request, config, commandRunner, now) {
   const events = await loadDecisionEvents(request, config, commandRunner);
+  const readyObservedAt = observeTrustedTime(now);
+  const options = {
+    ownershipEvidence: request.ownershipEvidence,
+    now: readyObservedAt,
+  };
   const decision = resolveAcceptedDelegationDecision(
     events,
     request.offerEvent,
-    { ownershipEvidence: request.ownershipEvidence, now },
+    options,
   );
-  return validateDelegationReadyEvent(
+  const admittedReady = validateDelegationReadyEvent(
     request.readyEvent,
     decision.event,
     request.offerEvent,
-    { ownershipEvidence: request.ownershipEvidence, now },
+    options,
   );
+  return { admittedReady, readyObservedAt };
 }
 
 function publishResponse(state, admittedReady) {
@@ -531,7 +545,7 @@ async function recoverOrPublishSource(
 export async function prepareGrant(
   request,
   configValue,
-  { now = Date.now(), commandRunner = runVector } = {},
+  { now, commandRunner = runVector } = {},
 ) {
   const config = validateConfig(configValue);
   if (config.role !== "source") {
@@ -549,7 +563,7 @@ export async function prepareGrant(
   const proofKey = await loadProofKey(config, commandRunner);
   const file = path.join(config.stateDirectory, `${operationId}.json`);
   const stored = fs.existsSync(file) ? readDurableJson(file) : null;
-  const admittedReady = stored
+  const admission = stored
     ? null
     : await admitReady(request, config, commandRunner, now);
   const releaseCapacity = stored
@@ -575,8 +589,9 @@ export async function prepareGrant(
             fenceLease,
           );
         }
+        const { admittedReady, readyObservedAt: observedAt } = admission;
         const lineage = lineageRecord(admittedReady, operationId);
-        const readyObservedAt = new Date(now).toISOString();
+        const readyObservedAt = new Date(observedAt).toISOString();
         const intent = {
           schemaVersion: 1,
           phase: "fencing",
