@@ -32,6 +32,7 @@ import {
 const SOURCE = "11".repeat(32);
 const TARGET = "22".repeat(32);
 const AGENT = "33".repeat(32);
+const TARGET_AGENT = "aa".repeat(32);
 const ROOT = "44".repeat(32);
 const OFFER_EVENT = "55".repeat(32);
 const DECISION_EVENT = "66".repeat(32);
@@ -48,6 +49,9 @@ const READY_AT = new Date(NOW - 5_000).toISOString();
 const OBSERVED_AT = new Date(NOW - 4_000).toISOString();
 const GRANTED_AT = new Date(NOW - 3_000).toISOString();
 const EXPIRES = new Date(NOW + 60_000).toISOString();
+function tempDir(label) {
+  return fs.mkdtempSync(path.join(os.tmpdir(), `pi-delegation-${label}-`));
+}
 
 function capsuleEnvelope() {
   const capsule = {
@@ -112,9 +116,19 @@ function ownershipEvidence() {
   };
 }
 
+function targetOwnershipEvidence(generation) {
+  return {
+    ...ownershipEvidence(),
+    agentPubkey: TARGET_AGENT,
+    ownerPubkey: TARGET,
+    generation,
+    location: "cloud",
+  };
+}
+
 function offerDraft(capsule) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     offerId: "44444444-4444-4444-8444-444444444444",
     createdAt: CREATED,
     expiresAt: EXPIRES,
@@ -124,7 +138,11 @@ function offerDraft(capsule) {
       generation: GENERATION,
       location: "local",
     },
-    target: { ownerPubkey: TARGET, location: "cloud" },
+    target: {
+      ownerPubkey: TARGET,
+      agentPubkey: TARGET_AGENT,
+      location: "cloud",
+    },
     task: capsule.capsule.task,
     git: {
       remoteUrl: capsule.capsule.git.remoteUrl,
@@ -160,6 +178,7 @@ function offerEvent(offer) {
       ["e", ROOT, "", "reply"],
       ["p", TARGET],
       ["p", AGENT],
+      ["p", TARGET_AGENT],
     ],
     signatureVerified: true,
   };
@@ -167,12 +186,14 @@ function offerEvent(offer) {
 
 function decisionValue(offer, decision = "accept") {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     offerId: offer.offer.offerId,
     offerEventId: OFFER_EVENT,
     offerDigest: offer.digest,
     sourceGeneration: GENERATION,
     activationGeneration: offer.activationGeneration,
+    sourceAgentPubkey: AGENT,
+    targetAgentPubkey: TARGET_AGENT,
     decision,
     decidedAt: DECIDED,
   };
@@ -193,6 +214,7 @@ function decisionEvent(offer, decision = "accept") {
       ["p", SOURCE],
       ["p", TARGET],
       ["p", AGENT],
+      ["p", TARGET_AGENT],
     ],
     signatureVerified: true,
   };
@@ -209,13 +231,15 @@ function admittedDecision(offer = offerEnvelope()) {
 function readyValue(admitted) {
   const offer = admitted.offer.envelope;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     offerEventId: admitted.offer.event.id,
     decisionEventId: admitted.event.id,
     offerDigest: offer.digest,
     capsuleDigest: offer.offer.capsuleDigest,
     sourceGeneration: offer.offer.source.generation,
     activationGeneration: offer.activationGeneration,
+    sourceAgentPubkey: offer.offer.task.agentPubkey,
+    targetAgentPubkey: offer.offer.target.agentPubkey,
     importReceiptDigest: "bb".repeat(32),
     readyAt: READY_AT,
   };
@@ -237,6 +261,7 @@ function readyEvent(admitted) {
       ["p", SOURCE],
       ["p", TARGET],
       ["p", AGENT],
+      ["p", TARGET_AGENT],
     ],
     signatureVerified: true,
   };
@@ -264,7 +289,7 @@ function fenceEvidence(ready) {
 function grantValue(ready) {
   const evidence = fenceEvidence(ready);
   const grant = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     offerEventId: ready.decision.offer.event.id,
     decisionEventId: ready.decision.event.id,
     readyEventId: ready.event.id,
@@ -273,6 +298,8 @@ function grantValue(ready) {
     capsuleDigest: ready.ready.capsuleDigest,
     sourceGeneration: ready.ready.sourceGeneration,
     activationGeneration: ready.ready.activationGeneration,
+    sourceAgentPubkey: ready.ready.sourceAgentPubkey,
+    targetAgentPubkey: ready.ready.targetAgentPubkey,
     fencedStateDigest: evidence.stateDigest,
     ownershipDigest: protocolDigest(ownershipEvidence()),
     readyObservedAt: evidence.readyObservedAt,
@@ -302,6 +329,7 @@ function grantEvent(ready) {
       ["p", SOURCE],
       ["p", TARGET],
       ["p", AGENT],
+      ["p", TARGET_AGENT],
     ],
     signatureVerified: true,
   };
@@ -342,6 +370,14 @@ test("wrong principals, community, routing, lineage, and expiry fail closed", ()
       }),
     /source and target locations must differ/,
   );
+  for (const targetAgent of [TARGET, AGENT]) {
+    const draft = offerDraft(capsuleEnvelope());
+    draft.target.agentPubkey = targetAgent;
+    assert.throws(
+      () => delegationOfferEnvelope(draft, { now: NOW }),
+      /pairwise/,
+    );
+  }
   assert.throws(
     () => admitReady({ ...readyEvent(decision), pubkey: SOURCE }),
     /signer is not the target owner/,
@@ -373,7 +409,7 @@ test("wrong principals, community, routing, lineage, and expiry fail closed", ()
           relayUrl: "wss://other.example",
         },
       }),
-    /authoritative ownership/,
+    /source ownership is not authoritative/,
   );
   assert.throws(
     () => admitReady(readyEvent(decision), { now: Date.parse(EXPIRES) + 1 }),
@@ -439,7 +475,7 @@ function hostRequest(offer, decision) {
 }
 
 test("source fence is durable before grant publication and retries idempotently", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-delegation-source-"));
+  const root = tempDir("source");
   try {
     const offer = offerEnvelope();
     const decision = admittedDecision(offer);
@@ -450,6 +486,7 @@ test("source fence is durable before grant publication and retries idempotently"
       if (command[0] === "/fake/decisions") decisionsRead = true;
       const key = protocolCommandResult(command, offer);
       if (key) return key;
+      assert.equal(input.schemaVersion, 2);
       fenceCalls += 1;
       return {
         status: "fenced",
@@ -532,7 +569,7 @@ test("source fence is durable before grant publication and retries idempotently"
 });
 
 test("authoritative cancellation blocks fencing", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-delegation-cancel-"));
+  const root = tempDir("cancel");
   try {
     const offer = offerEnvelope();
     const request = hostRequest(offer, admittedDecision(offer));
@@ -572,9 +609,7 @@ test("authoritative cancellation blocks fencing", async () => {
 });
 
 test("concurrent READY processing invokes one fence command", async () => {
-  const root = fs.mkdtempSync(
-    path.join(os.tmpdir(), "pi-delegation-concurrent-"),
-  );
+  const root = tempDir("concurrent");
   try {
     const offer = offerEnvelope();
     const request = hostRequest(offer, admittedDecision(offer));
@@ -621,10 +656,8 @@ test("concurrent READY processing invokes one fence command", async () => {
 });
 
 test("stale lock recovery admits one retry", async () => {
-  const seedRoot = fs.mkdtempSync(
-    path.join(os.tmpdir(), "pi-delegation-seed-"),
-  );
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-delegation-stale-"));
+  const seedRoot = tempDir("seed");
+  const root = tempDir("stale");
   try {
     const offer = offerEnvelope();
     const request = hostRequest(offer, admittedDecision(offer));
@@ -710,7 +743,7 @@ test("stale lock recovery admits one retry", async () => {
 });
 
 test("interrupted fence is retried without releasing grant content", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-delegation-fence-"));
+  const root = tempDir("fence");
   try {
     const offer = offerEnvelope();
     const decision = admittedDecision(offer);
@@ -764,9 +797,7 @@ test("interrupted fence is retried without releasing grant content", async () =>
 });
 
 test("state capacity fails before a fence effect", async () => {
-  const root = fs.mkdtempSync(
-    path.join(os.tmpdir(), "pi-delegation-capacity-"),
-  );
+  const root = tempDir("capacity");
   try {
     for (let index = 0; index < 512; index += 1) {
       fs.writeFileSync(path.join(root, `${index}.json`), "{}", { mode: 0o600 });
@@ -799,9 +830,7 @@ test("state capacity fails before a fence effect", async () => {
 });
 
 test("capacity reservations serialize distinct operations", () => {
-  const root = fs.mkdtempSync(
-    path.join(os.tmpdir(), "pi-delegation-reservation-"),
-  );
+  const root = tempDir("reservation");
   try {
     const release = testOnly.reserveStateCapacity(root);
     assert.throws(
@@ -845,7 +874,7 @@ test("fixed command malformed JSON and oversized descendants are contained", asy
     ),
     /returned invalid JSON/,
   );
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-delegation-child-"));
+  const root = tempDir("child");
   const marker = path.join(root, "survived");
   try {
     const script = [
@@ -866,12 +895,8 @@ test("fixed command malformed JSON and oversized descendants are contained", asy
 });
 
 test("target command is unreachable before an admitted grant and runs once", async () => {
-  const sourceRoot = fs.mkdtempSync(
-    path.join(os.tmpdir(), "pi-delegation-source-"),
-  );
-  const targetRoot = fs.mkdtempSync(
-    path.join(os.tmpdir(), "pi-delegation-target-"),
-  );
+  const sourceRoot = tempDir("source");
+  const targetRoot = tempDir("target");
   try {
     const offer = offerEnvelope();
     const decision = admittedDecision(offer);
@@ -901,6 +926,7 @@ test("target command is unreachable before an admitted grant and runs once", asy
     const activate = async (command, input) => {
       const key = protocolCommandResult(command, offer);
       if (key) return key;
+      assert.equal(input.schemaVersion, 2);
       activationCalls += 1;
       if (crashAfterFirstEffect) {
         crashAfterFirstEffect = false;
@@ -909,66 +935,48 @@ test("target command is unreachable before an admitted grant and runs once", asy
       return {
         status: "active",
         activationGeneration: input.activationGeneration,
+        ownershipEvidence: targetOwnershipEvidence(input.activationGeneration),
       };
     };
-    await assert.rejects(
+    const runActivation = (
+      grantEvent,
+      currentOwnership = request.ownershipEvidence,
+    ) =>
       activateTarget(
-        {
-          ...grantRequest,
-          grantEvent: { ...event, signatureVerified: false },
-        },
+        { ...grantRequest, grantEvent, ownershipEvidence: currentOwnership },
         hostConfig("target", targetRoot),
         { commandRunner: activate },
-      ),
+      );
+    await assert.rejects(
+      runActivation({ ...event, signatureVerified: false }),
       /signature is not verified/,
     );
     assert.equal(activationCalls, 0);
     await assert.rejects(
-      activateTarget(
-        { ...grantRequest, grantEvent: event },
-        hostConfig("target", targetRoot),
-        { commandRunner: activate },
-      ),
+      runActivation(event),
       /simulated crash after target effect/,
     );
     assert.equal(activationCalls, 1);
-    const transferredOwnership = {
-      ...ownershipEvidence(),
-      ownerPubkey: TARGET,
-      generation: ready.ready.activationGeneration,
-      location: "cloud",
-    };
+    const transferredOwnership = targetOwnershipEvidence(
+      ready.ready.activationGeneration,
+    );
     assert.equal(
-      (
-        await activateTarget(
-          {
-            ...grantRequest,
-            grantEvent: event,
-            ownershipEvidence: transferredOwnership,
-          },
-          hostConfig("target", targetRoot),
-          { commandRunner: activate },
-        )
-      ).status,
+      (await runActivation(event, transferredOwnership)).status,
       "active",
     );
     assert.equal(activationCalls, 2);
     const equivalentEvent = { ...event, id: "89".repeat(32) };
     assert.equal(
-      (
-        await activateTarget(
-          {
-            ...grantRequest,
-            grantEvent: equivalentEvent,
-            ownershipEvidence: transferredOwnership,
-          },
-          hostConfig("target", targetRoot),
-          { commandRunner: activate },
-        )
-      ).status,
+      (await runActivation(equivalentEvent, transferredOwnership)).status,
       "noop",
     );
-    assert.equal(activationCalls, 2);
+    await assert.rejects(
+      runActivation(event, {
+        ...transferredOwnership,
+        agentPubkey: AGENT,
+      }),
+      /target ownership is not authoritative/,
+    );
     const stateFile = fs
       .readdirSync(targetRoot)
       .find((entry) => entry.endsWith(".json"));
@@ -977,19 +985,11 @@ test("target command is unreachable before an admitted grant and runs once", asy
     const corruptState = JSON.parse(fs.readFileSync(statePath, "utf8"));
     fs.writeFileSync(
       statePath,
-      `${JSON.stringify({ ...corruptState, phase: "broken" })}\n`,
+      `${JSON.stringify({ ...corruptState, schemaVersion: 1 })}\n`,
       { mode: 0o600 },
     );
     await assert.rejects(
-      activateTarget(
-        {
-          ...grantRequest,
-          grantEvent: event,
-          ownershipEvidence: transferredOwnership,
-        },
-        hostConfig("target", targetRoot),
-        { commandRunner: activate },
-      ),
+      runActivation(event, transferredOwnership),
       /target delegation state is invalid/,
     );
     assert.equal(activationCalls, 2);

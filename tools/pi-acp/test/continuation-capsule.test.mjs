@@ -44,13 +44,18 @@ function expectedFor(draft, capsuleDigest) {
   };
 }
 
-function sessionDirectory(base, task, location) {
+function sessionDirectory(
+  base,
+  task,
+  location,
+  agentPubkey = task.agentPubkey,
+) {
   return taskSessionDirectory(
     path.join(base, `${location}-root`),
     taskSessionIdentity(
       {
         relayUrl: task.relayUrl,
-        agentPubkey: task.agentPubkey,
+        agentPubkey,
         channelId: task.channelId,
         taskThreadRoot: task.threadRoot,
       },
@@ -526,8 +531,17 @@ test("imports one fresh child session and is idempotent by capsule digest", () =
   const targetPath = path.join(base, "target-repo");
   fs.cpSync(repo, targetPath, { recursive: true });
   const target = fs.realpathSync(targetPath);
-  const sessionDir = sessionDirectory(base, draft.task, "target");
-  const expected = expectedFor(draft, envelope.digest);
+  const targetAgentPubkey = "e".repeat(64);
+  const sessionDir = sessionDirectory(
+    base,
+    draft.task,
+    "target",
+    targetAgentPubkey,
+  );
+  const expected = {
+    ...expectedFor(draft, envelope.digest),
+    targetAgentPubkey,
+  };
   const first = importCapsule(envelope, {
     cwd: target,
     sessionDir,
@@ -634,7 +648,7 @@ test("imports one fresh child session and is idempotent by capsule digest", () =
       importCapsule(competing, {
         cwd: target,
         sessionDir,
-        expected: expectedFor(draft, competing.digest),
+        expected: { ...expected, capsuleDigest: competing.digest },
         now,
       }),
     /parent is not the current task lineage head/,

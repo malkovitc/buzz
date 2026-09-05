@@ -18,7 +18,12 @@ import {
   reserveStateCapacity,
   runVector,
 } from "./delegation-host-runtime.mjs";
-import { resolveAcceptedDelegationDecision } from "./delegation-contract.mjs";
+import {
+  DELEGATION_SCHEMA_VERSION,
+  delegationValidation,
+  resolveAcceptedDelegationDecision,
+  validateDelegationTargetOwnership,
+} from "./delegation-contract.mjs";
 import {
   createFenceProof,
   protocolDigest,
@@ -30,6 +35,7 @@ import {
 const HEX64 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const ROLES = new Set(["source", "target"]);
+const { mentionPubkeysForOffer } = delegationValidation;
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -156,6 +162,8 @@ function lineageRecord(admittedReady, operationId) {
     capsuleDigest: admittedReady.ready.capsuleDigest,
     sourceGeneration: admittedReady.ready.sourceGeneration,
     activationGeneration: admittedReady.ready.activationGeneration,
+    sourceAgentPubkey: admittedReady.ready.sourceAgentPubkey,
+    targetAgentPubkey: admittedReady.ready.targetAgentPubkey,
   };
 }
 
@@ -195,7 +203,9 @@ function validateFencingState(
     ],
     "source fencing state",
   );
-  const validIdentity = state.schemaVersion === 1 && state.phase === "fencing";
+  const validIdentity =
+    state.schemaVersion === DELEGATION_SCHEMA_VERSION &&
+    state.phase === "fencing";
   if (!validIdentity) throw new Error("source fencing state is invalid");
   assertStoredLineage(state, lineage);
   if (
@@ -237,7 +247,7 @@ function validateSourceState(
     "source delegation state",
   );
   const validPhase = state.phase === "fenced" || state.phase === "published";
-  if (state.schemaVersion !== 1) {
+  if (state.schemaVersion !== DELEGATION_SCHEMA_VERSION) {
     throw new Error("source delegation state schemaVersion is invalid");
   }
   if (!validPhase) throw new Error("source delegation state phase is invalid");
@@ -272,7 +282,23 @@ function validateSourceState(
   return state;
 }
 
-function validateTargetState(state, lineage, ownershipEvidence, grantContent) {
+function validateTargetOwnershipState(state, envelope) {
+  if (state.phase === "activating") {
+    if (state.targetOwnershipEvidence !== null) {
+      throw new Error("activating target ownership state is invalid");
+    }
+    return;
+  }
+  validateDelegationTargetOwnership(envelope, state.targetOwnershipEvidence);
+}
+
+function validateTargetState(
+  state,
+  lineage,
+  ownershipEvidence,
+  grantContent,
+  envelope,
+) {
   exactObject(
     state,
     [
@@ -282,11 +308,13 @@ function validateTargetState(state, lineage, ownershipEvidence, grantContent) {
       "grantEventId",
       "grantContent",
       "ownershipEvidence",
+      "targetOwnershipEvidence",
     ],
     "target delegation state",
   );
   const validPhase = state.phase === "activating" || state.phase === "active";
-  const validIdentity = state.schemaVersion === 1 && validPhase;
+  const validIdentity =
+    state.schemaVersion === DELEGATION_SCHEMA_VERSION && validPhase;
   if (!validIdentity) throw new Error("target delegation state is invalid");
   assertStoredLineage(state, lineage);
   requiredString(state.grantEventId, HEX64, "target grantEventId");
@@ -298,6 +326,7 @@ function validateTargetState(state, lineage, ownershipEvidence, grantContent) {
   ) {
     throw new Error("target delegation ownership snapshot is corrupt");
   }
+  validateTargetOwnershipState(state, envelope);
   return state;
 }
 
@@ -310,7 +339,7 @@ function grantFor(
 ) {
   const lineage = lineageRecord(admittedReady, operationIdFor(admittedReady));
   const grant = {
-    schemaVersion: 1,
+    schemaVersion: DELEGATION_SCHEMA_VERSION,
     offerEventId: lineage.offerEventId,
     decisionEventId: lineage.decisionEventId,
     readyEventId: lineage.readyEventId,
@@ -319,6 +348,8 @@ function grantFor(
     capsuleDigest: lineage.capsuleDigest,
     sourceGeneration: lineage.sourceGeneration,
     activationGeneration: lineage.activationGeneration,
+    sourceAgentPubkey: lineage.sourceAgentPubkey,
+    targetAgentPubkey: lineage.targetAgentPubkey,
     fencedStateDigest: fenceEvidence.stateDigest,
     ownershipDigest: protocolDigest(ownershipEvidence),
     readyObservedAt: fenceEvidence.readyObservedAt,
@@ -330,7 +361,7 @@ function grantFor(
 async function loadProofKey(config, commandRunner) {
   const result = await commandRunner(config.fenceProofKeyCommand, {
     schemaVersion: 1,
-    purpose: "delegation-fence-proof-v1",
+    purpose: "delegation-fence-proof-v2",
   });
   exactObject(result, ["key"], "fence proof key result");
   return requiredString(result.key, HEX64, "fence proof key result");
@@ -394,11 +425,7 @@ function publishResponse(state, admittedReady) {
     content: state.grantContent,
     channelId: offer.task.channelId,
     replyTo: admittedReady.event.id,
-    mentionPubkeys: [
-      offer.source.ownerPubkey,
-      offer.target.ownerPubkey,
-      offer.task.agentPubkey,
-    ],
+    mentionPubkeys: mentionPubkeysForOffer(offer),
   };
 }
 
@@ -440,7 +467,7 @@ async function completeSourceFence(
     intent.ownershipEvidence,
   );
   const fenceRequest = {
-    schemaVersion: 1,
+    schemaVersion: DELEGATION_SCHEMA_VERSION,
     ...lineage,
     readyObservedAt: intent.readyObservedAt,
   };
@@ -485,7 +512,7 @@ async function completeSourceFence(
     intent.ownershipEvidence,
   );
   const state = {
-    schemaVersion: 1,
+    schemaVersion: DELEGATION_SCHEMA_VERSION,
     phase: "fenced",
     ...lineage,
     fenceEvidence,
@@ -593,7 +620,7 @@ export async function prepareGrant(
         const lineage = lineageRecord(admittedReady, operationId);
         const readyObservedAt = new Date(observedAt).toISOString();
         const intent = {
-          schemaVersion: 1,
+          schemaVersion: DELEGATION_SCHEMA_VERSION,
           phase: "fencing",
           ...lineage,
           readyObservedAt,
@@ -721,7 +748,7 @@ export async function activateTarget(
   const file = path.join(config.stateDirectory, `${operationId}.json`);
   const proofKey = await loadProofKey(config, commandRunner);
   const stored = fs.existsSync(file) ? readDurableJson(file) : null;
-  const ownershipEvidence =
+  const sourceOwnershipEvidence =
     stored?.ownershipEvidence ?? request.ownershipEvidence;
   const admittedGrant = validateDelegationGrantEvent(
     request.grantEvent,
@@ -729,8 +756,9 @@ export async function activateTarget(
     request.decisionEvent,
     request.offerEvent,
     proofKey,
-    { ownershipEvidence },
+    { ownershipEvidence: sourceOwnershipEvidence },
   );
+  const envelope = admittedGrant.ready.decision.offer.envelope;
   const lineage = lineageRecord(admittedGrant.ready, operationId);
   const releaseCapacity = stored
     ? null
@@ -747,23 +775,29 @@ export async function activateTarget(
           ? validateTargetState(
               readDurableJson(file),
               lineage,
-              ownershipEvidence,
+              sourceOwnershipEvidence,
               admittedGrant.event.content,
+              envelope,
             )
           : {
-              schemaVersion: 1,
+              schemaVersion: DELEGATION_SCHEMA_VERSION,
               phase: "activating",
               ...lineage,
               grantEventId: admittedGrant.event.id,
               grantContent: admittedGrant.event.content,
-              ownershipEvidence,
+              ownershipEvidence: sourceOwnershipEvidence,
+              targetOwnershipEvidence: null,
             };
         if (!fs.existsSync(file)) atomicJson(file, current);
         if (current.phase === "active") {
+          validateDelegationTargetOwnership(
+            envelope,
+            request.ownershipEvidence,
+          );
           return { status: "noop", operationId };
         }
         const activationRequest = {
-          schemaVersion: 1,
+          schemaVersion: DELEGATION_SCHEMA_VERSION,
           ...lineage,
           grantEventId: current.grantEventId,
           fencedStateDigest: admittedGrant.grant.fencedStateDigest,
@@ -775,7 +809,7 @@ export async function activateTarget(
         );
         exactObject(
           result,
-          ["status", "activationGeneration"],
+          ["status", "activationGeneration", "ownershipEvidence"],
           "target activation result",
         );
         const validActivation =
@@ -786,7 +820,15 @@ export async function activateTarget(
             "target command did not activate the exact generation",
           );
         }
-        atomicJson(file, { ...current, phase: "active" });
+        const targetOwnershipEvidence = validateDelegationTargetOwnership(
+          envelope,
+          result.ownershipEvidence,
+        );
+        atomicJson(file, {
+          ...current,
+          phase: "active",
+          targetOwnershipEvidence,
+        });
         return { status: "active", operationId };
       } finally {
         release.release();

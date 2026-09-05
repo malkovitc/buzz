@@ -150,7 +150,7 @@ async function handshake(harness) {
   assert.equal(initialized.result._meta.steering.supported, true);
   assert.equal(initialized.result._meta.pilot.liveCanaryValidated, true);
   assert.equal(initialized.result._meta.pilot.fleetApproved, false);
-  assert.equal(initialized.result.agentInfo.version, "0.2.9");
+  assert.equal(initialized.result.agentInfo.version, "0.2.10");
 
   harness.send({
     jsonrpc: "2.0",

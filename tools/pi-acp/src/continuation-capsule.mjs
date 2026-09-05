@@ -836,41 +836,60 @@ function reconcileCompletedHead(sessionDir, capsule, digest) {
   // reconciling an older completed import.
 }
 
+function validatedImportTask(expected, capsule, digest) {
+  const fields = [
+    "generation",
+    "location",
+    "capsuleDigest",
+    "relayUrl",
+    "agentPubkey",
+    "channelId",
+    "threadRoot",
+  ];
+  const delegated = Object.hasOwn(expected ?? {}, "targetAgentPubkey");
+  exactKeys(
+    expected,
+    delegated ? [...fields, "targetAgentPubkey"] : fields,
+    "expected ownership",
+  );
+  const targetAgentPubkey = delegated
+    ? expected.targetAgentPubkey
+    : expected.agentPubkey;
+  if (!HEX64.test(targetAgentPubkey))
+    throw new Error("expected targetAgentPubkey is invalid");
+  const expectedBinding = {
+    generation: expected.generation,
+    location: expected.location,
+    capsuleDigest: expected.capsuleDigest,
+    relayUrl: canonicalRelayUrl(expected.relayUrl),
+    agentPubkey: expected.agentPubkey,
+    channelId: expected.channelId,
+    threadRoot: expected.threadRoot,
+  };
+  const capsuleBinding = {
+    generation: capsule.ownership.generation,
+    location: capsule.ownership.targetLocation,
+    capsuleDigest: digest,
+    ...capsule.task,
+  };
+  if (canonicalJson(expectedBinding) !== canonicalJson(capsuleBinding)) {
+    throw new Error(
+      "capsule ownership generation, location, or task binding is stale",
+    );
+  }
+  return { ...capsule.task, agentPubkey: targetAgentPubkey };
+}
+
 function importCapsuleUnlocked(
   envelope,
   { cwd, sessionDir, expected, now = Date.now() },
 ) {
   validateEnvelope(envelope, { now, allowExpired: true });
-  exactKeys(
-    expected,
-    [
-      "generation",
-      "location",
-      "capsuleDigest",
-      "relayUrl",
-      "agentPubkey",
-      "channelId",
-      "threadRoot",
-    ],
-    "expected ownership",
-  );
   const capsule = envelope.capsule;
-  if (
-    expected.generation !== capsule.ownership.generation ||
-    expected.location !== capsule.ownership.targetLocation ||
-    expected.capsuleDigest !== envelope.digest ||
-    canonicalRelayUrl(expected.relayUrl) !== capsule.task.relayUrl ||
-    expected.agentPubkey !== capsule.task.agentPubkey ||
-    expected.channelId !== capsule.task.channelId ||
-    expected.threadRoot !== capsule.task.threadRoot
-  ) {
-    throw new Error(
-      "capsule ownership generation, location, or task binding is stale",
-    );
-  }
+  const importTask = validatedImportTask(expected, capsule, envelope.digest);
   if (!path.isAbsolute(cwd) || !path.isAbsolute(sessionDir))
     throw new Error("import paths must be absolute");
-  assertBoundTaskSessionDirectory(sessionDir, capsule.task);
+  assertBoundTaskSessionDirectory(sessionDir, importTask);
   fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(sessionDir, 0o700);
   const imports = path.join(sessionDir, ".capsule-imports");
