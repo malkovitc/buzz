@@ -3,9 +3,9 @@ import { canonicalJson } from "./continuation-canonical.mjs";
 import { validateEnvelope } from "./continuation-capsule.mjs";
 import { canonicalRelayUrl } from "./task-session.mjs";
 
-export const DELEGATION_SCHEMA_VERSION = 1;
-export const OFFER_MARKER = "[PI DELEGATION OFFER v1]";
-export const DECISION_MARKER = "[PI DELEGATION DECISION v1]";
+export const DELEGATION_SCHEMA_VERSION = 2;
+export const OFFER_MARKER = "[PI DELEGATION OFFER v2]";
+export const DECISION_MARKER = "[PI DELEGATION DECISION v2]";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -252,18 +252,53 @@ function canonicalOwnershipEvidence(value) {
   };
 }
 
-function assertCurrentOwnership(offer, value) {
+function assertOwnershipContract(expected, value, label) {
   const evidence = canonicalOwnershipEvidence(value);
-  const expected = {
-    relayUrl: offer.task.relayUrl,
-    agentPubkey: offer.task.agentPubkey,
-    ownerPubkey: offer.source.ownerPubkey,
-    generation: offer.source.generation,
-    location: offer.source.location,
-  };
   if (canonicalJson(evidence) !== canonicalJson(expected)) {
-    throw new Error("delegation offer does not match authoritative ownership");
+    throw new Error(`delegation ${label} ownership is not authoritative`);
   }
+  return evidence;
+}
+
+function assertCurrentOwnership(offer, value) {
+  return assertOwnershipContract(
+    {
+      relayUrl: offer.task.relayUrl,
+      agentPubkey: offer.task.agentPubkey,
+      ownerPubkey: offer.source.ownerPubkey,
+      generation: offer.source.generation,
+      location: offer.source.location,
+    },
+    value,
+    "source",
+  );
+}
+
+export function validateDelegationTargetOwnership(envelope, value) {
+  const offer = envelope.offer;
+  return assertOwnershipContract(
+    {
+      relayUrl: offer.task.relayUrl,
+      agentPubkey: offer.target.agentPubkey,
+      ownerPubkey: offer.target.ownerPubkey,
+      generation: envelope.activationGeneration,
+      location: offer.target.location,
+    },
+    value,
+    "target",
+  );
+}
+
+function offerMentionPubkeys(offer) {
+  return [
+    offer.target.ownerPubkey,
+    offer.task.agentPubkey,
+    offer.target.agentPubkey,
+  ];
+}
+
+function mentionPubkeysForOffer(offer) {
+  return [offer.source.ownerPubkey, ...offerMentionPubkeys(offer)];
 }
 
 export function activationGeneration(offerDigest) {
@@ -314,7 +349,11 @@ export function validateDelegationOffer(
     ["ownerPubkey", "generation", "location"],
     "offer.source",
   );
-  exactObject(value.target, ["ownerPubkey", "location"], "offer.target");
+  exactObject(
+    value.target,
+    ["ownerPubkey", "agentPubkey", "location"],
+    "offer.target",
+  );
   if (!LOCATIONS.has(value.source.location)) {
     throw new Error("offer.source.location is invalid");
   }
@@ -351,19 +390,21 @@ export function validateDelegationOffer(
         value.target.ownerPubkey,
         "offer.target.ownerPubkey",
       ),
+      agentPubkey: requiredPubkey(
+        value.target.agentPubkey,
+        "offer.target.agentPubkey",
+      ),
       location: value.target.location,
     },
     task: canonicalTask(value.task),
     git: canonicalGit(value.git),
     capabilities: canonicalCapabilities(value.capabilities),
   };
-  const distinctPrincipals = new Set([
-    offer.source.ownerPubkey,
-    offer.target.ownerPubkey,
-    offer.task.agentPubkey,
-  ]);
-  if (distinctPrincipals.size !== 3) {
-    throw new Error("delegation source, target, and agent keys must differ");
+  const principals = mentionPubkeysForOffer(offer);
+  if (new Set(principals).size !== principals.length) {
+    throw new Error(
+      "delegation owner and agent keys must be pairwise distinct",
+    );
   }
   if (offer.capabilities.repository !== offer.git.remoteUrl) {
     throw new Error("delegation capability repository does not match Git");
@@ -424,6 +465,8 @@ export function validateDelegationDecision(
       "offerDigest",
       "sourceGeneration",
       "activationGeneration",
+      "sourceAgentPubkey",
+      "targetAgentPubkey",
       "decision",
       "decidedAt",
     ],
@@ -441,12 +484,16 @@ export function validateDelegationDecision(
     offerDigest: offer.digest,
     sourceGeneration: offer.offer.source.generation,
     activationGeneration: offer.activationGeneration,
+    sourceAgentPubkey: offer.offer.task.agentPubkey,
+    targetAgentPubkey: offer.offer.target.agentPubkey,
   };
   const actual = {
     offerId: value.offerId,
     offerDigest: value.offerDigest,
     sourceGeneration: value.sourceGeneration,
     activationGeneration: value.activationGeneration,
+    sourceAgentPubkey: value.sourceAgentPubkey,
+    targetAgentPubkey: value.targetAgentPubkey,
   };
   if (canonicalJson(actual) !== canonicalJson(expected)) {
     throw new Error("delegation decision does not match its offer");
@@ -594,7 +641,7 @@ export function validateDelegationOfferEvent(event, options = {}) {
     {
       channelId: offer.task.channelId,
       eventTags: [["e", offer.task.threadRoot, "", "reply"]],
-      mentionPubkeys: [offer.target.ownerPubkey, offer.task.agentPubkey],
+      mentionPubkeys: offerMentionPubkeys(offer),
     },
     "delegation offer event",
   );
@@ -637,11 +684,7 @@ export function validateDelegationDecisionEvent(
         ["e", offer.task.threadRoot, "", "root"],
         ["e", admittedOffer.event.id, "", "reply"],
       ],
-      mentionPubkeys: [
-        offer.source.ownerPubkey,
-        offer.target.ownerPubkey,
-        offer.task.agentPubkey,
-      ],
+      mentionPubkeys: mentionPubkeysForOffer(offer),
     },
     "delegation decision event",
   );
@@ -687,4 +730,5 @@ export const delegationValidation = {
   parseProtocolContent,
   canonicalVerifiedEvent,
   assertCanonicalRouting,
+  mentionPubkeysForOffer,
 };

@@ -6,8 +6,8 @@ import {
   validateDelegationDecisionEvent,
 } from "./delegation-contract.mjs";
 
-export const READY_MARKER = "[PI DELEGATION READY v1]";
-export const GRANT_MARKER = "[PI DELEGATION GRANT v1]";
+export const READY_MARKER = "[PI DELEGATION READY v2]";
+export const GRANT_MARKER = "[PI DELEGATION GRANT v2]";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const {
@@ -18,6 +18,7 @@ const {
   parseProtocolContent,
   canonicalVerifiedEvent,
   assertCanonicalRouting,
+  mentionPubkeysForOffer,
 } = delegationValidation;
 
 function lineageBinding(admittedDecision) {
@@ -29,6 +30,8 @@ function lineageBinding(admittedDecision) {
     capsuleDigest: envelope.offer.capsuleDigest,
     sourceGeneration: envelope.offer.source.generation,
     activationGeneration: envelope.activationGeneration,
+    sourceAgentPubkey: envelope.offer.task.agentPubkey,
+    targetAgentPubkey: envelope.offer.target.agentPubkey,
   };
 }
 
@@ -47,6 +50,8 @@ export function validateDelegationReady(
       "capsuleDigest",
       "sourceGeneration",
       "activationGeneration",
+      "sourceAgentPubkey",
+      "targetAgentPubkey",
       "importReceiptDigest",
       "readyAt",
     ],
@@ -124,11 +129,7 @@ export function validateDelegationReadyEvent(
         ["e", offer.task.threadRoot, "", "root"],
         ["e", admittedDecision.event.id, "", "reply"],
       ],
-      mentionPubkeys: [
-        offer.source.ownerPubkey,
-        offer.target.ownerPubkey,
-        offer.task.agentPubkey,
-      ],
+      mentionPubkeys: mentionPubkeysForOffer(offer),
     },
     "delegation ready event",
   );
@@ -157,6 +158,8 @@ function fenceProofPayload(grant) {
     capsuleDigest: grant.capsuleDigest,
     sourceGeneration: grant.sourceGeneration,
     activationGeneration: grant.activationGeneration,
+    sourceAgentPubkey: grant.sourceAgentPubkey,
+    targetAgentPubkey: grant.targetAgentPubkey,
     fencedStateDigest: grant.fencedStateDigest,
     ownershipDigest: grant.ownershipDigest,
     readyObservedAt: grant.readyObservedAt,
@@ -191,6 +194,8 @@ export function validateDelegationGrant(
       "capsuleDigest",
       "sourceGeneration",
       "activationGeneration",
+      "sourceAgentPubkey",
+      "targetAgentPubkey",
       "fencedStateDigest",
       "fenceProof",
       "ownershipDigest",
@@ -348,11 +353,7 @@ export function validateDelegationGrantEvent(
         ["e", offer.task.threadRoot, "", "root"],
         ["e", admittedReady.event.id, "", "reply"],
       ],
-      mentionPubkeys: [
-        offer.source.ownerPubkey,
-        offer.target.ownerPubkey,
-        offer.task.agentPubkey,
-      ],
+      mentionPubkeys: mentionPubkeysForOffer(offer),
     },
     "delegation grant event",
   );
