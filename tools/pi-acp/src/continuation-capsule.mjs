@@ -5,6 +5,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   canonicalJson,
   capsuleDigest,
+  normalizedContinuation,
   renderContinuationContext,
 } from "./continuation-canonical.mjs";
 import { verifyGitBinding } from "./continuation-git.mjs";
@@ -24,7 +25,8 @@ export {
 } from "./continuation-canonical.mjs";
 export { verifyGitBinding } from "./continuation-git.mjs";
 
-export const CAPSULE_SCHEMA_VERSION = 1;
+export const CAPSULE_SCHEMA_VERSION = 2;
+const SUPPORTED_CAPSULE_SCHEMAS = new Set([1, CAPSULE_SCHEMA_VERSION]);
 export const MAX_CAPSULE_BYTES = 64 * 1024;
 const MAX_TEXT = 8 * 1024;
 const MAX_ITEM_TEXT = 2 * 1024;
@@ -33,9 +35,16 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HEX40_OR_64 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 const PI_ENTRY = /^[0-9a-f]{8}$/;
+const RUNTIME_ID = /^[a-z][a-z0-9_-]{0,31}$/;
+const CONTINUATION_MODES = new Set(["semantic", "exact"]);
 const LOCATIONS = new Set(["local", "cloud"]);
+const CONTINUATION_LINEAGE_TYPES = new Set([
+  "buzz.continuation.lineage.v1",
+  "buzz.continuation.lineage.v2",
+]);
+const SUPPORTED_ADAPTERS = new Set(["pi@1"]);
 const FORBIDDEN_KEYS =
-  /(?:secret|password|credential|api[_-]?key|private[_-]?key|authorization|cookie|environment|rawToolOutput|thinking|reasoning)/i;
+  /(?:secret|token|password|credential|api[_-]?key|private[_-]?key|authorization|cookie|environment|rawToolOutput|thinking|reasoning)/i;
 const FORBIDDEN_CONTEXT_TEXT =
   /\b(?:passwords?|passphrases?|credentials?|secrets?|tokens?|authorization|cookies?|environments?|private[_ -]?keys?|api[_ -]?keys?|access[_ -]?keys?|recovery[_ -]?phrases?|mnemonics?|wallet[_ -]?seeds?|seed[_ -]?phrases?|one[_ -]?time[_ -]?(?:passwords?|codes?)|otps?|pins?)\b/i;
 const FORBIDDEN_TEXT = [
@@ -159,23 +168,269 @@ function validateRemoteUrl(value) {
   return value;
 }
 
+function invalidLineageSize(value) {
+  return !Array.isArray(value) || value.length === 0 || value.length > 32;
+}
+
+function invalidAdapterVersion(value) {
+  return !Number.isSafeInteger(value) || value < 1;
+}
+
+function invalidOptionalDigest(value) {
+  return value !== null && !HEX64.test(value);
+}
+
 function validateLineage(value) {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 32) {
-    throw new Error("pi.lineage must contain 1..32 entries");
+  if (invalidLineageSize(value)) {
+    throw new Error("continuation.lineage must contain 1..32 entries");
   }
   return value.map((entry, index) => {
+    const label = `continuation.lineage[${index}]`;
     exactKeys(
       entry,
-      ["sessionId", "leafId", "location"],
-      `pi.lineage[${index}]`,
+      ["runtime", "sessionId", "checkpointId", "location"],
+      label,
     );
-    text(entry.sessionId, `pi.lineage[${index}].sessionId`, 128);
-    if (!PI_ENTRY.test(entry.leafId))
-      throw new Error(`pi.lineage[${index}].leafId is invalid`);
+    if (!RUNTIME_ID.test(entry.runtime))
+      throw new Error(`${label}.runtime is invalid`);
+    text(entry.sessionId, `${label}.sessionId`, 128);
+    text(entry.checkpointId, `${label}.checkpointId`, 128);
     if (!LOCATIONS.has(entry.location))
-      throw new Error(`pi.lineage[${index}].location is invalid`);
+      throw new Error(`${label}.location is invalid`);
     return entry;
   });
+}
+
+function adapterContractKey(adapter) {
+  return `${adapter.runtime}@${adapter.schemaVersion}`;
+}
+
+function validateAdapter(adapter) {
+  if (adapter === null) return null;
+  exactKeys(
+    adapter,
+    ["runtime", "schemaVersion", "payload"],
+    "continuation.adapter",
+  );
+  if (!RUNTIME_ID.test(adapter.runtime))
+    throw new Error("continuation.adapter.runtime is invalid");
+  if (invalidAdapterVersion(adapter.schemaVersion))
+    throw new Error("continuation.adapter.schemaVersion is invalid");
+  if (!SUPPORTED_ADAPTERS.has(adapterContractKey(adapter))) {
+    throw new Error("continuation adapter is unsupported");
+  }
+  if (!plainObject(adapter.payload))
+    throw new Error("continuation.adapter.payload must be an object");
+  assertSafeValue(adapter.payload, "capsule.continuation.adapter.payload");
+  return adapter;
+}
+
+function exactAdapterMissing(mode, adapter) {
+  return mode === "exact" && adapter === null;
+}
+
+function exactAdapterUnsupported(mode, adapter) {
+  return mode === "exact" && adapter !== null;
+}
+
+function sameCanonicalContract(left, right) {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function isContinuationLineageEntry(entry) {
+  return (
+    entry.type === "custom" &&
+    typeof entry.customType === "string" &&
+    entry.customType.startsWith("buzz.continuation.lineage.")
+  );
+}
+
+function continuationLineageEntries(branch) {
+  const entries = branch.filter(isContinuationLineageEntry);
+  for (const entry of entries) {
+    if (!CONTINUATION_LINEAGE_TYPES.has(entry.customType)) {
+      throw new Error("persisted continuation lineage version is unsupported");
+    }
+  }
+  return entries;
+}
+
+function validatedContinuation(capsule) {
+  if (capsule.schemaVersion === 1) validateLegacyPi(capsule.pi);
+  return normalizedContinuation(capsule);
+}
+
+function portableCapsule(capsule) {
+  if (capsule.schemaVersion === CAPSULE_SCHEMA_VERSION) {
+    return structuredClone(capsule);
+  }
+  const portable = structuredClone(capsule);
+  delete portable.pi;
+  portable.schemaVersion = CAPSULE_SCHEMA_VERSION;
+  portable.continuation = validatedContinuation(capsule);
+  return portable;
+}
+
+function normalizedExportIntent(capsule) {
+  const portable = portableCapsule(capsule);
+  portable.context.recentTail = [];
+  return portable;
+}
+
+function continuationParentDigest(capsule) {
+  return validatedContinuation(capsule).parentDigest;
+}
+
+function validatePersistedSourceBinding(lineage, binding) {
+  const head = lineage.at(-1);
+  const lineageBinding = {
+    runtime: head.runtime,
+    sessionId: head.sessionId,
+    checkpointId: head.checkpointId,
+  };
+  if (!sameCanonicalContract(binding, lineageBinding)) {
+    throw new Error("persisted continuation source binding is inconsistent");
+  }
+}
+
+function validateImportedMarkerDigest(data, parentField) {
+  if (!HEX64.test(data.capsuleDigest)) {
+    throw new Error("persisted continuation lineage digest is invalid");
+  }
+  if (invalidOptionalDigest(data[parentField])) {
+    throw new Error("persisted continuation parent digest is invalid");
+  }
+}
+
+function validatedImportedLineage(entry) {
+  if (!entry) return [];
+  const data = entry.data;
+  if (entry.customType === "buzz.continuation.lineage.v2") {
+    exactKeys(
+      data,
+      [
+        "capsuleDigest",
+        "sourceRuntime",
+        "sourceSessionId",
+        "sourceCheckpointId",
+        "parentDigest",
+        "lineage",
+      ],
+      "persisted continuation lineage v2",
+    );
+    validateImportedMarkerDigest(data, "parentDigest");
+    if (data.sourceRuntime !== "pi") {
+      throw new Error("persisted continuation source runtime is invalid");
+    }
+    text(data.sourceSessionId, "persisted continuation sourceSessionId", 128);
+    if (!PI_ENTRY.test(data.sourceCheckpointId)) {
+      throw new Error("persisted continuation sourceCheckpointId is invalid");
+    }
+    validateLineage(data.lineage);
+    validatePersistedSourceBinding(data.lineage, {
+      runtime: data.sourceRuntime,
+      sessionId: data.sourceSessionId,
+      checkpointId: data.sourceCheckpointId,
+    });
+    return data.lineage;
+  }
+  exactKeys(
+    data,
+    [
+      "capsuleDigest",
+      "parentSessionId",
+      "parentLeafId",
+      "parentCapsuleDigest",
+      "lineage",
+    ],
+    "persisted continuation lineage v1",
+  );
+  validateImportedMarkerDigest(data, "parentCapsuleDigest");
+  text(data.parentSessionId, "persisted continuation parentSessionId", 128);
+  if (!PI_ENTRY.test(data.parentLeafId)) {
+    throw new Error("persisted continuation parentLeafId is invalid");
+  }
+  data.lineage.forEach(validateLegacyLineageEntry);
+  const lineage = data.lineage.map((item) => ({
+    runtime: "pi",
+    sessionId: item.sessionId,
+    checkpointId: item.leafId,
+    location: item.location,
+  }));
+  validatePersistedSourceBinding(lineage, {
+    runtime: "pi",
+    sessionId: data.parentSessionId,
+    checkpointId: data.parentLeafId,
+  });
+  return lineage;
+}
+
+function validatedPiBinding(capsule, label = "capsule") {
+  const continuation = validatedContinuation(capsule);
+  const adapter = continuation.adapter;
+  if (adapter?.runtime !== "pi") {
+    throw new Error(`${label} has no compatible Pi adapter payload`);
+  }
+  if (adapter.schemaVersion !== 1) {
+    throw new Error(`${label} has no compatible Pi adapter payload`);
+  }
+  exactKeys(
+    adapter.payload,
+    ["sourceSessionId", "sourceLeafId"],
+    `${label}.continuation.adapter.payload`,
+  );
+  const binding = {
+    runtime: "pi",
+    sessionId: text(
+      adapter.payload.sourceSessionId,
+      `${label}.continuation.adapter.payload.sourceSessionId`,
+      128,
+    ),
+    checkpointId: adapter.payload.sourceLeafId,
+  };
+  if (!PI_ENTRY.test(binding.checkpointId)) {
+    throw new Error(
+      `${label}.continuation.adapter.payload.sourceLeafId is invalid`,
+    );
+  }
+  const head = continuation.lineage.at(-1);
+  const lineageBinding = {
+    runtime: head.runtime,
+    sessionId: head.sessionId,
+    checkpointId: head.checkpointId,
+  };
+  if (!sameCanonicalContract(binding, lineageBinding)) {
+    throw new Error("Pi adapter does not match the continuation lineage head");
+  }
+  return binding;
+}
+
+function validateLegacyLineageEntry(entry, index) {
+  const label = `pi.lineage[${index}]`;
+  exactKeys(entry, ["sessionId", "leafId", "location"], label);
+  text(entry.sessionId, `${label}.sessionId`, 128);
+  if (!PI_ENTRY.test(entry.leafId)) {
+    throw new Error(`${label}.leafId is invalid`);
+  }
+  if (!LOCATIONS.has(entry.location)) {
+    throw new Error(`${label}.location is invalid`);
+  }
+}
+
+function validateLegacyPi(pi) {
+  exactKeys(
+    pi,
+    ["sourceSessionId", "sourceLeafId", "lineage", "parentCapsuleDigest"],
+    "pi",
+  );
+  text(pi.sourceSessionId, "pi.sourceSessionId", 128);
+  if (!PI_ENTRY.test(pi.sourceLeafId)) {
+    throw new Error("pi.sourceLeafId is invalid");
+  }
+  if (!Array.isArray(pi.lineage)) {
+    throw new Error("pi.lineage must be an array");
+  }
+  pi.lineage.forEach(validateLegacyLineageEntry);
 }
 
 function validateContext(context) {
@@ -231,6 +486,10 @@ export function validateCapsule(
   capsule,
   { now = Date.now(), allowExpired = false } = {},
 ) {
+  if (!SUPPORTED_CAPSULE_SCHEMAS.has(capsule?.schemaVersion)) {
+    throw new Error("unsupported capsule schemaVersion");
+  }
+  const legacyPi = capsule.schemaVersion === 1;
   exactKeys(
     capsule,
     [
@@ -241,13 +500,11 @@ export function validateCapsule(
       "task",
       "git",
       "ownership",
-      "pi",
+      legacyPi ? "pi" : "continuation",
       "context",
     ],
     "capsule",
   );
-  if (capsule.schemaVersion !== CAPSULE_SCHEMA_VERSION)
-    throw new Error("unsupported capsule schemaVersion");
   if (!UUID.test(capsule.capsuleId)) throw new Error("capsuleId is invalid");
   const created = iso(capsule.createdAt, "createdAt");
   const expires = iso(capsule.expiresAt, "expiresAt");
@@ -308,28 +565,40 @@ export function validateCapsule(
     throw new Error("ownership source and target must differ");
   }
 
-  exactKeys(
-    capsule.pi,
-    ["sourceSessionId", "sourceLeafId", "lineage", "parentCapsuleDigest"],
-    "pi",
-  );
-  text(capsule.pi.sourceSessionId, "pi.sourceSessionId", 128);
-  if (!PI_ENTRY.test(capsule.pi.sourceLeafId))
-    throw new Error("pi.sourceLeafId is invalid");
-  validateLineage(capsule.pi.lineage);
-  if (
-    capsule.pi.parentCapsuleDigest !== null &&
-    !HEX64.test(capsule.pi.parentCapsuleDigest)
-  ) {
-    throw new Error("pi.parentCapsuleDigest is invalid");
+  const continuation = validatedContinuation(capsule);
+  if (!legacyPi) {
+    exactKeys(
+      continuation,
+      ["mode", "lineage", "parentDigest", "adapter"],
+      "continuation",
+    );
   }
-  const last = capsule.pi.lineage.at(-1);
-  if (
-    last.sessionId !== capsule.pi.sourceSessionId ||
-    last.leafId !== capsule.pi.sourceLeafId ||
-    last.location !== capsule.ownership.sourceLocation
-  ) {
-    throw new Error("pi lineage does not terminate at the source session leaf");
+  if (!CONTINUATION_MODES.has(continuation.mode))
+    throw new Error("continuation.mode is invalid");
+  validateLineage(continuation.lineage);
+  if (invalidOptionalDigest(continuation.parentDigest)) {
+    throw new Error("continuation.parentDigest is invalid");
+  }
+  const adapter = validateAdapter(continuation.adapter);
+  if (exactAdapterMissing(continuation.mode, adapter)) {
+    throw new Error("exact continuation requires an adapter payload");
+  }
+  if (exactAdapterUnsupported(continuation.mode, adapter)) {
+    throw new Error("continuation adapter does not support exact restore");
+  }
+  const last = continuation.lineage.at(-1);
+  if (last.location !== capsule.ownership.sourceLocation) {
+    throw new Error(
+      "continuation lineage does not terminate at the source location",
+    );
+  }
+  if (adapter !== null) {
+    if (adapter.runtime !== last.runtime) {
+      throw new Error(
+        "continuation adapter runtime does not match lineage head",
+      );
+    }
+    if (adapter.runtime === "pi") validatedPiBinding(capsule);
   }
 
   validateContext(capsule.context);
@@ -414,27 +683,24 @@ export function createCapsule(draft, sessionManager, options = {}) {
   const leafId = sessionManager.getLeafId();
   if (!leafId) throw new Error("source Pi session has no active leaf");
   const sessionId = sessionManager.getSessionId();
-  if (
-    draft?.pi?.sourceSessionId !== sessionId ||
-    draft?.pi?.sourceLeafId !== leafId
-  ) {
+  const draftBinding = validatedPiBinding(draft, "draft");
+  const activeBinding = {
+    runtime: "pi",
+    sessionId,
+    checkpointId: leafId,
+  };
+  if (!sameCanonicalContract(draftBinding, activeBinding)) {
     throw new Error("draft lineage is stale for the active Pi leaf");
   }
   const branch = sessionManager.getBranch();
-  const imported = branch
-    .filter(
-      (entry) =>
-        entry.type === "custom" &&
-        entry.customType === "buzz.continuation.lineage.v1",
-    )
-    .at(-1);
-  const inheritedLineage = imported?.data?.lineage ?? [];
-  if (inheritedLineage.length > 0) validateLineage(inheritedLineage);
+  const imported = continuationLineageEntries(branch).at(-1);
+  const inheritedLineage = validatedImportedLineage(imported);
   const derivedLineage = [
     ...inheritedLineage,
     {
+      runtime: "pi",
       sessionId,
-      leafId,
+      checkpointId: leafId,
       location: draft.ownership.sourceLocation,
     },
   ];
@@ -446,23 +712,30 @@ export function createCapsule(draft, sessionManager, options = {}) {
     );
   }
   const derivedParent = importedDigest;
-  if (
-    canonicalJson(draft.pi.lineage) !== canonicalJson(derivedLineage) ||
-    draft.pi.parentCapsuleDigest !== derivedParent
-  ) {
+  const draftLineageContract = {
+    lineage: validatedContinuation(draft).lineage,
+    parentDigest: continuationParentDigest(draft),
+  };
+  const persistedLineageContract = {
+    lineage: derivedLineage,
+    parentDigest: derivedParent,
+  };
+  if (!sameCanonicalContract(draftLineageContract, persistedLineageContract)) {
     throw new Error(
       "draft lineage does not match the persisted Pi lineage head",
     );
   }
-  const capsule = structuredClone(draft);
+  const capsule = portableCapsule(draft);
   // Raw transcript text is never portable: deterministic secret detection
   // cannot prove arbitrary conversation text credential-free. Continuation
   // uses only the explicit, bounded summary fields validated below.
   capsule.context.recentTail = [];
-  capsule.pi.sourceSessionId = sessionId;
-  capsule.pi.sourceLeafId = leafId;
-  capsule.pi.lineage = derivedLineage;
-  capsule.pi.parentCapsuleDigest = derivedParent;
+  capsule.continuation.lineage = derivedLineage;
+  capsule.continuation.parentDigest = derivedParent;
+  capsule.continuation.adapter.payload = {
+    sourceSessionId: sessionId,
+    sourceLeafId: leafId,
+  };
   validateCapsule(capsule, options);
   return { capsule, digest: capsuleDigest(capsule) };
 }
@@ -543,7 +816,7 @@ function assertCapsuleParent(sessionDir, capsule, digest) {
       "capsule is already the lineage head without an import receipt",
     );
   }
-  if ((head?.digest ?? null) !== capsule.pi.parentCapsuleDigest) {
+  if ((head?.digest ?? null) !== continuationParentDigest(capsule)) {
     throw new Error("capsule parent is not the current task lineage head");
   }
   return head;
@@ -608,7 +881,7 @@ export function recordCapsuleHead(
   try {
     const head = readCapsuleHead(sessionDir);
     if (head?.digest === digest) return head;
-    if ((head?.digest ?? null) !== capsule.pi.parentCapsuleDigest) {
+    if ((head?.digest ?? null) !== continuationParentDigest(capsule)) {
       throw new Error("capsule parent is not the current task lineage head");
     }
     const next = {
@@ -714,18 +987,39 @@ function exportCapsuleUnlocked(draft, sessionManager, options = {}) {
     if (receiptNow > Date.parse(envelope.capsule.expiresAt)) {
       throw new Error("capsule export receipt expired; use reissue");
     }
-    const exportIntent = (capsule) => ({
-      ...capsule,
-      context: { ...capsule.context, recentTail: [] },
-    });
-    if (
-      canonicalJson(exportIntent(draft)) !==
-        canonicalJson(exportIntent(envelope.capsule)) ||
-      envelope.capsule.pi.sourceSessionId !== sessionManager.getSessionId() ||
-      envelope.capsule.pi.sourceLeafId !== sessionManager.getLeafId() ||
-      draft.pi.sourceSessionId !== envelope.capsule.pi.sourceSessionId ||
-      draft.pi.sourceLeafId !== envelope.capsule.pi.sourceLeafId
-    ) {
+    const storedBinding = validatedPiBinding(
+      envelope.capsule,
+      "stored capsule",
+    );
+    const draftBinding = validatedPiBinding(draft, "draft");
+    const activeBinding = {
+      runtime: "pi",
+      sessionId: sessionManager.getSessionId(),
+      checkpointId: sessionManager.getLeafId(),
+    };
+    const storedLeafIsActive = sameCanonicalContract(
+      storedBinding,
+      activeBinding,
+    );
+    const draftSelectsStoredLeaf = sameCanonicalContract(
+      draftBinding,
+      storedBinding,
+    );
+    const exportIntentMatches = sameCanonicalContract(
+      normalizedExportIntent(draft),
+      normalizedExportIntent(envelope.capsule),
+    );
+    if (!exportIntentMatches) {
+      throw new Error(
+        "capsule export receipt does not match the selected Pi leaf",
+      );
+    }
+    if (!storedLeafIsActive) {
+      throw new Error(
+        "capsule export receipt does not match the selected Pi leaf",
+      );
+    }
+    if (!draftSelectsStoredLeaf) {
       throw new Error(
         "capsule export receipt does not match the selected Pi leaf",
       );
@@ -774,16 +1068,19 @@ export function reissueCapsule(
     }
     const sessionDir = sessionManager.getSessionDir();
     assertBoundTaskSessionDirectory(sessionDir, previous.task);
-    if (
-      sessionManager.getSessionId() !== previous.pi.sourceSessionId ||
-      sessionManager.getLeafId() !== previous.pi.sourceLeafId
-    ) {
+    const previousBinding = validatedPiBinding(previous, "expired capsule");
+    const activeBinding = {
+      runtime: "pi",
+      sessionId: sessionManager.getSessionId(),
+      checkpointId: sessionManager.getLeafId(),
+    };
+    if (!sameCanonicalContract(activeBinding, previousBinding)) {
       throw new Error("capsule reissue source Pi leaf has advanced");
     }
     if (readCapsuleHead(sessionDir)?.digest !== expiredEnvelope.digest) {
       throw new Error("expired capsule is not the current task lineage head");
     }
-    const capsule = structuredClone(previous);
+    const capsule = portableCapsule(previous);
     capsule.capsuleId = replacement.capsuleId;
     capsule.createdAt = replacement.createdAt;
     capsule.expiresAt = replacement.expiresAt;
@@ -829,7 +1126,7 @@ export function reissueCapsule(
 function reconcileCompletedHead(sessionDir, capsule, digest) {
   const head = readCapsuleHead(sessionDir);
   if (head?.digest === digest) return;
-  if ((head?.digest ?? null) === capsule.pi.parentCapsuleDigest) {
+  if ((head?.digest ?? null) === continuationParentDigest(capsule)) {
     recordCapsuleHead(sessionDir, capsule, digest);
   }
   // A later descendant may already be authoritative. Never roll it back while
@@ -872,7 +1169,7 @@ function validatedImportTask(expected, capsule, digest) {
     capsuleDigest: digest,
     ...capsule.task,
   };
-  if (canonicalJson(expectedBinding) !== canonicalJson(capsuleBinding)) {
+  if (!sameCanonicalContract(expectedBinding, capsuleBinding)) {
     throw new Error(
       "capsule ownership generation, location, or task binding is stale",
     );
@@ -880,16 +1177,36 @@ function validatedImportTask(expected, capsule, digest) {
   return { ...capsule.task, agentPubkey: targetAgentPubkey };
 }
 
-function importCapsuleUnlocked(
+function invalidImportPaths(cwd, sessionDir) {
+  return !path.isAbsolute(cwd) || !path.isAbsolute(sessionDir);
+}
+
+function validatedImportPreflight(
   envelope,
   { cwd, sessionDir, expected, now = Date.now() },
 ) {
   validateEnvelope(envelope, { now, allowExpired: true });
   const capsule = envelope.capsule;
   const importTask = validatedImportTask(expected, capsule, envelope.digest);
-  if (!path.isAbsolute(cwd) || !path.isAbsolute(sessionDir))
+  if (invalidImportPaths(cwd, sessionDir)) {
     throw new Error("import paths must be absolute");
+  }
   assertBoundTaskSessionDirectory(sessionDir, importTask);
+  const sourceBinding = validatedPiBinding(capsule, "import capsule");
+  const complete = path.join(
+    sessionDir,
+    ".capsule-imports",
+    `${envelope.digest}.json`,
+  );
+  if (!fs.existsSync(complete)) {
+    validateEnvelope(envelope, { now });
+    verifyGitBinding(capsule.git, cwd);
+  }
+  return { sourceBinding };
+}
+
+function importCapsuleUnlocked(envelope, { cwd, sessionDir, sourceBinding }) {
+  const capsule = envelope.capsule;
   fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(sessionDir, 0o700);
   const imports = path.join(sessionDir, ".capsule-imports");
@@ -907,7 +1224,7 @@ function importCapsuleUnlocked(
       recoverCompletedLineageLock(sessionDir, envelope.digest);
       return result;
     }
-    if (head !== null && head.digest !== capsule.pi.parentCapsuleDigest) {
+    if (head !== null && head.digest !== continuationParentDigest(capsule)) {
       // A later descendant is already authoritative; an old completed receipt
       // remains idempotently queryable without rolling the head back.
       return result;
@@ -923,8 +1240,6 @@ function importCapsuleUnlocked(
     }
     return result;
   }
-  validateEnvelope(envelope, { now });
-  verifyGitBinding(capsule.git, cwd);
   // The capsule is at most 64 KiB. Four capsule lengths conservatively cover
   // both imported JSONL entries, the completion receipt, lineage head, and
   // their temporary atomic-write copies before any child-session effect.
@@ -948,15 +1263,17 @@ function importCapsuleUnlocked(
     const childFd = fs.openSync(childFile, "wx", 0o600);
     fs.closeSync(childFd);
     const manager = SessionManager.open(childFile, sessionDir, cwd);
-    manager.appendCustomEntry("buzz.continuation.lineage.v1", {
+    const continuation = validatedContinuation(envelope.capsule);
+    manager.appendCustomEntry("buzz.continuation.lineage.v2", {
       capsuleDigest: envelope.digest,
-      parentSessionId: envelope.capsule.pi.sourceSessionId,
-      parentLeafId: envelope.capsule.pi.sourceLeafId,
-      parentCapsuleDigest: envelope.capsule.pi.parentCapsuleDigest,
-      lineage: envelope.capsule.pi.lineage,
+      sourceRuntime: sourceBinding.runtime,
+      sourceSessionId: sourceBinding.sessionId,
+      sourceCheckpointId: sourceBinding.checkpointId,
+      parentDigest: continuation.parentDigest,
+      lineage: continuation.lineage,
     });
     manager.appendCustomMessageEntry(
-      "buzz.continuation.context.v1",
+      "buzz.continuation.context.v2",
       renderContinuationContext(envelope.capsule, envelope.digest),
       false,
       { capsuleDigest: envelope.digest },
@@ -979,11 +1296,12 @@ function importCapsuleUnlocked(
 }
 
 export function importCapsule(envelope, options) {
+  const preflight = validatedImportPreflight(envelope, options);
   fs.mkdirSync(options.sessionDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(options.sessionDir, 0o700);
   const release = acquireTaskLease(options.sessionDir, "capsule-import");
   try {
-    return importCapsuleUnlocked(envelope, options);
+    return importCapsuleUnlocked(envelope, { ...options, ...preflight });
   } finally {
     release();
   }

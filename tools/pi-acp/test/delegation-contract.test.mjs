@@ -55,7 +55,7 @@ function tempDir(label) {
 
 function capsuleEnvelope() {
   const capsule = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     capsuleId: "22222222-2222-4222-8222-222222222222",
     createdAt: CREATED,
     expiresAt: EXPIRES,
@@ -78,17 +78,25 @@ function capsuleEnvelope() {
       sourceLocation: "local",
       targetLocation: "cloud",
     },
-    pi: {
-      sourceSessionId: "session-source",
-      sourceLeafId: "a1b2c3d4",
+    continuation: {
+      mode: "semantic",
       lineage: [
         {
+          runtime: "pi",
           sessionId: "session-source",
-          leafId: "a1b2c3d4",
+          checkpointId: "a1b2c3d4",
           location: "local",
         },
       ],
-      parentCapsuleDigest: null,
+      parentDigest: null,
+      adapter: {
+        runtime: "pi",
+        schemaVersion: 1,
+        payload: {
+          sourceSessionId: "session-source",
+          sourceLeafId: "a1b2c3d4",
+        },
+      },
     },
     context: {
       goal: "Continue one bounded task",

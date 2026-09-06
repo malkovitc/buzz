@@ -32,6 +32,30 @@ function nowOrZero() {
   return Date.now();
 }
 
+function asLegacyCapsule(capsule) {
+  const legacy = structuredClone(capsule);
+  const continuation = legacy.continuation;
+  const payload = continuation.adapter.payload;
+  legacy.schemaVersion = 1;
+  legacy.pi = {
+    sourceSessionId: payload.sourceSessionId,
+    sourceLeafId: payload.sourceLeafId,
+    lineage: continuation.lineage.map((entry) => ({
+      sessionId: entry.sessionId,
+      leafId: entry.checkpointId,
+      location: entry.location,
+    })),
+    parentCapsuleDigest: continuation.parentDigest,
+  };
+  delete legacy.continuation;
+  return legacy;
+}
+
+function asLegacyEnvelope(envelope) {
+  const capsule = asLegacyCapsule(envelope.capsule);
+  return { capsule, digest: capsuleDigest(capsule) };
+}
+
 function expectedFor(draft, capsuleDigest) {
   return {
     generation: draft.ownership.generation,
@@ -114,7 +138,7 @@ function fixture() {
   });
   const now = Date.now();
   const draft = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     capsuleId: "11111111-1111-4111-8111-111111111111",
     createdAt: new Date(now).toISOString(),
     expiresAt: new Date(now + 60 * 60 * 1000).toISOString(),
@@ -132,17 +156,25 @@ function fixture() {
       sourceLocation: "local",
       targetLocation: "cloud",
     },
-    pi: {
-      sourceSessionId: source.getSessionId(),
-      sourceLeafId: source.getLeafId(),
+    continuation: {
+      mode: "semantic",
       lineage: [
         {
+          runtime: "pi",
           sessionId: source.getSessionId(),
-          leafId: source.getLeafId(),
+          checkpointId: source.getLeafId(),
           location: "local",
         },
       ],
-      parentCapsuleDigest: null,
+      parentDigest: null,
+      adapter: {
+        runtime: "pi",
+        schemaVersion: 1,
+        payload: {
+          sourceSessionId: source.getSessionId(),
+          sourceLeafId: source.getLeafId(),
+        },
+      },
     },
     context: {
       goal: "Continue the reviewed implementation.",
@@ -186,7 +218,7 @@ test("creates a canonical, bounded capsule bound to the active Pi leaf", () => {
   assert.equal(envelope.digest, capsuleDigest(envelope.capsule));
   assert.equal(validateEnvelope(envelope, { now }), envelope);
   const rendered = renderContinuationContext(envelope.capsule, envelope.digest);
-  assert.match(rendered, /^\[BUZZ CONTINUATION CAPSULE v1\]/);
+  assert.match(rendered, /^\[BUZZ CONTINUATION CAPSULE v2\]/);
   assert.match(rendered, /Continue the reviewed implementation/);
   assert.doesNotMatch(rendered, /safe source context/);
   assert.doesNotMatch(rendered, /private internal reasoning/);
@@ -195,9 +227,285 @@ test("creates a canonical, bounded capsule bound to the active Pi leaf", () => {
     eventIds: ["a".repeat(64)],
   });
   const deliveredDraft = structuredClone(draft);
-  deliveredDraft.pi.sourceLeafId = deliveryLeaf;
-  deliveredDraft.pi.lineage[0].leafId = deliveryLeaf;
+  deliveredDraft.continuation.adapter.payload.sourceLeafId = deliveryLeaf;
+  deliveredDraft.continuation.lineage[0].checkpointId = deliveryLeaf;
   assert.doesNotThrow(() => createCapsule(deliveredDraft, source, { now }));
+});
+
+test("semantic envelope is runtime-neutral and Pi import requires its optional adapter", () => {
+  const { base, repo, source, draft, now } = fixture();
+  const envelope = createCapsule(draft, source, { now });
+  const portable = structuredClone(envelope);
+  portable.capsule.continuation.adapter = null;
+  portable.digest = capsuleDigest(portable.capsule);
+  assert.equal(validateEnvelope(portable, { now }), portable);
+  assert.match(
+    renderContinuationContext(portable.capsule, portable.digest),
+    /semantic continuation context/,
+  );
+  const incompatibleTarget = sessionDirectory(
+    base,
+    draft.task,
+    "portable-target",
+  );
+  assert.throws(
+    () =>
+      importCapsule(portable, {
+        cwd: repo,
+        sessionDir: incompatibleTarget,
+        expected: expectedFor(draft, portable.digest),
+        now,
+      }),
+    /no compatible Pi adapter payload/,
+  );
+  assert.deepEqual(fs.readdirSync(incompatibleTarget), []);
+
+  const falseExact = structuredClone(portable);
+  falseExact.capsule.continuation.mode = "exact";
+  falseExact.digest = capsuleDigest(falseExact.capsule);
+  assert.throws(
+    () => validateEnvelope(falseExact, { now }),
+    /exact continuation requires an adapter payload/,
+  );
+
+  const unsupportedExact = structuredClone(envelope);
+  unsupportedExact.capsule.continuation.mode = "exact";
+  unsupportedExact.digest = capsuleDigest(unsupportedExact.capsule);
+  assert.throws(
+    () => validateEnvelope(unsupportedExact, { now }),
+    /adapter does not support exact restore/,
+  );
+
+  const mismatchedRuntime = structuredClone(envelope);
+  mismatchedRuntime.capsule.continuation.lineage[0].runtime = "codex";
+  mismatchedRuntime.digest = capsuleDigest(mismatchedRuntime.capsule);
+  assert.throws(
+    () => validateEnvelope(mismatchedRuntime, { now }),
+    /adapter runtime does not match lineage head/,
+  );
+
+  const unsupportedAdapter = structuredClone(envelope);
+  unsupportedAdapter.capsule.continuation.adapter.runtime = "codex";
+  unsupportedAdapter.capsule.continuation.lineage[0].runtime = "codex";
+  unsupportedAdapter.digest = capsuleDigest(unsupportedAdapter.capsule);
+  assert.throws(
+    () => validateEnvelope(unsupportedAdapter, { now }),
+    /continuation adapter is unsupported/,
+  );
+
+  const secretPayload = structuredClone(envelope);
+  secretPayload.capsule.continuation.adapter.payload = { token: "hunter2" };
+  secretPayload.digest = capsuleDigest(secretPayload.capsule);
+  assert.throws(
+    () => validateEnvelope(secretPayload, { now }),
+    /token is forbidden/,
+  );
+});
+
+test("legacy Pi envelope remains valid and imports into v2 lineage metadata", () => {
+  const { base, repo, source, draft, now } = fixture();
+  const legacy = asLegacyEnvelope(createCapsule(draft, source, { now }));
+  assert.equal(validateEnvelope(legacy, { now }), legacy);
+  assert.match(
+    renderContinuationContext(legacy.capsule, legacy.digest),
+    /semantic continuation context/,
+  );
+  const invalidLegacy = structuredClone(legacy);
+  invalidLegacy.capsule.pi.unexpected = true;
+  invalidLegacy.digest = capsuleDigest(invalidLegacy.capsule);
+  assert.throws(
+    () => validateEnvelope(invalidLegacy, { now }),
+    /unknown or missing fields/,
+  );
+  const targetPath = path.join(base, "legacy-target-repo");
+  fs.cpSync(repo, targetPath, { recursive: true });
+  const target = fs.realpathSync(targetPath);
+  const imported = importCapsule(legacy, {
+    cwd: target,
+    sessionDir: sessionDirectory(base, draft.task, "legacy-target"),
+    expected: expectedFor(draft, legacy.digest),
+    now,
+  });
+  const child = SessionManager.open(imported.sessionFile);
+  const lineage = child
+    .getEntries()
+    .find(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === "buzz.continuation.lineage.v2",
+    );
+  assert.equal(lineage.data.capsuleDigest, legacy.digest);
+  assert.equal(lineage.data.sourceSessionId, source.getSessionId());
+
+  child.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "continued" }],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: now,
+  });
+  const descendantDraft = structuredClone(draft);
+  descendantDraft.capsuleId = "99999999-9999-4999-8999-999999999999";
+  descendantDraft.git.repository = target;
+  descendantDraft.ownership.sourceLocation = "cloud";
+  descendantDraft.ownership.targetLocation = "local";
+  descendantDraft.continuation.lineage = [
+    ...lineage.data.lineage,
+    {
+      runtime: "pi",
+      sessionId: child.getSessionId(),
+      checkpointId: child.getLeafId(),
+      location: "cloud",
+    },
+  ];
+  descendantDraft.continuation.parentDigest = legacy.digest;
+  descendantDraft.continuation.adapter.payload = {
+    sourceSessionId: child.getSessionId(),
+    sourceLeafId: child.getLeafId(),
+  };
+  const descendant = createCapsule(descendantDraft, child, { now });
+  assert.equal(descendant.capsule.schemaVersion, 2);
+  assert.equal(descendant.capsule.continuation.parentDigest, legacy.digest);
+});
+
+test("schema-v1 draft export migrates to v2 and retries idempotently", () => {
+  const { source, draft, now } = fixture();
+  const legacyDraft = asLegacyCapsule(draft);
+  const first = exportCapsule(legacyDraft, source, { now });
+  const retry = exportCapsule(legacyDraft, source, { now });
+  assert.equal(first.capsule.schemaVersion, 2);
+  assert.deepEqual(retry, first);
+});
+
+test("v2 export continues a session anchored by legacy v1 lineage", () => {
+  const { source, draft, now } = fixture();
+  const parentDigest = "b".repeat(64);
+  const inheritedLineage = [
+    {
+      sessionId: "legacy-source",
+      leafId: "deadbeef",
+      location: "cloud",
+    },
+  ];
+  const legacyMarker = {
+    capsuleDigest: parentDigest,
+    parentSessionId: "legacy-source",
+    parentLeafId: "deadbeef",
+    parentCapsuleDigest: null,
+    lineage: inheritedLineage,
+  };
+  source.appendCustomEntry("buzz.continuation.lineage.v1", legacyMarker);
+  source.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "continued locally" }],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: now,
+  });
+  fs.writeFileSync(
+    path.join(source.getSessionDir(), ".capsule-lineage-head.json"),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      generation: draft.ownership.generation,
+      digest: parentDigest,
+    })}\n`,
+  );
+  draft.continuation.lineage = [
+    {
+      runtime: "pi",
+      sessionId: "legacy-source",
+      checkpointId: "deadbeef",
+      location: "cloud",
+    },
+    {
+      runtime: "pi",
+      sessionId: source.getSessionId(),
+      checkpointId: source.getLeafId(),
+      location: "local",
+    },
+  ];
+  draft.continuation.parentDigest = parentDigest;
+  draft.continuation.adapter.payload = {
+    sourceSessionId: source.getSessionId(),
+    sourceLeafId: source.getLeafId(),
+  };
+  const descendant = createCapsule(draft, source, { now });
+  assert.equal(descendant.capsule.schemaVersion, 2);
+  assert.equal(descendant.capsule.continuation.parentDigest, parentDigest);
+
+  source.appendCustomEntry("buzz.continuation.lineage.v1", {
+    ...legacyMarker,
+    unexpected: true,
+  });
+  source.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "continued again" }],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: now,
+  });
+  draft.continuation.lineage.at(-1).checkpointId = source.getLeafId();
+  draft.continuation.adapter.payload.sourceLeafId = source.getLeafId();
+  assert.throws(
+    () => createCapsule(draft, source, { now }),
+    /unknown or missing fields/,
+  );
+
+  source.appendCustomEntry("buzz.continuation.lineage.v3", legacyMarker);
+  source.appendCustomEntry("buzz.continuation.lineage.v1", legacyMarker);
+  source.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "continued once more" }],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: now,
+  });
+  draft.continuation.lineage.at(-1).checkpointId = source.getLeafId();
+  draft.continuation.adapter.payload.sourceLeafId = source.getLeafId();
+  assert.throws(
+    () => createCapsule(draft, source, { now }),
+    /lineage version is unsupported/,
+  );
 });
 
 test("export receipt recovers the same capsule after output loss", () => {
@@ -268,8 +576,8 @@ test("export receipt recovers the same capsule after output loss", () => {
     { now: reissueNow },
   );
   assert.equal(
-    reissued.capsule.pi.parentCapsuleDigest,
-    first.capsule.pi.parentCapsuleDigest,
+    reissued.capsule.continuation.parentDigest,
+    first.capsule.continuation.parentDigest,
   );
   assert.equal(
     JSON.parse(
@@ -356,12 +664,14 @@ test("raw transcript text is omitted from the portable capsule", () => {
     });
   }
   const verboseDraft = structuredClone(draft);
-  verboseDraft.pi.sourceSessionId = verbose.getSessionId();
-  verboseDraft.pi.sourceLeafId = verbose.getLeafId();
-  verboseDraft.pi.lineage = [
+  verboseDraft.continuation.adapter.payload.sourceSessionId =
+    verbose.getSessionId();
+  verboseDraft.continuation.adapter.payload.sourceLeafId = verbose.getLeafId();
+  verboseDraft.continuation.lineage = [
     {
+      runtime: "pi",
       sessionId: verbose.getSessionId(),
-      leafId: verbose.getLeafId(),
+      checkpointId: verbose.getLeafId(),
       location: "local",
     },
   ];
@@ -411,12 +721,15 @@ test("successful terminal Buzz publication is an exportable idle boundary", () =
     timestamp: now,
   });
   const publicationDraft = structuredClone(draft);
-  publicationDraft.pi.sourceSessionId = published.getSessionId();
-  publicationDraft.pi.sourceLeafId = published.getLeafId();
-  publicationDraft.pi.lineage = [
+  publicationDraft.continuation.adapter.payload.sourceSessionId =
+    published.getSessionId();
+  publicationDraft.continuation.adapter.payload.sourceLeafId =
+    published.getLeafId();
+  publicationDraft.continuation.lineage = [
     {
+      runtime: "pi",
       sessionId: published.getSessionId(),
-      leafId: published.getLeafId(),
+      checkpointId: published.getLeafId(),
       location: "local",
     },
   ];
@@ -479,12 +792,15 @@ test("successful terminal Buzz publication is an exportable idle boundary", () =
     timestamp: now,
   });
   const ambiguousDraft = structuredClone(draft);
-  ambiguousDraft.pi.sourceSessionId = ambiguous.getSessionId();
-  ambiguousDraft.pi.sourceLeafId = ambiguous.getLeafId();
-  ambiguousDraft.pi.lineage = [
+  ambiguousDraft.continuation.adapter.payload.sourceSessionId =
+    ambiguous.getSessionId();
+  ambiguousDraft.continuation.adapter.payload.sourceLeafId =
+    ambiguous.getLeafId();
+  ambiguousDraft.continuation.lineage = [
     {
+      runtime: "pi",
       sessionId: ambiguous.getSessionId(),
-      leafId: ambiguous.getLeafId(),
+      checkpointId: ambiguous.getLeafId(),
       location: "local",
     },
   ];
@@ -593,9 +909,9 @@ test("imports one fresh child session and is idempotent by capsule digest", () =
     .find(
       (entry) =>
         entry.type === "custom" &&
-        entry.customType === "buzz.continuation.lineage.v1",
+        entry.customType === "buzz.continuation.lineage.v2",
     );
-  assert.equal(lineage.data.parentSessionId, source.getSessionId());
+  assert.equal(lineage.data.sourceSessionId, source.getSessionId());
   assert.ok(child.getEntry(first.leafId));
   assert.notEqual(child.getLeafId(), first.leafId);
   assert.equal(
@@ -679,8 +995,8 @@ test("never exports credential-like text from the visible transcript", () => {
     stopReason: "stop",
     timestamp: now,
   });
-  draft.pi.sourceLeafId = source.getLeafId();
-  draft.pi.lineage[0].leafId = source.getLeafId();
+  draft.continuation.adapter.payload.sourceLeafId = source.getLeafId();
+  draft.continuation.lineage[0].checkpointId = source.getLeafId();
   const envelope = createCapsule(draft, source, { now });
   assert.deepEqual(envelope.capsule.context.recentTail, []);
   assert.equal(JSON.stringify(envelope).includes("hunter2"), false);
@@ -767,9 +1083,10 @@ test("rejects tampering, secrets, stale generation/leaf, effects, and expiry", (
   );
 
   const invented = structuredClone(draft);
-  invented.pi.lineage.unshift({
+  invented.continuation.lineage.unshift({
+    runtime: "pi",
     sessionId: "invented-session",
-    leafId: "deadbeef",
+    checkpointId: "deadbeef",
     location: "cloud",
   });
   assert.throws(
@@ -778,18 +1095,19 @@ test("rejects tampering, secrets, stale generation/leaf, effects, and expiry", (
   );
 
   const stale = structuredClone(draft);
-  stale.pi.sourceLeafId = "deadbeef";
-  stale.pi.lineage[0].leafId = "deadbeef";
+  stale.continuation.adapter.payload.sourceLeafId = "deadbeef";
+  stale.continuation.lineage[0].checkpointId = "deadbeef";
   assert.throws(
     () => createCapsule(stale, source, { now }),
     /lineage is stale/,
   );
 
+  const staleTarget = sessionDirectory(base, draft.task, "stale-target");
   assert.throws(
     () =>
       importCapsule(envelope, {
         cwd: repo,
-        sessionDir: sessionDirectory(base, draft.task, "stale-target"),
+        sessionDir: staleTarget,
         expected: {
           ...expectedFor(draft, envelope.digest),
           generation: "33333333-3333-4333-8333-333333333333",
@@ -798,6 +1116,7 @@ test("rejects tampering, secrets, stale generation/leaf, effects, and expiry", (
       }),
     /binding is stale/,
   );
+  assert.deepEqual(fs.readdirSync(staleTarget), []);
 
   assert.throws(
     () => validateEnvelope(envelope, { now: now + 2 * 60 * 60 * 1000 }),
@@ -809,16 +1128,18 @@ test("import fails closed for dirty Git and an ambiguous prior import", () => {
   const { base, repo, source, draft, now } = fixture();
   const envelope = createCapsule(draft, source, { now });
   fs.writeFileSync(path.join(repo, "dirty.txt"), "dirty\n");
+  const dirtyTarget = sessionDirectory(base, draft.task, "dirty-target");
   assert.throws(
     () =>
       importCapsule(envelope, {
         cwd: repo,
-        sessionDir: sessionDirectory(base, draft.task, "dirty-target"),
+        sessionDir: dirtyTarget,
         expected: expectedFor(draft, envelope.digest),
         now,
       }),
     /worktree is dirty/,
   );
+  assert.deepEqual(fs.readdirSync(dirtyTarget), []);
   fs.unlinkSync(path.join(repo, "dirty.txt"));
 
   const sessionDir = sessionDirectory(base, draft.task, "locked-target");
