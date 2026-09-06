@@ -61,8 +61,8 @@ The audio endpoint is the existing authenticated WebSocket
 1. a valid NIP-42 challenge response signed by the connecting peer;
 2. protocol-version agreement with the room;
 3. an existing channel in the same tenant/community;
-4. channel membership, or an existing documented auto-add path for an eligible
-   human member; and
+4. channel membership, or the relay's existing documented auto-add path for a
+   parent-channel member of a private ephemeral channel; and
 5. a successful bounded room admission.
 
 A managed agent additionally supplies its owner authorization (`auth` tag). The
@@ -242,6 +242,8 @@ The named boundary contracts for implementation are:
   rate and one fixed maximum sample count;
 - `ProviderSessionState`: `preparing`, `ready`, `active`, `draining`, or `closed`,
   with one terminal reason and generation-fenced transitions;
+- `RealtimeAgentLease`: exclusive dialogue and audio-output ownership for one
+  Huddle lifetime and managed-agent pubkey;
 - `RedactedVoiceMetrics`: session correlation ID, stage timestamps, audio
   duration, drop/cancel counters, provider usage units, and terminal reason—no
   PCM, transcript, instructions, arguments, credentials, or signed events.
@@ -262,8 +264,12 @@ cancellation conventions. It accepts normalized provider PCM for publication
 and remains send-only in VOICE 2; it is not a provider interface.
 
 Provider input comes from a bounded tee after the existing local microphone's
-mute/PTT, device, Huddle-generation, and human-peer transmission gates, but
-before that same admitted PCM is encoded to Opus. The WebView-to-Tauri IPC
+mute/PTT, device, and human-peer transmission gates, but before that same
+admitted PCM is encoded to Opus. VOICE 2 adds exact capture/Huddle-generation
+and isolated-output-route gates at that boundary. It fails closed on a
+coupled/speaker route: echo cancellation is not an authority
+or consent boundary, and rendered remote/provider audio must not be recaptured
+for external processing. The WebView-to-Tauri IPC
 carries one `CapturedHuddlePcm` envelope rather than unversioned raw bytes. Its
 Huddle generation, capture generation, and capture-source identity are checked
 against the current capture lease before the single fan-out to both relay Opus
@@ -280,11 +286,13 @@ processing. The tee closes immediately on mute, device/capture loss, leave,
 stale capture generation, or grant loss and remains closed unless the complete
 grant is current.
 
-VOICE 2 does not decode or forward any audio received by the agent socket, so
-remote-human and bot streams have no path to the provider. Multi-participant
-consent, disclosure controls, and a safe remote-media attribution prerequisite
-remain VOICE 7 work. Removing the agent's `bot` membership or invalidating the
-local user's grant cancels the provider session and publisher.
+VOICE 2 does not decode or digitally forward any audio received by the agent
+socket. The isolated-route gate also prevents rendered remote-human, bot, and
+provider speech from re-entering the capture tee acoustically. Coupled routes,
+multi-participant consent, disclosure controls, and a safe remote-media
+attribution prerequisite remain VOICE 7 work. Removing the agent's `bot`
+membership or invalidating the local user's grant cancels the provider session
+and publisher.
 
 This gate is structural and identity-based. Voice activity, transcript text,
 keywords, or model judgment must not grant authorization or consent.
@@ -298,7 +306,7 @@ framework. Its provider-independent vocabulary is intentionally small:
 start(session configuration) -> session
 session.send_audio(PCM chunk)
 session.cancel_response()
-session.next_event() -> audio | transcript | speech-state | closed
+session.next_event() -> audio | speech-state | closed
 session.close()
 ```
 
@@ -322,20 +330,26 @@ non-secret dialogue instructions. It does not contain Nostr keys, relay auth,
 channel membership authority, or effect capabilities.
 
 VOICE 2 advertises no tools. Any unexpected provider tool event is rejected
-inside the adapter without propagating arguments or executing anything. VOICE 4
+inside the adapter without propagating arguments or executing anything. Provider
+transcript content is likewise consumed or discarded inside the adapter; it is
+not emitted through the provider-independent contract, persisted, published as
+a Buzz message, signed as the local user, logged, or used for effects. VOICE 4
 owns the later introduction of proposal/result contracts at the existing
 managed-agent effect boundary, where Buzz rechecks actor, channel, policy,
 arguments, and audit requirements before any effect.
 
-Realtime and local TTS also need one Buzz-owned output lease keyed by the same
-Huddle lifetime and agent pubkey. Lease acquisition is a generation-fenced
-quiescence handshake: it first cancels and drains active/queued local synthesis,
-invalidates pending local-publisher packets, confirms that generation can no
-longer send, and only then grants realtime ownership. While held, it prevents
-new `speak_agent_message` work and local TTS publication for that agent.
-Releasing it restores the existing local route without replaying stale queued
-speech. This is a mutual-exclusion rule, not a new audio framework, and it must
-be atomic with session ownership.
+Realtime and the existing local managed-agent responder need one Buzz-owned
+`RealtimeAgentLease` keyed by the same Huddle lifetime and agent pubkey. Lease
+acquisition is a generation-fenced quiescence handshake: it first prevents new
+local transcript delivery to that agent, cancels and drains active/queued local
+synthesis, invalidates pending local-publisher packets, confirms that generation
+can no longer produce a message, effect, or audio send, and only then grants
+realtime ownership. While held, the selected agent is excluded from the local
+STT transcript's addressee set, managed-agent response/effect path,
+`speak_agent_message` work, and local TTS publication. Other enrolled agents are
+unchanged. Releasing it restores the existing local route without replaying a
+stale transcript, effect, or queued speech. This is a mutual-exclusion rule, not
+a new audio framework, and it is atomic with session ownership.
 
 ## Why this option
 
@@ -360,7 +374,9 @@ part of VOICE 2.
 ## Lifecycle and failure contract
 
 A realtime session is keyed by `(ephemeral_channel_id, huddle_generation,
-agent_pubkey)`. At most one local session may own that key.
+agent_pubkey)`. At most one external-provider session may exist for the local
+Huddle lifetime, so the same captured human audio cannot be sent concurrently
+to multiple agent/provider sessions.
 
 It may start only when all of these facts are current:
 
@@ -369,21 +385,28 @@ It may start only when all of these facts are current:
 - the matching locally managed identity and owner authorization are available;
 - provider configuration passes its typed readiness check;
 - an `ExternalAudioEgressGrant` exists for the local user and exact session;
-- the managed-agent `respond_to` policy allows that local user; and
-- no realtime session or local TTS output lease already owns the same key.
+- the managed-agent `respond_to` policy allows that local user;
+- the current output route is explicitly classified as isolated; and
+- no realtime session already owns the Huddle lifetime.
+
+Active or queued local-agent work is not a startup refusal by itself: acquiring
+the `RealtimeAgentLease` must quiesce it completely before the provider session
+can become active.
 
 Huddle leave/end, generation change, agent removal, local-user membership or
-egress-grant loss, explicit disable, or local mute/capture loss cancels the
-applicable input or both sides. Canonical authority comes from the current
+egress-grant loss, explicit disable, isolated-to-coupled output-route change, or
+local mute/capture loss cancels the applicable input or both sides. Canonical authority comes from the current
 `HuddleState` generation and local controls, an exact managed-agent policy
 snapshot, and authoritative channel membership—not a 15-second poll. The audio
 roster is attribution only; it does not prove continuing membership or policy.
-Existing Nostr membership-change notifications trigger
-`fetch_channel_members_with_roles` revalidation, while local managed-agent
-record changes and owner-authorization expiry trigger policy revalidation. No
-new event kind is needed. Watchers and the expiry timer are armed before the
-initial snapshots; events observed during snapshot reads are reconciled before
-the session/output lease can activate. Every callback carries the session
+VOICE 2 adds a live subscription for the existing addressable channel
+membership event and uses its notifications to trigger
+`fetch_channel_members_with_roles` revalidation; the current 15-second polling
+path is not sufficient authority. Local managed-agent record changes and
+owner-authorization expiry likewise trigger policy revalidation. No new event
+kind is needed. Watchers and the expiry timer are armed before the initial
+snapshots; events observed during snapshot reads are reconciled before
+the provider session and `RealtimeAgentLease` can activate. Every callback carries the session
 generation. Any relevant notification closes the shared media-authorization
 gate synchronously before asynchronous revalidation; only an exact-session
 snapshot passing under that same gate may reopen it. Loss of the membership
@@ -412,12 +435,13 @@ VOICE 2 is fail-closed and does not add automatic reconnect. VOICE 6 may add
 bounded reconnect only after it proves single ownership and no duplicated
 speech or effects.
 
-The first slice has a fixed Buzz-owned per-session resource/spend budget:
-20 minutes wall clock, 15 minutes of PCM admitted to provider input, and
-5 minutes of decoded provider output. Budget is charged from validated frame
+The first slice has a fixed Buzz-owned resource/spend budget for the sole
+external-provider session in a local Huddle lifetime: 20 minutes wall clock, 15
+minutes of PCM admitted to provider input, and 5 minutes of decoded provider
+output. Budget is charged from validated frame
 sample counts before queueing, so provider metadata cannot reduce it. Reaching
 any limit closes input, cancels the active response, drains unsent output,
-closes provider and publisher sockets, releases the output lease, and records
+closes provider and publisher sockets, releases the `RealtimeAgentLease`, and records
 terminal reason `budget_exhausted`. It never auto-starts a replacement session.
 VOICE 7 may replace these conservative constants only with an approved product
 spend policy and equivalent fail-closed tests; telemetry alone is not a budget.
@@ -452,9 +476,11 @@ median while preserving the known speaker-echo trade-off.
 
 The vertical slice is:
 
-1. after explicit local-user enablement, create an
-   `ExternalAudioEgressGrant`, acquire the selected enrolled managed agent's
-   output lease, and create one OpenAI Realtime session;
+1. on an explicitly classified isolated/headset output route and after explicit
+   local-user enablement, create an `ExternalAudioEgressGrant`, acquire the
+   selected enrolled managed agent's `RealtimeAgentLease`, and create one OpenAI
+   Realtime session using a developer-supplied process credential that is never
+   persisted in app settings, managed-agent records, snapshots, or logs;
 2. authenticate a send-only Huddle socket as that agent using the existing
    NIP-42 plus owner-auth path; reuse its auth/encode contract but do not mark
    this peer as locally synthesized TTS, so the host's human socket receives and
@@ -465,43 +491,52 @@ The vertical slice is:
    connected to provider input;
 4. convert returned audio to the existing 48 kHz mono Opus room contract and
    publish it as the authenticated agent peer; and
-5. tear both connections and the output lease down together on any authority or
+5. tear both connections and the `RealtimeAgentLease` down together on any authority or
    lifecycle loss.
 
 Likely touch points are the Desktop Huddle modules (`mod.rs`, `state.rs`,
-`pipeline.rs`, `relay_api.rs`, and the existing agent publisher/auth helper)
-plus narrowly named OpenAI adapter code and focused tests. This is an expected
-change map, not permission to refactor the existing playout or local STT/TTS
-pipelines.
+`pipeline.rs`, `relay_api.rs`, and the existing agent publisher/auth helper),
+the WebView capture producer/worklet and Huddle context that originate the IPC
+envelope, and a narrowly scoped live subscription/revalidation path for the
+existing addressable membership event, plus narrowly named OpenAI adapter code
+and focused tests. The shared
+authenticated send-only connector may be separated below the existing
+TTS-specific publisher lease, but existing local TTS behavior changes only at
+the `RealtimeAgentLease` exclusion gate. This is an expected change map, not
+permission to refactor the existing playout or local STT/TTS pipelines.
 
 ### Acceptance criteria
 
 VOICE 2 is ready only when focused local tests demonstrate all of the following:
 
-- the provider peer appears in the existing roster under the managed agent's
-  pubkey and remote participants hear its returned audio;
+- a second authenticated test peer sees the provider peer in the existing
+  roster under the managed agent's pubkey, receives its returned audio, and
+  decodes the expected signal through the normal Huddle path;
 - a missing/mismatched managed identity, invalid owner authorization, absent
   `bot` membership, wrong room protocol, absent/mismatched egress grant, or
   denied `respond_to` policy prevents startup or forwarding;
 - only `CapturedHuddlePcm` owned by the current, non-bot local user named by the
   exact-session egress grant reaches relay/provider fan-out; delayed prior
   Huddle, capture-generation, and source callbacks fail before either output;
-- relay-received media is not connected to provider input, proving that remote
-  humans, bots, unknown indices, and v2 index-reuse races have no egress path;
-- muted, wrong-device, stale-generation, and post-cancel local capture never
+- a complete-diff/dataflow audit confirms relay-received media is not connected
+  to provider input, while tests reject all relay peer/index inputs at the
+  capture boundary; an isolated-route test rejects coupled output before any
+  egress grant activates;
+- muted, wrong-device, coupled-route, stale-generation, and post-cancel local capture never
   reaches the provider; after cancellation starts no new provider frame obtains
   send authorization, unsent queued audio is drained, and completion waits for
   writes already authorized before cancellation;
-- local TTS and realtime output cannot simultaneously own one agent/Huddle key,
-  including acquisition during active synthesis, queued publication, and
-  concurrent-start races; acquisition quiesces old TTS before realtime sends,
-  and release neither replays stale speech nor blocks fresh local TTS;
+- the local managed-agent responder and realtime session cannot simultaneously
+  own one agent/Huddle key, including acquisition during transcript delivery,
+  effect execution, active synthesis, queued publication, and concurrent-start
+  races; acquisition quiesces all old local-agent work before realtime starts,
+  and release replays no stale transcript, effect, or speech;
 - provider PCM is normalized once and emitted as 48 kHz mono, 20 ms Huddle Opus
   frames whose sequence and 48 kHz timestamp advance by 1 and 960 respectively,
   including the v2 contract's defined integer wrapping boundaries;
 - bounded media queues prefer freshness and cannot grow without limit;
 - exact and max-plus-one tests cover all three `ProviderSessionBudget` limits;
-  exhaustion is terminal, tears down both sockets, and releases the output lease
+  exhaustion is terminal, tears down both sockets, and releases the `RealtimeAgentLease`
   without automatic restart;
 - provider transport tests accept the exact raw-message, encoded-audio, decoded
   byte, and sample-count maxima, reject each maximum plus one before the next
@@ -510,18 +545,21 @@ VOICE 2 is ready only when focused local tests demonstrate all of the following:
 - cancellation prevents queued provider audio from being published;
 - provider disconnect tears down the agent audio peer without ending the human
   Huddle, while audio authority loss tears down the provider session;
-- provider credentials use a secret-bearing type with redacted diagnostics;
-  query strings, transport traces, response bodies, surfaced errors, metrics,
-  and Nostr events pass a canary-secret non-disclosure test;
+- the VOICE 2 credential is injected into the host process and uses a
+  secret-bearing type with redacted diagnostics; app settings, managed-agent
+  records, snapshots, query strings, transport traces, response bodies,
+  surfaced errors, metrics, and Nostr events pass a canary-secret
+  non-disclosure test;
 - OpenAI tools are disabled and an unexpected tool event is rejected inside
   the adapter without propagating its arguments or producing any effect; and
 - focused tests cover normal bidirectional media, each authorization/consent
   refusal, malformed provider messages, backpressure, provider/publisher
-  failure, output-lease exclusion, and teardown races.
+  failure, `RealtimeAgentLease` exclusion, and teardown races.
 
 The complete-diff architecture audit must separately verify that no relay or
-Huddle wire change was introduced, local STT behavior was not changed, local
-TTS changed only for the named output-lease exclusion, PR #7232 code was not
+Huddle wire change was introduced, local STT behavior changed only to exclude
+the exact leased agent from transcript delivery, local TTS changed only at the
+named `RealtimeAgentLease` exclusion, PR #7232 code was not
 copied or made a dependency, and no kind 48200/48201 or PR #7217
 provider-hosted media path is used. These are provenance/scope checks, not
 claims that behavioral tests can prove.
