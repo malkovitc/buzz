@@ -1181,6 +1181,12 @@ function invalidImportPaths(cwd, sessionDir) {
   return !path.isAbsolute(cwd) || !path.isAbsolute(sessionDir);
 }
 
+function validateNewImportGit(envelope, cwd, complete, now) {
+  if (fs.existsSync(complete)) return;
+  validateEnvelope(envelope, { now });
+  verifyGitBinding(envelope.capsule.git, cwd);
+}
+
 function validatedImportPreflight(
   envelope,
   { cwd, sessionDir, expected, now = Date.now() },
@@ -1198,14 +1204,14 @@ function validatedImportPreflight(
     ".capsule-imports",
     `${envelope.digest}.json`,
   );
-  if (!fs.existsSync(complete)) {
-    validateEnvelope(envelope, { now });
-    verifyGitBinding(capsule.git, cwd);
-  }
+  validateNewImportGit(envelope, cwd, complete, now);
   return { sourceBinding };
 }
 
-function importCapsuleUnlocked(envelope, { cwd, sessionDir, sourceBinding }) {
+function importCapsuleUnlocked(
+  envelope,
+  { cwd, sessionDir, sourceBinding, now = Date.now() },
+) {
   const capsule = envelope.capsule;
   fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(sessionDir, 0o700);
@@ -1213,6 +1219,7 @@ function importCapsuleUnlocked(envelope, { cwd, sessionDir, sourceBinding }) {
   fs.mkdirSync(imports, { recursive: true, mode: 0o700 });
   fs.chmodSync(imports, 0o700);
   const complete = path.join(imports, `${envelope.digest}.json`);
+  validateNewImportGit(envelope, cwd, complete, now);
   if (fs.existsSync(complete)) {
     const result = validateImportResult(
       JSON.parse(fs.readFileSync(complete, "utf8")),
