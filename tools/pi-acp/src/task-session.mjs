@@ -7,6 +7,43 @@ const HEX_EVENT = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SIDE_EFFECTING_TOOLS = new Set(["buzz_reply", "bash", "edit", "write"]);
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls", "kanban_tasks"]);
+const CONTINUATION_LINEAGE_TYPES = new Set([
+  "buzz.continuation.lineage.v1",
+  "buzz.continuation.lineage.v2",
+]);
+const CONTINUATION_CONTEXT_TYPES = new Set([
+  "buzz.continuation.context.v1",
+  "buzz.continuation.context.v2",
+]);
+
+function isContinuationLineage(entry) {
+  return (
+    entry.type === "custom" &&
+    typeof entry.customType === "string" &&
+    entry.customType.startsWith("buzz.continuation.lineage.")
+  );
+}
+
+function continuationLineageEntries(branch) {
+  const entries = branch.filter(isContinuationLineage);
+  for (const entry of entries) {
+    if (!CONTINUATION_LINEAGE_TYPES.has(entry.customType)) {
+      throw new Error("task continuation lineage version is unsupported");
+    }
+  }
+  return entries;
+}
+
+function latestContinuationLineage(branch) {
+  return continuationLineageEntries(branch).at(-1);
+}
+
+function isContinuationContext(entry) {
+  return (
+    entry.type === "custom_message" &&
+    CONTINUATION_CONTEXT_TYPES.has(entry.customType)
+  );
+}
 
 export function toolResultLeavesAmbiguousEffect(message) {
   return (
@@ -297,14 +334,7 @@ function assertCommittedTaskLineage(manager, sessionDir) {
   if (fs.existsSync(path.join(sessionDir, ".capsule-lineage.lock"))) {
     throw new Error("task capsule lineage is concurrent or interrupted");
   }
-  const lineage = manager
-    .getBranch()
-    .filter(
-      (entry) =>
-        entry.type === "custom" &&
-        entry.customType === "buzz.continuation.lineage.v1",
-    )
-    .at(-1);
+  const lineage = latestContinuationLineage(manager.getBranch());
   const headFile = path.join(sessionDir, ".capsule-lineage-head.json");
   const head = fs.existsSync(headFile)
     ? JSON.parse(fs.readFileSync(headFile, "utf8"))
@@ -325,18 +355,18 @@ function reopenSafeTaskSession(manager, cwd, sessionDir) {
   let toolActivityAfterSettled = false;
   for (const entry of branch) {
     if (entry.type === "custom_message") {
-      if (entry.customType === "buzz.continuation.context.v1") {
+      if (isContinuationContext(entry)) {
         settledEntry = entry;
         toolActivityAfterSettled = false;
       }
       continue;
     }
-    if (
-      entry.type === "custom" &&
-      ["buzz.continuation.lineage.v1", "buzz.delivery.v1"].includes(
-        entry.customType,
-      )
-    ) {
+    if (isContinuationLineage(entry)) {
+      settledEntry = entry;
+      toolActivityAfterSettled = false;
+      continue;
+    }
+    if (entry.type === "custom" && entry.customType === "buzz.delivery.v1") {
       settledEntry = entry;
       toolActivityAfterSettled = false;
       continue;
@@ -403,13 +433,7 @@ export function resetTaskSession(cwd, root, identity) {
     sessionDir,
   );
   const branch = current.getBranch();
-  const lineage = branch
-    .filter(
-      (entry) =>
-        entry.type === "custom" &&
-        entry.customType === "buzz.continuation.lineage.v1",
-    )
-    .at(-1);
+  const lineage = latestContinuationLineage(branch);
   const headFile = path.join(sessionDir, ".capsule-lineage-head.json");
   if (fs.existsSync(headFile)) {
     const head = JSON.parse(fs.readFileSync(headFile, "utf8"));

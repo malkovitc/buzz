@@ -298,13 +298,80 @@ test("reopen fails closed for unresolved tools and trims an interrupted user tai
   assert.doesNotMatch(JSON.stringify(recovered.getBranch()), /interrupted/);
 });
 
-test("task rotation preserves imported lineage metadata without model context", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-task-reset-"));
+for (const lineageVersion of [1, 2]) {
+  test(`task rotation preserves v${lineageVersion} lineage without model context`, () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-task-reset-"));
+    const identity = taskSessionIdentity(context, "wss://example.com");
+    const current = openTaskSession(process.cwd(), root, identity);
+    current.appendMessage({
+      role: "user",
+      content: "work",
+      timestamp: Date.now(),
+    });
+    current.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      api: "test",
+      provider: "test",
+      model: "test",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    });
+    const digest = "a".repeat(64);
+    current.appendCustomEntry(`buzz.continuation.lineage.v${lineageVersion}`, {
+      capsuleDigest: digest,
+      lineage: [
+        {
+          runtime: "pi",
+          sessionId: "source",
+          checkpointId: "deadbeef",
+          location: "local",
+        },
+      ],
+    });
+    fs.writeFileSync(
+      path.join(current.getSessionDir(), ".capsule-lineage-head.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        generation: "22222222-2222-4222-8222-222222222222",
+        digest,
+      }),
+    );
+    const reset = resetTaskSession(process.cwd(), root, identity);
+    assert.notEqual(reset.getSessionId(), current.getSessionId());
+    assert.equal(reset.buildSessionContext().messages.length, 0);
+    const marker = reset.getEntries().find((entry) => entry.type === "custom");
+    assert.equal(
+      marker.customType,
+      `buzz.continuation.lineage.v${lineageVersion}`,
+    );
+    assert.equal(marker.data.capsuleDigest, digest);
+  });
+}
+
+test("unsupported continuation lineage blocks task reopen", () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "pi-task-lineage-version-"),
+  );
   const identity = taskSessionIdentity(context, "wss://example.com");
   const current = openTaskSession(process.cwd(), root, identity);
+  current.appendCustomEntry("buzz.continuation.lineage.v3", {
+    capsuleDigest: "a".repeat(64),
+  });
+  current.appendCustomEntry("buzz.continuation.lineage.v2", {
+    capsuleDigest: "a".repeat(64),
+  });
   current.appendMessage({
     role: "user",
-    content: "work",
+    content: "continue",
     timestamp: Date.now(),
   });
   current.appendMessage({
@@ -324,24 +391,10 @@ test("task rotation preserves imported lineage metadata without model context", 
     stopReason: "stop",
     timestamp: Date.now(),
   });
-  const digest = "a".repeat(64);
-  current.appendCustomEntry("buzz.continuation.lineage.v1", {
-    capsuleDigest: digest,
-    lineage: [{ sessionId: "source", leafId: "deadbeef", location: "local" }],
-  });
-  fs.writeFileSync(
-    path.join(current.getSessionDir(), ".capsule-lineage-head.json"),
-    JSON.stringify({
-      schemaVersion: 1,
-      generation: "22222222-2222-4222-8222-222222222222",
-      digest,
-    }),
+  assert.throws(
+    () => openTaskSession(process.cwd(), root, identity),
+    /lineage version is unsupported/,
   );
-  const reset = resetTaskSession(process.cwd(), root, identity);
-  assert.notEqual(reset.getSessionId(), current.getSessionId());
-  assert.equal(reset.buildSessionContext().messages.length, 0);
-  const marker = reset.getEntries().find((entry) => entry.type === "custom");
-  assert.equal(marker.data.capsuleDigest, digest);
 });
 
 test("a real AgentSession reopens task history after process-style replacement", async (t) => {
