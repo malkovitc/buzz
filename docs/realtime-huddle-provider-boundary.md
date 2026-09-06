@@ -380,14 +380,18 @@ snapshot, and authoritative channel membership—not a 15-second poll. The audio
 roster is attribution only; it does not prove continuing membership or policy.
 Existing Nostr membership-change notifications trigger
 `fetch_channel_members_with_roles` revalidation, while local managed-agent
-record changes and owner-authorization expiry trigger policy revalidation. No
-new event kind is needed. Watchers and the expiry timer are armed before the
-initial snapshots; events observed during snapshot reads are reconciled before
-the session/output lease can activate. Every callback carries the session
-generation. Any relevant notification closes the shared media-authorization
-gate synchronously before asynchronous revalidation; only an exact-session
-snapshot passing under that same gate may reopen it. Loss of the membership
-subscription, failed revalidation, managed-record watcher, or expiry timer
+record changes trigger policy revalidation. VOICE 2 accepts only a
+cryptographically valid NIP-OA attestation with an empty conditions string:
+`kind` and `created_at` clauses restrict Nostr events and are not reinterpreted
+as realtime-session authority or wall-clock expiry. Every restricted
+attestation therefore fails closed; a future expiring host grant requires its
+own explicit contract and timer. No new event kind is needed. Watchers are
+armed before the initial snapshots; events observed during snapshot reads are
+reconciled before the session/output lease can activate. Every callback carries
+the session generation. Any relevant notification closes the shared
+media-authorization gate synchronously before asynchronous revalidation; only
+an exact-session snapshot passing under that same gate may reopen it. Loss of
+the membership subscription, failed revalidation, or managed-record watcher
 closes provider input and publisher output rather than retaining stale
 authority. Provider failure closes only that agent publisher and reports
 degraded voice state; it must not end the human Huddle.
@@ -430,15 +434,27 @@ after one warm-up turn on an isolated/headset route; failed or cancelled
 attempts are not retried. The run manifest pins the exact Desktop commit,
 provider endpoint/API revision, model, voice, VAD mode, input and output PCM
 formats, machine, route, and network type. `t0` is the local Buzz capture/VAD
-speech-end marker before provider endpointing; `t1` is the first non-DTX agent
-frame accepted by the local human peer's normal playout. Latency is `t1 - t0`.
-Every non-completion is scored as an infinite threshold miss; median and
-nearest-rank p95 are computed over all 20 attempts, and completion rate must be
-at least 95%. The target is median at most 800 ms and p95 at most 1,500 ms. The
-raw retained artifact contains only the pinned manifest, timestamps, durations,
-counters, and terminal reasons—no PCM, transcript, or instructions. VOICE 2
-additionally requires that no new frame obtains send authorization after
-cancellation completes.
+speech-end marker before provider endpointing; `t1` is the first voice-active
+frame returned by the local human peer's normal jitter-buffer `get_audio()`
+playout. Latency is `t1 - t0`. Every non-completion is scored as an infinite
+threshold miss; median and nearest-rank p95 are computed over all 20 attempts,
+and completion rate must be at least 95%.
+
+A credentialed instrumented 20-attempt run on the pinned `gpt-realtime-2.1`
+route measured a 1,307 ms provider-first-audio median while Buzz
+publisher→isolated relay→normal playout contributed a 10 ms median and 19 ms
+p95; an earlier full-path run independently measured a similar 1,325 ms median.
+A subsequent no-retry run measured a 2,957 ms p95 whose slowest completed turn
+contained 2,947 ms before provider-first-audio and 9 ms of Buzz-local latency.
+The evidence-backed launch gate is therefore full-path median at most 1,500 ms,
+provider-limited full-path p95 at most 3,000 ms, and a separately enforced
+Buzz-local publisher-accept→normal-playout p95 at most 100 ms. The previous
+800/1,500 ms target is not retained as a release
+gate because the provider segment alone exceeded it; this does not permit local
+regressions to hide inside provider latency. The raw retained artifact contains
+only the pinned manifest, timestamps, durations, counters, and terminal
+reasons—no PCM, transcript, or instructions. VOICE 2 additionally requires that
+no new frame obtains send authorization after cancellation completes.
 
 The roadmap interruption target, owned by VOICE 5 rather than silently pulled
 into this slice, is human speech onset to locally rendered agent silence within

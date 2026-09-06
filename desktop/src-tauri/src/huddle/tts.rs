@@ -146,6 +146,14 @@ type WorkerControlState = (
 
 // ── Public pipeline handle ────────────────────────────────────────────────────
 
+struct TtsWorkerExit(tokio::sync::watch::Sender<bool>);
+
+impl Drop for TtsWorkerExit {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
 /// Handle to the running TTS pipeline.
 ///
 /// Not Clone — wrap in `Arc` to share across threads.
@@ -185,6 +193,9 @@ pub struct TtsPipeline {
     /// Agent-authenticated Huddle publishers used to carry synthesized speech
     /// to remote clients without impersonating the hosting human.
     broadcasters: TtsBroadcasters,
+    /// Independent acknowledgement that the worker has exited. Unlike the
+    /// thread handle, this remains observable while other `Arc` owners exist.
+    worker_exit: tokio::sync::watch::Receiver<bool>,
     /// Worker thread handle — taken on drop to join cleanly.
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -232,10 +243,12 @@ impl TtsPipeline {
         let worker_broadcasters = broadcasters.clone();
         let model_dir_worker = model_dir.clone();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let (worker_exit_tx, worker_exit) = tokio::sync::watch::channel(false);
 
         let handle = thread::Builder::new()
             .name("tts-worker".into())
             .spawn(move || {
+                let _worker_exit = TtsWorkerExit(worker_exit_tx);
                 tts_worker(
                     model_dir_worker,
                     (
@@ -278,6 +291,7 @@ impl TtsPipeline {
             playback_probe,
             voice_change_ack,
             broadcasters,
+            worker_exit,
             thread: Some(handle),
         })
     }
@@ -287,10 +301,14 @@ impl Drop for TtsPipeline {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         self.broadcasters.shutdown();
-        // Dropping `text_tx` unblocks the worker's recv_timeout loop.
-        // Join to ensure the audio thread exits cleanly.
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        // A pipeline can become the last Arc while an async timeout is being
+        // cancelled. Never join its worker on that async executor thread.
+        if let Some(worker) = self.thread.take() {
+            let _ = thread::Builder::new()
+                .name("buzz-tts-worker-reaper".to_string())
+                .spawn(move || {
+                    let _ = worker.join();
+                });
         }
     }
 }

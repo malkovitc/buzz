@@ -5,6 +5,20 @@ use std::sync::Arc;
 use super::{relay_api, tts};
 use crate::app_state::AppState;
 
+fn owns_local_tts_output_lease(
+    huddle: &super::state::HuddleState,
+    pipeline: &tts::TtsPipeline,
+    channel_id: &str,
+    huddle_generation: u64,
+) -> bool {
+    huddle.is_current_huddle(channel_id, huddle_generation)
+        && !huddle.realtime_voice_active
+        && huddle
+            .tts_pipeline
+            .as_ref()
+            .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), pipeline))
+}
+
 pub(super) async fn ensure(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -40,13 +54,14 @@ pub(super) async fn ensure(
     {
         return Err("managed-agent identity does not match the Huddle speaker".to_string());
     }
-    let (ephemeral_channel_id, parent_channel_id, local_tts_publishers) = {
+    let (ephemeral_channel_id, huddle_generation, parent_channel_id, local_tts_publishers) = {
         let huddle = state.huddle()?;
         (
             huddle
                 .ephemeral_channel_id
                 .clone()
                 .ok_or("active Huddle has no backing channel")?,
+            huddle.huddle_generation,
             huddle.parent_channel_id.clone(),
             Arc::clone(&huddle.local_tts_publishers),
         )
@@ -70,6 +85,12 @@ pub(super) async fn ensure(
         local_tts_publishers,
     )
     .await?;
+    let huddle = state.huddle()?;
+    if !owns_local_tts_output_lease(&huddle, pipeline, &ephemeral_channel_id, huddle_generation) {
+        publisher.shutdown();
+        return Err("local TTS output lease changed during publisher setup".to_string());
+    }
     pipeline.register_audio_publisher(speaker_pubkey, publisher);
+    drop(huddle);
     Ok(true)
 }

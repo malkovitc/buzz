@@ -437,6 +437,13 @@ pub(crate) fn commit_imported_identity(
         .keyring_locked
         .store(false, std::sync::atomic::Ordering::Release);
 
+    if previous_pubkey != pubkey {
+        if let Ok(mut huddle) = state.huddle() {
+            huddle.end_realtime_voice();
+        }
+        state.emit_huddle_state_changed();
+    }
+
     // Importing a different identity invalidates the app-managed backup: it
     // encrypts the previous key and must not linger mislabeled. Best-effort
     // per the ordering contract above.

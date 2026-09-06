@@ -3,13 +3,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 fn inert_pipeline(cancel: Arc<AtomicBool>) -> TtsPipeline {
+    inert_pipeline_with_exit_delay(cancel, std::time::Duration::ZERO)
+}
+
+fn inert_pipeline_with_exit_delay(
+    cancel: Arc<AtomicBool>,
+    exit_delay: std::time::Duration,
+) -> TtsPipeline {
     let (text_tx, text_rx) = std::sync::mpsc::sync_channel(TEXT_QUEUE_DEPTH);
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = Arc::clone(&shutdown);
+    let (worker_exit_tx, worker_exit) = tokio::sync::watch::channel(false);
     let thread = std::thread::spawn(move || {
+        let _worker_exit = TtsWorkerExit(worker_exit_tx);
         while !worker_shutdown.load(Ordering::Acquire) {
             let _ = text_rx.recv_timeout(RECV_TIMEOUT);
         }
+        std::thread::sleep(exit_delay);
     });
     TtsPipeline {
         text_tx,
@@ -26,8 +36,53 @@ fn inert_pipeline(cancel: Arc<AtomicBool>) -> TtsPipeline {
         playback_probe: PlaybackProbe::new(),
         voice_change_ack: Arc::new(std::sync::Mutex::new(None)),
         broadcasters: TtsBroadcasters::default(),
+        worker_exit,
         thread: Some(thread),
     }
+}
+
+#[test]
+fn last_and_retained_pipeline_owners_never_join_a_delayed_worker_on_drop() {
+    let delayed_pipeline = || {
+        Arc::new(inert_pipeline_with_exit_delay(
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_millis(500),
+        ))
+    };
+
+    let last_owner = delayed_pipeline();
+    let started = std::time::Instant::now();
+    drop(last_owner);
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
+
+    let retained_owner = delayed_pipeline();
+    let other_owner = Arc::clone(&retained_owner);
+    drop(retained_owner);
+    let started = std::time::Instant::now();
+    drop(other_owner);
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
+}
+
+#[tokio::test]
+async fn worker_exit_is_acknowledged_while_an_arc_owner_is_retained() {
+    let pipeline = Arc::new(inert_pipeline(Arc::new(AtomicBool::new(false))));
+    let retained = Arc::clone(&pipeline);
+    let mut worker_exit = pipeline.worker_exit_receiver();
+
+    pipeline.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(1), worker_exit.changed())
+        .await
+        .expect("worker exit timeout")
+        .expect("worker exit acknowledgement");
+
+    assert!(*worker_exit.borrow());
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !retained.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker thread completion timeout");
 }
 
 #[test]

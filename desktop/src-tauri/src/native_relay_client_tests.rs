@@ -11,6 +11,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 /// The subscription id every test below drives.
 const PROBE_ID: &str = "archive:probe";
+const HUDDLE_PROBE_ID: &str = "huddle:probe";
 
 /// Minimal relay that completes the NIP-42 handshake, records every REQ,
 /// and sends a CLOSED only when the test asks it to.
@@ -124,6 +125,13 @@ fn probe_subscription() -> Subscription {
     }
 }
 
+fn huddle_probe_subscription() -> Subscription {
+    Subscription {
+        id: HUDDLE_PROBE_ID.to_string(),
+        filter: serde_json::json!({ "kinds": [39002], "limit": 0 }),
+    }
+}
+
 async fn next_frame(frames: &mut mpsc::Receiver<Frame>, label: &str) -> Frame {
     tokio::time::timeout(Duration::from_secs(10), frames.recv())
         .await
@@ -226,6 +234,101 @@ async fn finite_fetch_multiplexes_with_persistent_delivery_on_a_real_websocket()
         .unwrap();
     assert_eq!(delivered.subscription_id, PROBE_ID);
     assert_eq!(*delivered.event, persistent);
+    session.shutdown();
+}
+
+#[tokio::test]
+async fn cancelled_finite_fetch_removes_its_shared_subscription() {
+    let (relay_url, mut frames, _commands) = stub_relay().await;
+    let (session, _events) = start(relay_url, Keys::generate(), None).await;
+    let fetch_session = Arc::clone(&session);
+    let fetch = tokio::spawn(async move {
+        fetch_session
+            .fetch_events(
+                serde_json::json!({"kinds": [1], "limit": 1}),
+                Duration::from_secs(30),
+            )
+            .await
+    });
+    let _ = next_req(&mut frames, "cancel-safe finite REQ").await;
+    fetch.abort();
+    let _ = fetch.await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let requests_empty = session.requests.lock().await.is_empty();
+            let transient_empty = session.state.lock().await.transient.is_empty();
+            let cleanup_complete = requests_empty && transient_empty;
+            if cleanup_complete {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled request cleanup");
+    session.shutdown();
+}
+
+#[tokio::test]
+async fn huddle_watcher_shares_the_socket_without_stealing_archive_delivery() {
+    let (relay_url, mut frames, commands) = stub_relay().await;
+    let (session, mut archive_events) = start(relay_url, Keys::generate(), None).await;
+    let media_fence = CancellationToken::new();
+    let mut huddle_events = session.attach_huddle(media_fence.clone()).await;
+    session.set_subscriptions(vec![probe_subscription()]).await;
+    session
+        .set_huddle_subscription(Some(huddle_probe_subscription()))
+        .await;
+
+    let first = next_req(&mut frames, "first shared REQ").await;
+    let second = next_req(&mut frames, "second shared REQ").await;
+    assert_eq!(
+        std::collections::BTreeSet::from([first, second]),
+        std::collections::BTreeSet::from([PROBE_ID.to_string(), HUDDLE_PROBE_ID.to_string()])
+    );
+
+    commands
+        .send(StubCommand::Eose(HUDDLE_PROBE_ID.into()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        huddle_events.recv().await,
+        Some(HuddleRelaySignal::Ready)
+    ));
+
+    let relay_keys = Keys::generate();
+    let huddle_event = EventBuilder::text_note("huddle membership changed")
+        .sign_with_keys(&relay_keys)
+        .unwrap();
+    commands
+        .send(StubCommand::Event(
+            HUDDLE_PROBE_ID.into(),
+            serde_json::to_value(&huddle_event).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let Some(HuddleRelaySignal::Event(delivered)) = huddle_events.recv().await else {
+        panic!("huddle event was not delivered to its watcher");
+    };
+    assert_eq!(*delivered, huddle_event);
+    assert!(media_fence.is_cancelled());
+
+    let archive_event = EventBuilder::text_note("archive only")
+        .sign_with_keys(&relay_keys)
+        .unwrap();
+    commands
+        .send(StubCommand::Event(
+            PROBE_ID.into(),
+            serde_json::to_value(&archive_event).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        *archive_events.recv().await.unwrap().event,
+        archive_event,
+        "Huddle watcher must not steal archive delivery"
+    );
+
     session.shutdown();
 }
 

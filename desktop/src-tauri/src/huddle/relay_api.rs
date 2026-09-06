@@ -69,7 +69,7 @@ fn build_audio_auth_event(
         .map_err(|e| format!("sign: {e}"))
 }
 
-async fn connect_authenticated_audio_socket(
+pub(super) async fn connect_authenticated_audio_socket(
     channel_id: &str,
     parent_channel_id: Option<&str>,
     relay_url: &str,
@@ -79,8 +79,9 @@ async fn connect_authenticated_audio_socket(
     use nostr::JsonUtil;
 
     let ws_url = format!("{relay_url}/huddle/{channel_id}/audio");
-    let (ws_stream, _) = connect_async(&ws_url)
+    let (ws_stream, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_async(&ws_url))
         .await
+        .map_err(|_| "audio WS connect timed out".to_string())?
         .map_err(|e| format!("audio WS connect failed: {e}"))?;
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
@@ -260,11 +261,69 @@ pub(crate) async fn connect_audio_relay(
 /// Background Opus encode/decode pipeline spawned by `connect_audio_relay`.
 pub(crate) type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-type WsSink = futures_util::stream::SplitSink<WsStream, WsMsg>;
-type WsReceiver = futures_util::stream::SplitStream<WsStream>;
+pub(super) type WsSink = futures_util::stream::SplitSink<WsStream, WsMsg>;
+pub(super) type WsReceiver = futures_util::stream::SplitStream<WsStream>;
 
 const TTS_BROADCAST_QUEUE_DEPTH: usize = 8;
 const TTS_BROADCAST_MAX_FRAMES: usize = 1_500; // 30 seconds at 20 ms/frame.
+
+pub(super) struct HuddleOpusEncoder {
+    encoder: opus::Encoder,
+    sequence: u16,
+    timestamp_48k: u32,
+    encoded: Vec<u8>,
+}
+
+impl HuddleOpusEncoder {
+    pub(super) fn new(label: &str) -> Result<Self, String> {
+        let mut encoder = opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)
+            .map_err(|error| format!("{label} opus encoder: {error}"))?;
+        encoder
+            .set_bitrate(opus::Bitrate::Bits(32_000))
+            .map_err(|error| format!("{label} opus bitrate: {error}"))?;
+        encoder
+            .set_dtx(true)
+            .map_err(|error| format!("{label} opus dtx: {error}"))?;
+        Ok(Self {
+            encoder,
+            sequence: 0,
+            timestamp_48k: 0,
+            encoded: vec![0_u8; 4_000],
+        })
+    }
+
+    pub(super) fn encode(&mut self, samples_48k: &[f32]) -> Result<Option<Vec<u8>>, String> {
+        use super::wire::{audio_level_dbov, FrameHeader, V2_HEADER_LEN};
+
+        let encoded_len = self
+            .encoder
+            .encode_float(samples_48k, &mut self.encoded)
+            .map_err(|error| format!("agent opus encode: {error}"))?;
+        if encoded_len == 0 {
+            return Ok(None);
+        }
+        let flags = if encoded_len <= 2 {
+            super::wire::FLAG_DTX
+        } else {
+            0
+        };
+        let header = FrameHeader {
+            seq: self.sequence,
+            ts_48k: self.timestamp_48k,
+            level_dbov: audio_level_dbov(samples_48k),
+            flags,
+        }
+        .encode();
+        let mut payload = Vec::with_capacity(V2_HEADER_LEN + encoded_len);
+        payload.extend_from_slice(&header);
+        payload.extend_from_slice(&self.encoded[..encoded_len]);
+        self.sequence = self.sequence.wrapping_add(1);
+        self.timestamp_48k = self
+            .timestamp_48k
+            .wrapping_add(super::jitter::FRAME_TIMESTAMP_DELTA);
+        Ok(Some(payload))
+    }
+}
 
 struct QueuedTtsFrame {
     epoch: u64,
@@ -272,7 +331,7 @@ struct QueuedTtsFrame {
     samples_48k: Vec<f32>,
 }
 
-fn upsample_tts_24k_to_48k(samples_24k: &[f32]) -> Vec<f32> {
+pub(super) fn upsample_tts_24k_to_48k(samples_24k: &[f32]) -> Vec<f32> {
     let mut samples_48k = Vec::with_capacity(samples_24k.len().saturating_mul(2));
     for (index, sample) in samples_24k.iter().copied().enumerate() {
         let next = samples_24k.get(index + 1).copied().unwrap_or(sample);
@@ -364,21 +423,9 @@ async fn run_tts_audio_publisher(
     epoch: Arc<std::sync::atomic::AtomicU64>,
     speaker_generation: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), String> {
-    use super::wire::{audio_level_dbov, FrameHeader, V2_HEADER_LEN};
     use std::sync::atomic::Ordering;
 
-    let mut encoder = opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)
-        .map_err(|error| format!("tts opus encoder: {error}"))?;
-    encoder
-        .set_bitrate(opus::Bitrate::Bits(32_000))
-        .map_err(|error| format!("tts opus bitrate: {error}"))?;
-    encoder
-        .set_dtx(true)
-        .map_err(|error| format!("tts opus dtx: {error}"))?;
-
-    let mut sequence = 0_u16;
-    let mut timestamp_48k = 0_u32;
-    let mut encoded = vec![0_u8; 4_000];
+    let mut encoder = HuddleOpusEncoder::new("tts")?;
     let mut queue = std::collections::VecDeque::<QueuedTtsFrame>::new();
     let mut send_tick = tokio::time::interval(std::time::Duration::from_millis(20));
     send_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -397,30 +444,16 @@ async fn run_tts_audio_publisher(
                     queue.pop_front();
                 }
                 let Some(frame) = queue.pop_front() else { continue };
-                let level = audio_level_dbov(&frame.samples_48k);
-                let encoded_len = encoder
-                    .encode_float(&frame.samples_48k, &mut encoded)
-                    .map_err(|error| format!("tts opus encode: {error}"))?;
-                if encoded_len == 0 {
+                let Some(payload) = encoder.encode(&frame.samples_48k)? else {
                     continue;
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    result = ws_tx.send(WsMsg::Binary(payload.into())) => {
+                        result.map_err(|error| format!("tts audio send: {error}"))?;
+                    }
                 }
-                let flags = if encoded_len <= 2 { super::wire::FLAG_DTX } else { 0 };
-                let header = FrameHeader {
-                    seq: sequence,
-                    ts_48k: timestamp_48k,
-                    level_dbov: level,
-                    flags,
-                }
-                .encode();
-                let mut payload = Vec::with_capacity(V2_HEADER_LEN + encoded_len);
-                payload.extend_from_slice(&header);
-                payload.extend_from_slice(&encoded[..encoded_len]);
-                ws_tx
-                    .send(WsMsg::Binary(payload.into()))
-                    .await
-                    .map_err(|error| format!("tts audio send: {error}"))?;
-                sequence = sequence.wrapping_add(1);
-                timestamp_48k = timestamp_48k.wrapping_add(super::jitter::FRAME_TIMESTAMP_DELTA);
             }
             message = ws_rx.next() => {
                 match message {
@@ -444,7 +477,11 @@ async fn run_tts_audio_publisher(
             }
         }
     }
-    let _ = ws_tx.send(WsMsg::Close(None)).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        ws_tx.send(WsMsg::Close(None)),
+    )
+    .await;
     Ok(())
 }
 
@@ -626,7 +663,12 @@ pub(crate) async fn fetch_channel_members_with_roles(
     let Some(event) = events.first() else {
         return Ok(Vec::new());
     };
+    Ok(channel_members_with_roles_from_event(event))
+}
 
+pub(crate) fn channel_members_with_roles_from_event(
+    event: &nostr::Event,
+) -> Vec<(String, Option<String>)> {
     let mut seen = std::collections::BTreeSet::new();
     let mut members = Vec::new();
     for tag in event.tags.iter() {
@@ -641,7 +683,7 @@ pub(crate) async fn fetch_channel_members_with_roles(
         let role = slice.get(3).filter(|s| !s.is_empty()).cloned();
         members.push((pubkey.clone(), role));
     }
-    Ok(members)
+    members
 }
 
 /// Fetch channel members, optionally filtered by role (e.g., "bot" for agents).

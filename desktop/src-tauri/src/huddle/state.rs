@@ -12,6 +12,7 @@ use std::sync::{
 
 use super::agent_voice::AgentVoiceSettings;
 use super::human_floor::HumanFloor;
+use super::realtime_voice::CaptureLease;
 use super::{stt, tts};
 
 /// Voice input mode: push-to-talk (PTT) or voice-activity detection (VAD).
@@ -140,6 +141,42 @@ pub struct HuddleState {
     /// generation, this changes only when a new start/join attempt begins.
     #[serde(skip)]
     pub huddle_generation: u64,
+    /// Monotonic browser-capture identity, preserved across Huddle resets.
+    #[serde(skip)]
+    pub capture_generation: u64,
+    /// Exact browser capture currently allowed to submit microphone PCM.
+    #[serde(skip)]
+    pub capture_lease: Option<CaptureLease>,
+    /// Latest-only provider input boundary. The sender exists only after the
+    /// authority watcher and admission snapshot have both succeeded.
+    #[serde(skip)]
+    pub realtime_voice_pcm_tx:
+        Option<tokio::sync::watch::Sender<Option<super::realtime_voice::CapturedHuddlePcm>>>,
+    /// Host-owned transition signal for an explicitly closed microphone turn.
+    #[serde(skip)]
+    pub realtime_voice_turn_tx: Option<tokio::sync::watch::Sender<u64>>,
+    /// Host-owned PTT press signal for cancelling active provider output.
+    #[serde(skip)]
+    pub realtime_voice_interrupt_tx: Option<tokio::sync::watch::Sender<u64>>,
+    /// Shared send fence advanced synchronously by the PTT entry point.
+    #[serde(skip)]
+    pub realtime_voice_output_fence:
+        Option<std::sync::Arc<super::realtime_voice::ProviderOutputFence>>,
+    /// Completion acknowledgement used by explicit disable for bounded cleanup.
+    #[serde(skip)]
+    pub realtime_voice_done: Option<tokio::sync::watch::Receiver<bool>>,
+    /// User-visible state of the explicitly enabled external realtime agent.
+    #[serde(default)]
+    pub realtime_voice_active: bool,
+    #[serde(default)]
+    pub realtime_voice_agent_pubkey: Option<String>,
+    /// Monotonic runtime identity; stale teardown cannot close a replacement.
+    #[serde(skip)]
+    pub realtime_voice_generation: u64,
+    /// Cancels provider input, provider output, and authority monitoring as one
+    /// linearized teardown.
+    #[serde(skip)]
+    pub realtime_voice_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Session generation — incremented on every teardown. The transcription
     /// task captures this at spawn time and checks before each POST. If the
     /// generation has changed, the task silently drops the transcript.
@@ -212,6 +249,17 @@ impl Clone for HuddleState {
             stt_starting: Arc::clone(&self.stt_starting),
             last_agent_refresh: self.last_agent_refresh,
             huddle_generation: self.huddle_generation,
+            capture_generation: self.capture_generation,
+            capture_lease: None,
+            realtime_voice_pcm_tx: None,
+            realtime_voice_turn_tx: None,
+            realtime_voice_interrupt_tx: None,
+            realtime_voice_output_fence: None,
+            realtime_voice_done: None,
+            realtime_voice_active: self.realtime_voice_active,
+            realtime_voice_agent_pubkey: self.realtime_voice_agent_pubkey.clone(),
+            realtime_voice_generation: self.realtime_voice_generation,
+            realtime_voice_cancel: None,
             session_generation: Arc::clone(&self.session_generation),
             voice_input_mode: self.voice_input_mode.clone(),
             ptt_active: Arc::clone(&self.ptt_active),
@@ -249,6 +297,17 @@ impl Default for HuddleState {
             stt_starting: Arc::new(AtomicBool::new(false)),
             last_agent_refresh: None,
             huddle_generation: 0,
+            capture_generation: 0,
+            capture_lease: None,
+            realtime_voice_pcm_tx: None,
+            realtime_voice_turn_tx: None,
+            realtime_voice_interrupt_tx: None,
+            realtime_voice_output_fence: None,
+            realtime_voice_done: None,
+            realtime_voice_active: false,
+            realtime_voice_agent_pubkey: None,
+            realtime_voice_generation: 0,
+            realtime_voice_cancel: None,
             session_generation: Arc::new(AtomicU64::new(0)),
             voice_input_mode: VoiceInputMode::default(),
             ptt_active: Arc::new(AtomicBool::new(false)),
@@ -342,16 +401,92 @@ impl HuddleState {
         false
     }
 
-    /// Reset to default state while preserving the session generation counter.
+    pub(crate) fn begin_capture(&mut self, mut lease: CaptureLease) -> CaptureLease {
+        self.capture_generation = self.capture_generation.wrapping_add(1);
+        lease.capture_generation = self.capture_generation;
+        self.capture_lease = Some(lease.clone());
+        lease
+    }
+
+    pub(crate) fn end_capture(&mut self) {
+        self.capture_generation = self.capture_generation.wrapping_add(1);
+        self.capture_lease = None;
+    }
+
+    pub(crate) fn realtime_voice_is_stopping(&self) -> bool {
+        self.realtime_voice_done
+            .as_ref()
+            .is_some_and(|done| !*done.borrow())
+    }
+
+    pub(crate) fn begin_realtime_voice(
+        &mut self,
+        agent_pubkey: String,
+        output_fence: std::sync::Arc<super::realtime_voice::ProviderOutputFence>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> (u64, tokio_util::sync::CancellationToken) {
+        self.realtime_voice_generation = self.realtime_voice_generation.wrapping_add(1);
+        self.realtime_voice_done = None;
+        self.realtime_voice_cancel = Some(cancel.clone());
+        self.realtime_voice_output_fence = Some(output_fence);
+        self.realtime_voice_active = true;
+        self.realtime_voice_agent_pubkey = Some(agent_pubkey);
+        (self.realtime_voice_generation, cancel)
+    }
+
+    pub(crate) fn end_realtime_voice_input_turn(&self) {
+        if let Some(turns) = self.realtime_voice_turn_tx.as_ref() {
+            turns.send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
+
+    pub(crate) fn interrupt_realtime_voice_output(&self) {
+        if let Some(output_fence) = self.realtime_voice_output_fence.as_ref() {
+            output_fence.advance();
+        }
+        if let Some(interrupts) = self.realtime_voice_interrupt_tx.as_ref() {
+            interrupts.send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
+
+    pub(crate) fn end_realtime_voice(&mut self) {
+        self.realtime_voice_generation = self.realtime_voice_generation.wrapping_add(1);
+        self.realtime_voice_active = false;
+        self.realtime_voice_agent_pubkey = None;
+        self.realtime_voice_pcm_tx = None;
+        self.realtime_voice_turn_tx = None;
+        self.realtime_voice_interrupt_tx = None;
+        self.realtime_voice_output_fence = None;
+        if let Some(cancel) = self.realtime_voice_cancel.take() {
+            cancel.cancel();
+        }
+    }
+
+    pub(crate) fn finish_realtime_voice(&mut self, generation: u64) {
+        if self.realtime_voice_generation == generation {
+            self.end_realtime_voice();
+        }
+    }
+
+    /// Reset to default state while preserving monotonic generation counters.
     /// Used by start_huddle rollback, join_huddle rollback, and teardown_huddle
-    /// to invalidate in-flight transcription tasks without losing the generation.
+    /// to invalidate in-flight work without allowing a stale capture to return.
     pub(crate) fn reset_preserving_generation(&mut self) {
         let gen = Arc::clone(&self.session_generation);
         let huddle_generation = self.huddle_generation;
+        let capture_generation = self.capture_generation.wrapping_add(1);
+        let realtime_voice_generation = self.realtime_voice_generation.wrapping_add(1);
+        let realtime_voice_done = self.realtime_voice_done.clone();
         let tts_enabled = self.tts_enabled;
+        if let Some(cancel) = self.realtime_voice_cancel.take() {
+            cancel.cancel();
+        }
         *self = Self::default();
         self.session_generation = gen;
         self.huddle_generation = huddle_generation;
+        self.capture_generation = capture_generation;
+        self.realtime_voice_generation = realtime_voice_generation;
+        self.realtime_voice_done = realtime_voice_done;
         self.tts_enabled = tts_enabled;
     }
 }
@@ -385,6 +520,54 @@ mod tests {
         let state = HuddleState::default();
         assert_eq!(state.voice_input_mode, super::VoiceInputMode::PushToTalk);
         assert!(!state.manual_mic_unmuted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn teardown_cancels_realtime_voice_and_fences_stale_completion() {
+        let mut state = HuddleState::default();
+        let media = tokio_util::sync::CancellationToken::new();
+        let (generation, cancel) = state.begin_realtime_voice(
+            "agent-a".to_string(),
+            super::super::realtime_voice::ProviderOutputFence::shared(),
+            media.child_token(),
+        );
+        assert!(state.realtime_voice_active);
+        assert_eq!(
+            state.realtime_voice_agent_pubkey.as_deref(),
+            Some("agent-a")
+        );
+
+        state.reset_preserving_generation();
+        assert!(cancel.is_cancelled());
+        assert!(!state.realtime_voice_active);
+
+        let replacement_media = tokio_util::sync::CancellationToken::new();
+        let (replacement_generation, replacement_cancel) = state.begin_realtime_voice(
+            "agent-b".to_string(),
+            super::super::realtime_voice::ProviderOutputFence::shared(),
+            replacement_media.child_token(),
+        );
+        state.finish_realtime_voice(generation);
+        assert!(state.realtime_voice_active);
+        assert!(!replacement_cancel.is_cancelled());
+        state.finish_realtime_voice(replacement_generation);
+        assert!(replacement_cancel.is_cancelled());
+        assert!(!state.realtime_voice_active);
+    }
+
+    #[test]
+    fn ptt_press_signals_realtime_output_interruption() {
+        let mut state = HuddleState::default();
+        let (interrupt_tx, mut interrupts) = tokio::sync::watch::channel(0_u64);
+        let output_fence = super::super::realtime_voice::ProviderOutputFence::shared();
+        state.realtime_voice_interrupt_tx = Some(interrupt_tx);
+        state.realtime_voice_output_fence = Some(std::sync::Arc::clone(&output_fence));
+
+        state.interrupt_realtime_voice_output();
+
+        assert_eq!(output_fence.generation(), 1);
+        assert!(interrupts.has_changed().expect("interruption signal"));
+        assert_eq!(*interrupts.borrow_and_update(), 1);
     }
 
     #[test]

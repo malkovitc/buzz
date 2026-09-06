@@ -67,6 +67,7 @@ pub fn install<R: Runtime>(builder: Builder<R>) -> Builder<R> {
                         if let Ok(hs) = state.huddle_state.lock() {
                             hs.ptt_active
                                 .store(true, std::sync::atomic::Ordering::Release);
+                            hs.interrupt_realtime_voice_output();
                             // Only cancel TTS if it's actually playing — avoids
                             // a stale cancel flag that drops the next queued message.
                             if hs.tts_active.load(std::sync::atomic::Ordering::Acquire) {
@@ -102,6 +103,12 @@ pub fn install<R: Runtime>(builder: Builder<R>) -> Builder<R> {
                                 if let Ok(hs) = state.huddle_state.lock() {
                                     hs.ptt_active
                                         .store(false, std::sync::atomic::Ordering::Release);
+                                    if !hs
+                                        .manual_mic_unmuted
+                                        .load(std::sync::atomic::Ordering::Acquire)
+                                    {
+                                        hs.end_realtime_voice_input_turn();
+                                    }
                                 }
                             }
                             // Emit ptt-state=false — React plays the release audio cue.

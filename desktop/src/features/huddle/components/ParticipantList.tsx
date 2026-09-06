@@ -30,6 +30,8 @@ type ParticipantListProps = {
   agentPubkeys?: string[];
   /** Local, huddle-scoped playback choices for agent participants. */
   agentVoiceSettings?: Record<string, HuddleAgentVoiceSettings>;
+  /** Agent currently using explicit external realtime audio, if any. */
+  realtimeVoiceAgentPubkey?: string | null;
   /** Called when the user clicks the remove button on an agent avatar. */
   onRemoveAgent?: (pubkey: string) => void;
   /** Interrupts local TTS playback while this agent is speaking. */
@@ -135,6 +137,7 @@ export function HuddleParticipantsControl({
   speakerLevels,
   agentPubkeys,
   agentVoiceSettings,
+  realtimeVoiceAgentPubkey,
   onRemoveAgent,
   onInterruptAgentSpeech,
   selfProfile,
@@ -320,6 +323,7 @@ export function HuddleParticipantsControl({
                     [participant.pubkey]: settings,
                   }));
                 }}
+                realtimeVoiceAgentPubkey={realtimeVoiceAgentPubkey}
                 registry={voiceRegistry}
                 settings={resolvedAgentVoiceSettings[participant.pubkey]}
               />
@@ -368,6 +372,7 @@ export function HuddleParticipantsControl({
                 [participant.pubkey]: settings,
               }));
             }}
+            realtimeVoiceAgentPubkey={realtimeVoiceAgentPubkey}
             registry={voiceRegistry}
             settings={resolvedAgentVoiceSettings[participant.pubkey]}
             trigger={

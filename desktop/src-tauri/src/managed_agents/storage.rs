@@ -3,6 +3,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read as _, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
 };
 
 use tauri::{AppHandle, Manager};
@@ -12,6 +16,44 @@ use crate::managed_agents::{
     ManagedAgentRecord, ManagedAgentRuntimeKey, ManagedAgentRuntimeReceipt,
 };
 use crate::secret_store::{KeyringProbe, SecretStore};
+
+static MANAGED_AGENT_STORE_REVISION: AtomicU64 = AtomicU64::new(0);
+static MANAGED_AGENT_STORE_CHANGES: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
+static MANAGED_AGENT_AUTHORITY_FENCE: OnceLock<Mutex<Option<tokio_util::sync::CancellationToken>>> =
+    OnceLock::new();
+
+fn managed_agent_store_changes() -> &'static tokio::sync::watch::Sender<u64> {
+    MANAGED_AGENT_STORE_CHANGES.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+
+/// Subscribe before taking an authority snapshot so no successful local store
+/// mutation can be missed between admission and runtime activation.
+pub(crate) fn subscribe_managed_agent_store_changes() -> tokio::sync::watch::Receiver<u64> {
+    managed_agent_store_changes().subscribe()
+}
+
+/// Install the actual-send cancellation gate before reading managed authority.
+pub(crate) fn fence_managed_agent_authority_with(cancel: tokio_util::sync::CancellationToken) {
+    let fence = MANAGED_AGENT_AUTHORITY_FENCE.get_or_init(|| Mutex::new(None));
+    let mut current = fence.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(previous) = current.replace(cancel) {
+        previous.cancel();
+    }
+}
+
+fn signal_managed_agent_store_change() {
+    if let Some(fence) = MANAGED_AGENT_AUTHORITY_FENCE.get() {
+        if let Some(cancel) = fence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            cancel.cancel();
+        }
+    }
+    let revision = MANAGED_AGENT_STORE_REVISION.fetch_add(1, Ordering::AcqRel) + 1;
+    managed_agent_store_changes().send_replace(revision);
+}
 
 /// Keyring key name for an agent's nsec, namespaced from the human identity
 /// key (`"identity"`) which shares the service.
@@ -414,7 +456,9 @@ fn write_agent_store(
     // fallback. Write it owner-only (`0o600`) unconditionally — harmless for the
     // keyring-backed case (it is the user's own agent store) and closes the
     // umask window a post-write `chmod` would leave open.
-    atomic_write_json_restricted(&path, &payload)
+    atomic_write_json_restricted(&path, &payload)?;
+    signal_managed_agent_store_change();
+    Ok(())
 }
 
 /// Write each record's in-memory key to the keyring and blank the inline copy

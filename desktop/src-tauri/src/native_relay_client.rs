@@ -32,6 +32,13 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "native_relay_client_huddle.rs"]
+mod huddle;
+pub(crate) use huddle::HuddleRelaySignal;
+use huddle::{
+    is_current_huddle_subscription, notify_huddle, route_huddle_event, CancelSafeRequestCleanup,
+};
+
 /// Backoff floor for reconnect attempts.
 const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 /// Backoff ceiling. Matches the renderer session's ceiling so a relay outage
@@ -233,6 +240,8 @@ pub(crate) struct RelaySession {
     /// backpressure required by live-only (`limit: 0`) subscriptions: dropping
     /// an event here cannot be repaired by replaying it later.
     archive_events: Arc<Mutex<Option<mpsc::Sender<MatchedEvent>>>>,
+    huddle_events: Arc<Mutex<Option<mpsc::Sender<HuddleRelaySignal>>>>,
+    huddle_media_fence: Arc<Mutex<Option<CancellationToken>>>,
     wake: mpsc::Sender<()>,
     cancel: CancellationToken,
 }
@@ -251,6 +260,7 @@ struct PendingRequest {
 #[derive(Default)]
 struct SessionState {
     desired: Vec<Subscription>,
+    huddle: Option<Subscription>,
     transient: Vec<Subscription>,
     /// Ids whose exact subscription has left `desired` since the last
     /// reconcile drained this. Written here rather than derived at reconcile
@@ -304,6 +314,7 @@ impl RelaySession {
         timeout: Duration,
     ) -> Result<Vec<Event>, String> {
         let id = format!("native-fetch-{}", uuid::Uuid::new_v4());
+        let mut cleanup = CancelSafeRequestCleanup::new(self, id.clone());
         let (complete, result) = oneshot::channel();
         self.requests.lock().await.insert(
             id.clone(),
@@ -330,6 +341,7 @@ impl RelaySession {
             }
         };
         self.finish_request(&id).await;
+        cleanup.disarm();
         outcome
     }
 
@@ -400,6 +412,8 @@ fn start_managed(relay_url: String, keys: Keys, auth_tag: Option<nostr::Tag>) ->
         state: Arc::new(Mutex::new(SessionState::default())),
         requests: Arc::new(Mutex::new(HashMap::new())),
         archive_events: Arc::new(Mutex::new(None)),
+        huddle_events: Arc::new(Mutex::new(None)),
+        huddle_media_fence: Arc::new(Mutex::new(None)),
         wake,
         cancel: CancellationToken::new(),
     });
@@ -436,8 +450,10 @@ async fn run_session(
                 // inherit the previous failure's delay.
                 delay = RECONNECT_BASE_DELAY;
                 run_connection(conn, &session, &mut wake_rx).await;
+                notify_huddle(&session, HuddleRelaySignal::Unavailable).await;
             }
             Err(error) => {
+                notify_huddle(&session, HuddleRelaySignal::Unavailable).await;
                 eprintln!("buzz-desktop: native_relay_client: connect failed: {error}");
             }
         }
@@ -575,6 +591,10 @@ async fn run_connection(
                         // Because this await is outside the session-cancel select,
                         // teardown depends on `run_sync` dropping its receiver; moving
                         // ownership or spawning that teardown can strand the socket loop.
+                        let Some(event) = route_huddle_event(session, &subscription_id, event).await
+                        else {
+                            continue;
+                        };
                         let sender = session.archive_events.lock().await.clone();
                         if let Some(sender) = sender {
                             let _ = sender
@@ -607,6 +627,9 @@ async fn run_connection(
                             let _ = session.wake.try_send(());
                             continue;
                         }
+                        if is_current_huddle_subscription(session, &subscription_id).await {
+                            notify_huddle(session, HuddleRelaySignal::Unavailable).await;
+                        }
                         let retry = retries.entry(subscription_id.clone()).or_default();
                         retry.schedule(&message);
                         eprintln!(
@@ -630,6 +653,9 @@ async fn run_connection(
                             continue;
                         }
                         retries.remove(&subscription_id);
+                        if is_current_huddle_subscription(session, &subscription_id).await {
+                            notify_huddle(session, HuddleRelaySignal::Ready).await;
+                        }
                         // The relay is running a subscription this socket does
                         // not think is open, so the two disagree. EOSE is the
                         // fence that makes this recoverable: frames on one
@@ -683,6 +709,7 @@ async fn reconcile(
             state
                 .desired
                 .iter()
+                .chain(state.huddle.iter())
                 .chain(&state.transient)
                 .cloned()
                 .collect::<Vec<_>>(),

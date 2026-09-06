@@ -2,7 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import * as React from "react";
 
-import { setupAudioWorklet, type AudioWorkletHandle } from "./lib/audioWorklet";
+import {
+  setupAudioWorklet,
+  type AudioWorkletHandle,
+  type CaptureLease,
+} from "./lib/audioWorklet";
 import { type AudioInputDevice, useAudioDevices } from "./lib/useAudioDevices";
 import { usePipelineHotstart } from "./lib/usePipelineHotstart";
 import { formatHuddleActionError } from "./lib/huddleError";
@@ -580,6 +584,9 @@ export function HuddleProvider({
       });
       const audioTrack = stream.getAudioTracks()[0];
 
+      const captureSourceId = crypto.randomUUID();
+      let captureLease: CaptureLease | null = null;
+
       // Wrap post-getUserMedia steps so the stream is always cleaned up on
       // failure — prevents the mic permission light staying on after errors.
       try {
@@ -590,10 +597,15 @@ export function HuddleProvider({
         setLocalAudioTrack(audioTrack);
         setMicConnected(true);
 
-        // Setup AudioWorklet — PCM goes to Rust via push_audio_pcm
+        captureLease = await invoke<CaptureLease>("begin_huddle_capture", {
+          sourceId: captureSourceId,
+        });
+
+        // Setup AudioWorklet — versioned capture PCM goes to Rust.
         audioTrack.enabled = !locallyMutedRef.current;
         const worklet = await setupAudioWorklet(
           audioTrack,
+          captureLease,
           getVoiceInputMode(),
           !isMutedRef.current,
         );
@@ -610,6 +622,11 @@ export function HuddleProvider({
 
         return { worklet, stream };
       } catch (err) {
+        if (captureLease) {
+          void invoke("end_huddle_capture", {
+            sourceId: captureSourceId,
+          }).catch(() => {});
+        }
         // Always stop the mic stream on any failure path.
         stream.getTracks().forEach((t) => {
           t.stop();

@@ -425,6 +425,16 @@ pub(crate) async fn start_auto_enabled_transcription(state: &AppState, ephemeral
 /// pass the `is_some()` check, both construct pipelines, and the loser's thread
 /// leaks ~200MB of ONNX sessions. The sentinel is set under the lock before
 /// releasing it for the expensive construction step.
+fn realtime_compatible_tts_state(huddle: &HuddleState) -> bool {
+    huddle.tts_enabled && !huddle.realtime_voice_active
+}
+
+fn can_publish_tts_pipeline(huddle: &HuddleState) -> bool {
+    realtime_compatible_tts_state(huddle)
+        && matches!(huddle.phase, HuddlePhase::Connected | HuddlePhase::Active)
+        && huddle.tts_pipeline.is_none()
+}
+
 pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, String> {
     if !models::is_tts_ready() {
         return Ok(false); // TTS model not downloaded yet — TTS unavailable.
@@ -440,7 +450,10 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
     // these checks after the fallible work to close the race.
     {
         let huddle = state.huddle()?;
-        if huddle.tts_pipeline.is_some() || !huddle.tts_enabled {
+        if huddle.tts_pipeline.is_some() {
+            return Ok(false);
+        }
+        if !realtime_compatible_tts_state(&huddle) {
             return Ok(false);
         }
     }
@@ -477,7 +490,7 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
         if hs.tts_pipeline.is_some() {
             return Ok(false);
         }
-        if !hs.tts_enabled {
+        if !realtime_compatible_tts_state(&hs) {
             return Ok(false);
         }
         if hs.tts_starting.swap(true, Ordering::AcqRel) {
@@ -573,10 +586,7 @@ fn finalize_tts_pipeline_start(
 ) -> Result<bool, String> {
     let mut huddle = state.huddle()?;
     huddle.tts_starting.store(false, Ordering::Release);
-    if !huddle.tts_enabled
-        || !matches!(huddle.phase, HuddlePhase::Connected | HuddlePhase::Active)
-        || huddle.tts_pipeline.is_some()
-    {
+    if !can_publish_tts_pipeline(&huddle) {
         return Ok(false);
     }
     let app = state

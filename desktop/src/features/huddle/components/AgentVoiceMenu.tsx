@@ -32,6 +32,7 @@ type AgentVoiceMenuProps = {
   contentSide?: React.ComponentProps<typeof PopoverContent>["side"];
   displayName: string;
   onRemoveAgent?: () => void;
+  realtimeVoiceAgentPubkey?: string | null;
   registry: VoiceRegistryEntry[];
   settings: HuddleAgentVoiceSettings | undefined;
   onSettingsChange: (settings: HuddleAgentVoiceSettings) => void;
@@ -45,6 +46,7 @@ export function AgentVoiceMenu({
   contentSide,
   displayName,
   onRemoveAgent,
+  realtimeVoiceAgentPubkey,
   registry,
   settings,
   onSettingsChange,
@@ -53,6 +55,9 @@ export function AgentVoiceMenu({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const voices = voicesForBackend(registry, "pocket");
+  const realtimeActive = realtimeVoiceAgentPubkey === agentPubkey;
+  const anotherRealtimeAgentActive =
+    realtimeVoiceAgentPubkey != null && !realtimeActive;
   const selectedVoice =
     voices.find((voice) => voice.key === settings?.voice_key) ?? voices[0];
 
@@ -80,6 +85,29 @@ export function AgentVoiceMenu({
       }
     },
     [agentPubkey, onSettingsChange],
+  );
+
+  const toggleRealtime = React.useCallback(
+    async (enabled: boolean) => {
+      setBusy(true);
+      setError(null);
+      try {
+        if (enabled) {
+          await invokeTauri("enable_realtime_voice", { agentPubkey });
+        } else {
+          await invokeTauri("disable_realtime_voice");
+        }
+      } catch (updateError) {
+        setError(
+          updateError instanceof Error
+            ? updateError.message
+            : "Realtime voice could not be updated.",
+        );
+      } finally {
+        setBusy(false);
+      }
+    },
+    [agentPubkey],
   );
 
   return (
@@ -163,6 +191,29 @@ export function AgentVoiceMenu({
             </DropdownMenu>
           </div>
         ) : null}
+
+        <Separator />
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between gap-3">
+            <label
+              className="text-sm font-medium"
+              htmlFor={`agent-realtime-${agentPubkey}`}
+            >
+              OpenAI realtime voice
+            </label>
+            <Switch
+              checked={realtimeActive}
+              data-testid="huddle-agent-realtime-toggle"
+              disabled={busy || anotherRealtimeAgentActive}
+              id={`agent-realtime-${agentPubkey}`}
+              onCheckedChange={(enabled) => void toggleRealtime(enabled)}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Sends this device&apos;s live microphone audio to OpenAI while
+            enabled.
+          </p>
+        </div>
 
         {onRemoveAgent ? (
           <>

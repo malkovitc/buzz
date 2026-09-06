@@ -235,6 +235,30 @@ pub fn verify_auth_tag(
     Ok(owner_pubkey)
 }
 
+/// Verify an owner attestation that carries no event restrictions.
+///
+/// VOICE 2 does not publish general agent events through its provider bridge,
+/// so it cannot soundly interpret `kind` or `created_at` restrictions as
+/// realtime-session authority or wall-clock expiry. Restricted attestations
+/// therefore fail closed instead of being silently broadened.
+pub fn verify_unrestricted_auth_tag(
+    auth_tag_json: &str,
+    agent_pubkey: &PublicKey,
+) -> Result<PublicKey, SdkError> {
+    let owner = verify_auth_tag(auth_tag_json, agent_pubkey)?;
+    let arr = parse_json_array(auth_tag_json)?;
+    let conditions = arr
+        .get(2)
+        .and_then(Value::as_str)
+        .ok_or_else(|| SdkError::InvalidInput("auth conditions must be a string".into()))?;
+    if !conditions.is_empty() {
+        return Err(SdkError::InvalidInput(
+            "restricted owner attestations are unsupported for realtime voice".into(),
+        ));
+    }
+    Ok(owner)
+}
+
 /// Parse a NIP-OA `auth` tag JSON string into a [`Tag`] without verifying the
 /// signature.
 ///
@@ -361,6 +385,25 @@ mod tests {
             .expect("verify with empty conditions must succeed");
 
         assert_eq!(recovered, owner_keys.public_key());
+    }
+
+    #[test]
+    fn unrestricted_verification_rejects_every_signed_condition() {
+        let owner_keys = Keys::generate();
+        let agent_pubkey = Keys::generate().public_key();
+        let unrestricted =
+            compute_auth_tag(&owner_keys, &agent_pubkey, "").expect("unrestricted attestation");
+        assert_eq!(
+            verify_unrestricted_auth_tag(&unrestricted, &agent_pubkey)
+                .expect("unrestricted attestation must pass"),
+            owner_keys.public_key()
+        );
+
+        for conditions in ["kind=9", "created_at<4294967295", "created_at>0"] {
+            let restricted = compute_auth_tag(&owner_keys, &agent_pubkey, conditions)
+                .expect("structurally valid restricted attestation");
+            assert!(verify_unrestricted_auth_tag(&restricted, &agent_pubkey).is_err());
+        }
     }
 
     /// Self-attestation (owner == agent) must be rejected at both sign and verify.

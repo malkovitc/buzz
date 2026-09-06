@@ -121,6 +121,10 @@ impl TtsPipeline {
         self.shutdown.store(true, Ordering::Release);
     }
 
+    pub(crate) fn worker_exit_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.worker_exit.clone()
+    }
+
     /// Returns `true` if the worker thread has exited (init failure, crash, or normal exit).
     /// Used by hot-start to detect dead pipelines and clear them for retry.
     pub fn is_finished(&self) -> bool {

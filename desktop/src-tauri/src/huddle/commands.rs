@@ -11,6 +11,10 @@ use super::pipeline::start_auto_enabled_transcription;
 use super::relay_api::MAX_HUDDLE_AGENTS;
 use super::{agents, relay_api::validate_pubkey_hex, HuddlePhase};
 
+fn closes_manual_input_turn(was_enabled: bool, enabled: bool, ptt_active: bool) -> bool {
+    was_enabled && !enabled && !ptt_active
+}
+
 /// Update the clickable microphone control independently from the PTT shortcut.
 #[tauri::command]
 pub fn set_huddle_manual_mic_unmuted(
@@ -21,7 +25,11 @@ pub fn set_huddle_manual_mic_unmuted(
     if !matches!(huddle.phase, HuddlePhase::Connected | HuddlePhase::Active) {
         return Err("no active huddle".to_string());
     }
-    huddle.manual_mic_unmuted.store(enabled, Ordering::Release);
+    let was_enabled = huddle.manual_mic_unmuted.swap(enabled, Ordering::AcqRel);
+    let ptt_active = huddle.ptt_active.load(Ordering::Acquire);
+    if closes_manual_input_turn(was_enabled, enabled, ptt_active) {
+        huddle.end_realtime_voice_input_turn();
+    }
     Ok(())
 }
 

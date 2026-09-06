@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /**
@@ -14,6 +15,57 @@ function invokeRawBinary(cmd: string, payload: Uint8Array): Promise<unknown> {
     return Promise.reject(new Error("Tauri internals not available"));
   }
   return internals.invoke(cmd, payload);
+}
+
+const CAPTURE_ENVELOPE_HEADER_BYTES = 88;
+const CAPTURE_ENVELOPE_VERSION = 1;
+
+export type CaptureLease = {
+  sessionChannelId: string;
+  huddleGeneration: number;
+  captureGeneration: number;
+  sourceId: string;
+  localHumanPubkey: string;
+};
+
+function uuidBytes(value: string): Uint8Array {
+  const compact = value.replaceAll("-", "");
+  if (!/^[0-9a-fA-F]{32}$/.test(compact)) {
+    throw new Error("invalid capture UUID");
+  }
+  return Uint8Array.from(compact.match(/.{2}/g) ?? [], (byte) =>
+    Number.parseInt(byte, 16),
+  );
+}
+
+function pubkeyBytes(value: string): Uint8Array {
+  if (!/^[0-9a-fA-F]{64}$/.test(value)) {
+    throw new Error("invalid capture pubkey");
+  }
+  return Uint8Array.from(value.match(/.{2}/g) ?? [], (byte) =>
+    Number.parseInt(byte, 16),
+  );
+}
+
+function capturedPcmEnvelope(
+  lease: CaptureLease,
+  samples: Float32Array,
+): Uint8Array {
+  const envelope = new Uint8Array(
+    CAPTURE_ENVELOPE_HEADER_BYTES + samples.byteLength,
+  );
+  envelope.set([0x42, 0x5a, 0x50, 0x43, CAPTURE_ENVELOPE_VERSION], 0);
+  envelope.set(uuidBytes(lease.sessionChannelId), 8);
+  const view = new DataView(envelope.buffer);
+  view.setBigUint64(24, BigInt(lease.huddleGeneration));
+  view.setBigUint64(32, BigInt(lease.captureGeneration));
+  envelope.set(uuidBytes(lease.sourceId), 40);
+  envelope.set(pubkeyBytes(lease.localHumanPubkey), 56);
+  envelope.set(
+    new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength),
+    CAPTURE_ENVELOPE_HEADER_BYTES,
+  );
+  return envelope;
 }
 
 /** Return type for setupAudioWorklet — stop + mode control. */
@@ -44,12 +96,14 @@ export type AudioWorkletHandle = {
  *   global shortcut. The worklet sends audio while either path is open and
  *   discards frames only when both are closed.
  *
- * @param audioTrack - Mic track from LiveKit
+ * @param audioTrack - Local microphone track.
+ * @param captureLease - Backend-issued identity for this exact capture source.
  * @param initialMode - Whether the push-to-talk shortcut is enabled.
  * @param initiallyManuallyUnmuted - Initial state of the clickable mic control.
  */
 export async function setupAudioWorklet(
   audioTrack: MediaStreamTrack,
+  captureLease: CaptureLease,
   initialMode: "push_to_talk" | "voice_activity" = "voice_activity",
   initiallyManuallyUnmuted = true,
 ): Promise<AudioWorkletHandle> {
@@ -93,11 +147,9 @@ export async function setupAudioWorklet(
     const float32 = event.data;
     // Fire-and-forget — Rust side uses try_send which drops on backpressure.
     // No await: prevents main-thread backpressure from slow Rust processing.
-    // Create a zero-copy Uint8Array view over the same underlying buffer.
-    // Rust reinterprets the bytes as f32 on the other side.
     invokeRawBinary(
       "push_audio_pcm",
-      new Uint8Array(float32.buffer, float32.byteOffset, float32.byteLength),
+      capturedPcmEnvelope(captureLease, float32),
     ).catch(() => {
       /* silently drop — Rust handles backpressure */
     });
@@ -124,6 +176,9 @@ export async function setupAudioWorklet(
   return {
     stop: () => {
       workletNode.port.onmessage = null;
+      void invoke("end_huddle_capture", {
+        sourceId: captureLease.sourceId,
+      }).catch(() => {});
       pttUnlisten?.();
       source.disconnect();
       gainNode.disconnect();

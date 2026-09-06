@@ -830,3 +830,13 @@ fn install_log_filename_accepts_ordinary_runtime_ids() {
         );
     }
 }
+
+#[test]
+fn store_mutation_synchronously_closes_the_installed_authority_fence() {
+    let fence = tokio_util::sync::CancellationToken::new();
+    super::fence_managed_agent_authority_with(fence.clone());
+
+    super::signal_managed_agent_store_change();
+
+    assert!(fence.is_cancelled());
+}

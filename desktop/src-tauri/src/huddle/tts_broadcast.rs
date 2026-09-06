@@ -118,7 +118,7 @@ impl TtsAudioPublisher {
         self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.cancel.cancel();
     }
 }

@@ -28,6 +28,7 @@ mod agent_tts_routing;
 pub mod agent_voice;
 pub mod agents;
 pub mod audio_output;
+mod capture;
 mod commands;
 mod human_floor;
 pub mod jitter;
@@ -39,6 +40,13 @@ pub mod pipeline;
 pub mod playout;
 pub mod pocket;
 pub mod preprocessing;
+#[cfg(test)]
+mod realtime_latency;
+mod realtime_openai;
+mod realtime_publisher;
+mod realtime_runtime;
+pub(crate) use realtime_runtime::{disable_realtime_voice, enable_realtime_voice};
+pub(crate) mod realtime_voice;
 pub mod reconnect;
 pub mod relay_api;
 pub mod state;
@@ -75,6 +83,7 @@ pub(super) fn drain_until_shutdown<T>(
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
+pub use capture::{begin_huddle_capture, end_huddle_capture, push_audio_pcm};
 pub use commands::{
     add_agent_to_huddle, interrupt_huddle_speech, remove_agent_from_huddle,
     set_huddle_manual_mic_unmuted,
@@ -138,9 +147,13 @@ pub async fn set_voice_input_mode(
     let needs_restart = {
         let mut hs = state.huddle()?;
         let old_mode = hs.voice_input_mode.clone();
+        let mode_changed = old_mode != mode;
         hs.voice_input_mode = mode.clone();
+        if mode_changed {
+            hs.end_realtime_voice();
+        }
         // Restart STT if mode changed and a huddle is active with a pipeline running.
-        old_mode != mode
+        mode_changed
             && matches!(hs.phase, HuddlePhase::Connected | HuddlePhase::Active)
             && hs.stt_pipeline.is_some()
             && hs.transcription_enabled
@@ -731,45 +744,6 @@ pub async fn get_huddle_agent_pubkeys(state: State<'_, AppState>) -> Result<Vec<
     match eph_id {
         Some(id) => fetch_channel_members(&id, Some("bot"), &state).await,
         None => Ok(Vec::new()),
-    }
-}
-
-/// Maximum IPC audio batch size: 100 KB.
-/// A 100 ms batch at 48 kHz mono f32 is ~19 KB; 100 KB allows headroom
-/// without letting a malformed IPC call allocate unbounded memory.
-const MAX_AUDIO_BATCH_BYTES: usize = 100 * 1024;
-
-/// Receive raw PCM audio bytes from the AudioWorklet and feed the STT pipeline.
-///
-/// Expects a raw binary body of f32 LE samples at 48 kHz mono.
-/// If no STT pipeline is active, the bytes are silently discarded.
-#[tauri::command]
-pub fn push_audio_pcm(
-    request: tauri::ipc::Request<'_>,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    match request.body() {
-        tauri::ipc::InvokeBody::Raw(bytes) => {
-            if bytes.len() > MAX_AUDIO_BATCH_BYTES {
-                return Err(format!(
-                    "audio batch too large: {} bytes (max {})",
-                    bytes.len(),
-                    MAX_AUDIO_BATCH_BYTES
-                ));
-            }
-            if let Ok(hs) = state.huddle() {
-                // Fan out to STT pipeline.
-                if let Some(ref pipeline) = hs.stt_pipeline {
-                    pipeline.push_audio(bytes.to_vec())?;
-                }
-                // Fan out to audio relay encoder (best-effort, non-blocking).
-                if let Some(ref pcm_tx) = hs.audio_relay_pcm_tx {
-                    let _ = pcm_tx.try_send(bytes.to_vec());
-                }
-            }
-            Ok(())
-        }
-        _ => Err("expected raw binary body".to_string()),
     }
 }
 

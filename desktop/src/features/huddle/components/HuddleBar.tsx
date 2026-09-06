@@ -52,6 +52,8 @@ type HuddleState = {
   agent_voice_settings: Record<string, HuddleAgentVoiceSettings>;
   tts_enabled: boolean;
   transcription_enabled: boolean;
+  realtime_voice_active: boolean;
+  realtime_voice_agent_pubkey: string | null;
   is_creator: boolean;
   voice_input_mode: "push_to_talk" | "voice_activity";
 };
@@ -703,6 +705,11 @@ export function HuddleBar({
               speakerLevels={participantSpeakerLevels}
               agentPubkeys={barState.agent_pubkeys}
               agentVoiceSettings={barState.agent_voice_settings}
+              realtimeVoiceAgentPubkey={
+                barState.realtime_voice_active
+                  ? barState.realtime_voice_agent_pubkey
+                  : null
+              }
               selfProfile={{
                 avatarUrl:
                   profileQuery.data?.avatarUrl ??
