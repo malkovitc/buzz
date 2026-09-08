@@ -590,8 +590,7 @@ fn is_private_regular_file(metadata: &std::fs::Metadata) -> bool {
 #[cfg(unix)]
 fn is_owned_by_effective_user(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
-    // SAFETY: geteuid(2) has no preconditions and only reads process identity.
-    metadata.uid() == unsafe { libc::geteuid() }
+    metadata.uid() == nix::unistd::geteuid().as_raw()
 }
 
 #[cfg(not(unix))]
