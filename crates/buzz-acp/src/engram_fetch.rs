@@ -28,6 +28,14 @@ pub const ONBOARDING_NUDGE: &str = "No core memory found. \
 Use `buzz mem set core \"…\"` to create one (it will hold your identity, \
 rules, and goals across sessions). Ask your user about yourself.";
 
+/// Render a core-memory result using the harness's current prompt framing.
+pub fn render_core_section(profile: Option<String>) -> Option<String> {
+    Some(format!(
+        "[{SECTION_LABEL}]\n{}",
+        profile.as_deref().unwrap_or(ONBOARDING_NUDGE)
+    ))
+}
+
 /// Build the rendered prompt section for the agent's core.
 ///
 /// Returns:
@@ -42,8 +50,7 @@ pub async fn build_core_section(
     owner: &PublicKey,
 ) -> Option<String> {
     match fetch_core_body(rest, agent_keys, owner).await {
-        Ok(Some(profile)) => Some(format!("[{SECTION_LABEL}]\n{profile}")),
-        Ok(None) => Some(format!("[{SECTION_LABEL}]\n{ONBOARDING_NUDGE}")),
+        Ok(profile) => render_core_section(profile),
         Err(reason) => {
             tracing::warn!(
                 target: "engram::core",

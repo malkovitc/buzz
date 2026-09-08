@@ -34,6 +34,8 @@ use crate::acp::{
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
     ModelSwitchMethod, StopReason, SystemPromptTransport,
 };
+use buzz_broker_client::AuthorityFence;
+
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
 use crate::queue::{
@@ -41,6 +43,7 @@ use crate::queue::{
     PromptChannelInfo, PromptProfile, PromptProfileLookup, ThreadTags,
 };
 use crate::relay::{ChannelInfo, RestClient};
+use crate::runtime_transport::BrokerActions;
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -582,7 +585,7 @@ pub enum PromptOutcome {
 #[derive(Debug, Clone)]
 pub struct ChannelInfoResolver {
     cache: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, PromptChannelInfo>>>,
-    rest_client: RestClient,
+    rest_client: Option<RestClient>,
 }
 
 impl ChannelInfoResolver {
@@ -605,7 +608,28 @@ impl ChannelInfoResolver {
             .collect();
         Self {
             cache: std::sync::Arc::new(std::sync::RwLock::new(cache)),
-            rest_client,
+            rest_client: Some(rest_client),
+        }
+    }
+
+    /// Build a resolver that never falls back to a direct relay metadata read.
+    pub fn without_fallback(startup: std::collections::HashMap<Uuid, ChannelInfo>) -> Self {
+        let cache = startup
+            .into_iter()
+            .filter_map(|(id, info)| {
+                (info.channel_type != "unknown").then_some((
+                    id,
+                    PromptChannelInfo {
+                        name: info.name,
+                        channel_type: info.channel_type,
+                        description: info.description,
+                    },
+                ))
+            })
+            .collect();
+        Self {
+            cache: std::sync::Arc::new(std::sync::RwLock::new(cache)),
+            rest_client: None,
         }
     }
 
@@ -618,8 +642,8 @@ impl ChannelInfoResolver {
         {
             return Some(info);
         }
-
-        let info = fetch_channel_info(channel_id, &self.rest_client).await?;
+        let rest_client = self.rest_client.as_ref()?;
+        let info = fetch_channel_info(channel_id, rest_client).await?;
         if let Ok(mut cache) = self.cache.write() {
             cache.insert(channel_id, info.clone());
         }
@@ -653,6 +677,14 @@ pub struct PromptContext {
     /// (`include_str!`) is inherently `'static`.
     pub base_prompt: Option<&'static str>,
     pub cwd: String,
+    /// Whether direct relay-only enrichments and housekeeping are available.
+    /// False in broker mode, where the runtime has no relay route.
+    pub relay_features_enabled: bool,
+    /// Broker-backed features that replace direct relay operations in keyless
+    /// mode. `None` for local mode.
+    pub broker_actions: Option<BrokerActions>,
+    /// Exact host-derived generation permit checked before every prompt.
+    pub authority_fence: Option<AuthorityFence>,
     /// REST client for pre-prompt context fetches (thread/DM history).
     pub rest_client: RestClient,
     /// Shared channel metadata for startup-known and dynamically joined channels.
@@ -1194,6 +1226,9 @@ async fn create_session_and_apply_model(
         ctx.session_title.as_deref(),
     );
 
+    // Context assembly can involve network I/O. Fence at the actual session
+    // creation boundary rather than relying only on the turn's entry snapshot.
+    require_prompt_authority(ctx).await?;
     let resp = agent
         .acp
         .session_new_full(
@@ -1880,6 +1915,16 @@ fn send_prompt_result(
     });
 }
 
+async fn require_prompt_authority(ctx: &PromptContext) -> Result<(), AcpError> {
+    let Some(authority) = ctx.authority_fence.as_ref() else {
+        return Ok(());
+    };
+    authority
+        .permit()
+        .await
+        .map_err(|error| AcpError::Protocol(error.to_string()))
+}
+
 /// Core async function spawned for each prompt.
 ///
 /// Lifecycle:
@@ -1908,6 +1953,17 @@ pub async fn run_prompt_task(
         Some(b) => PromptSource::Channel(b.channel_id),
         None => PromptSource::Heartbeat,
     };
+    if let Err(error) = require_prompt_authority(&ctx).await {
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Error(error),
+            batch,
+        );
+        return;
+    }
     let observer_channel_id = match &source {
         PromptSource::Channel(channel_id) => Some(*channel_id),
         PromptSource::Heartbeat => None,
@@ -1982,7 +2038,10 @@ pub async fn run_prompt_task(
     }));
     let liveness = run_turn_liveness(
         agent.acp.observer_handle(),
+        ctx.broker_actions.clone(),
         agent.acp.observer_agent_index(),
+        observer_channel_id,
+        turn_id.clone(),
         observer::context_for_turn(
             observer_channel_id,
             None,
@@ -2003,7 +2062,9 @@ pub async fn run_prompt_task(
         .as_ref()
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
-    let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
+    let _reaction_guard = ctx
+        .relay_features_enabled
+        .then(|| ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone()));
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -2031,19 +2092,43 @@ pub async fn run_prompt_task(
     //
     // Operator opt-out: `--no-memory` / `BUZZ_ACP_NO_MEMORY` skips the fetch.
     if ctx.memory_enabled {
-        if let (PromptSource::Channel(cid), Some(owner_pk)) =
-            (&source, ctx.agent_owner_pubkey.as_ref())
-        {
+        if let PromptSource::Channel(cid) = &source {
             let is_new_channel_session = !agent.state.sessions.contains_key(cid);
             if is_new_channel_session && !agent.state.core_sections.contains_key(cid) {
                 // Bounded — we'd rather start the session with no core hint
                 // than block session creation on a stalled relay.
                 const CORE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-                let fetch = crate::engram_fetch::build_core_section(
-                    &ctx.rest_client,
-                    &ctx.agent_keys,
-                    owner_pk,
-                );
+                let fetch = async {
+                    if let Some(broker) = ctx.broker_actions.as_ref() {
+                        match broker
+                            .storage_get(buzz_core::engram::CORE_SLUG.to_string())
+                            .await
+                        {
+                            Ok(record) => crate::engram_fetch::render_core_section(record.value),
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "engram::core",
+                                    "broker core fetch failed: {error} — emitting no section"
+                                );
+                                None
+                            }
+                        }
+                    } else if ctx.relay_features_enabled {
+                        match ctx.agent_owner_pubkey.as_ref() {
+                            Some(owner_pk) => {
+                                crate::engram_fetch::build_core_section(
+                                    &ctx.rest_client,
+                                    &ctx.agent_keys,
+                                    owner_pk,
+                                )
+                                .await
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    }
+                };
                 let section = match tokio::time::timeout(CORE_FETCH_TIMEOUT, fetch).await {
                     Ok(s) => s,
                     Err(_) => {
@@ -2095,13 +2180,15 @@ pub async fn run_prompt_task(
                 resolve_new_session_channel_context(&ctx.channel_info, *cid).await;
             title_channel = resolved_channel;
             origin_channel_type = resolved_channel_type;
-            if let Some(owner) = ctx.agent_owner_pubkey.as_ref() {
-                huddle_instructions =
-                    fetch_huddle_instructions(*cid, owner, &ctx.rest_client).await;
+            if ctx.relay_features_enabled {
+                if let Some(owner) = ctx.agent_owner_pubkey.as_ref() {
+                    huddle_instructions =
+                        fetch_huddle_instructions(*cid, owner, &ctx.rest_client).await;
+                }
             }
             // A confirmed DM never receives a canvas section; an undeterminable
             // channel type fails closed as a DM for the same reason.
-            if needs_canvas && !is_dm {
+            if ctx.relay_features_enabled && needs_canvas && !is_dm {
                 if let Some(section) = fetch_canvas_section(*cid, &ctx.rest_client).await {
                     pending_canvas = Some((*cid, section));
                 }
@@ -2340,6 +2427,18 @@ pub async fn run_prompt_task(
                 &standing,
                 initial_msg,
             );
+            if let Err(error) = require_prompt_authority(&ctx).await {
+                agent.state.invalidate(&source);
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(error),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
             let init_result = agent
                 .acp
                 .session_prompt_with_idle_timeout(
@@ -2625,8 +2724,11 @@ pub async fn run_prompt_task(
             conversation_context.as_ref(),
         ));
 
-        let profile_lookup =
-            fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
+        let profile_lookup = if ctx.relay_features_enabled {
+            fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await
+        } else {
+            None
+        };
         buzz_prompt_metadata = crate::prompt_metadata::for_batch(
             b,
             channel_info.as_ref(),
@@ -2715,7 +2817,7 @@ pub async fn run_prompt_task(
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
     // A brief race where 💬 appears slightly after the agent starts is acceptable.
-    if !reaction_ids.is_empty() {
+    if ctx.relay_features_enabled && !reaction_ids.is_empty() {
         let rest = ctx.rest_client.clone();
         let ids = reaction_ids.clone();
         tokio::spawn(async move {
@@ -2768,6 +2870,21 @@ pub async fn run_prompt_task(
         "turn starting for {}",
         prompt_label(&source)
     );
+
+    // Context/session setup may be slow. Revalidate at the actual prompt
+    // boundary so an authority cutover during preparation cannot admit either
+    // an initial message or a restored-session turn.
+    if let Err(error) = require_prompt_authority(&ctx).await {
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Error(error),
+            batch,
+        );
+        return;
+    }
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
@@ -3803,6 +3920,9 @@ async fn fetch_conversation_context(
     channel_info: &Option<PromptChannelInfo>,
     ctx: &PromptContext,
 ) -> Option<ConversationContext> {
+    if !ctx.relay_features_enabled {
+        return None;
+    }
     let limit = ctx.context_message_limit;
     let is_dm = channel_info
         .as_ref()
@@ -4712,21 +4832,27 @@ impl Drop for ReactionGuard {
 // by `run_prompt_task` after session resolution — so pings emitted for the
 // remainder of the turn carry the real session, matching every other
 // observer frame for this turn instead of a permanent `None`.
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_liveness(
     observer: Option<observer::ObserverHandle>,
+    broker: Option<BrokerActions>,
     agent_index: Option<usize>,
+    channel_id: Option<Uuid>,
+    turn_id: String,
     mut context: observer::ObserverContext,
     interval: Duration,
     state: Arc<Mutex<LivenessState>>,
     association_event_ids: Arc<Mutex<Vec<String>>>,
 ) {
-    let Some(observer) = observer else {
+    let has_liveness_route = observer.is_some() || broker.is_some();
+    if !has_liveness_route {
         return std::future::pending::<()>().await;
-    };
+    }
     if interval.is_zero() {
         return std::future::pending::<()>().await;
     }
     let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // The first tick completes immediately; skip it so the first liveness ping
     // fires one interval after the turn starts, not at t=0 (turn_started already
     // marks t=0).
@@ -4736,25 +4862,35 @@ async fn run_turn_liveness(
         // Nothing awaitable between the lock and the emit: `LivenessGuard::drop`
         // takes this same lock before its `abort()`, so the guard can only ever
         // observe this tick fully emitted or not yet started — never mid-emit.
-        let guard = match state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if guard.closed {
-            return;
+        {
+            let guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if guard.closed {
+                return;
+            }
+            context.session_id = guard.session_id.clone();
+            if broker.is_none() {
+                if let Some(observer) = observer.as_ref() {
+                    let associations = match association_event_ids.lock() {
+                        Ok(ids) => ids.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
+                    };
+                    observer.emit(
+                        "turn_liveness",
+                        agent_index,
+                        &context,
+                        serde_json::json!({ "associationEventIds": associations }),
+                    );
+                }
+            }
         }
-        context.session_id = guard.session_id.clone();
-        let associations = match association_event_ids.lock() {
-            Ok(ids) => ids.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        observer.emit(
-            "turn_liveness",
-            agent_index,
-            &context,
-            serde_json::json!({ "associationEventIds": associations }),
-        );
-        drop(guard);
+        if let (Some(broker), Some(channel_id)) = (broker.as_ref(), channel_id) {
+            if let Err(error) = broker.liveness_ping(channel_id, turn_id.clone()).await {
+                tracing::debug!(%channel_id, "broker liveness ping dropped: {error}");
+            }
+        }
     }
 }
 
@@ -5251,6 +5387,8 @@ mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
+
+    mod authority_tests;
 
     fn test_mcp_server() -> McpServer {
         McpServer {
@@ -7751,7 +7889,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             let _liveness_guard = LivenessGuard::new(
                 tokio::spawn(run_turn_liveness(
                     Some(observer.clone()),
+                    None,
                     Some(0),
+                    None,
+                    "turn".into(),
                     context,
                     Duration::from_secs(10),
                     Arc::clone(&state),
@@ -7803,7 +7944,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let guard = LivenessGuard::new(
             tokio::spawn(run_turn_liveness(
                 Some(observer.clone()),
+                None,
                 Some(0),
+                None,
+                "turn".into(),
                 context,
                 Duration::from_secs(10),
                 Arc::clone(&state),
@@ -7864,7 +8008,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let guard = LivenessGuard::new(
             tokio::spawn(run_turn_liveness(
                 Some(observer.clone()),
+                None,
                 Some(0),
+                None,
+                "turn".into(),
                 context,
                 Duration::from_secs(10),
                 Arc::clone(&state),
@@ -7907,7 +8054,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let context = observer::context_for(None, None, Some("t-1".into()));
         let liveness = run_turn_liveness(
             Some(observer.clone()),
+            None,
             Some(0),
+            None,
+            "turn".into(),
             context,
             Duration::ZERO,
             open_liveness_state(),
@@ -7932,6 +8082,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let liveness = run_turn_liveness(
             None,
             None,
+            None,
+            None,
+            "turn".into(),
             context,
             Duration::from_secs(10),
             open_liveness_state(),
@@ -7971,7 +8124,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         }));
         let liveness = run_turn_liveness(
             Some(observer.clone()),
+            None,
             Some(0),
+            None,
+            "turn".into(),
             context,
             Duration::from_secs(10),
             state,
@@ -8596,6 +8752,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             heartbeat_prompt: None,
             base_prompt: None,
             cwd: ".".to_string(),
+            relay_features_enabled: true,
+            broker_actions: None,
+            authority_fence: None,
             rest_client: RestClient {
                 http: reqwest::Client::new(),
                 base_url: "http://127.0.0.1:0".to_string(),
@@ -9062,6 +9221,44 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let mut event_tags = vec![json!(["d", id.to_string()])];
         event_tags.extend(tags.iter().map(|[k, v]| json!([k, v])));
         json!([{ "tags": event_tags }])
+    }
+
+    #[tokio::test]
+    async fn broker_resolver_uses_known_metadata_without_a_relay_fallback() {
+        let known_id = Uuid::new_v4();
+        let unknown_id = Uuid::new_v4();
+        let resolver = ChannelInfoResolver::without_fallback(
+            [
+                (
+                    known_id,
+                    crate::relay::ChannelInfo {
+                        name: "known".into(),
+                        channel_type: "stream".into(),
+                        description: None,
+                    },
+                ),
+                (
+                    unknown_id,
+                    crate::relay::ChannelInfo {
+                        name: "unknown".into(),
+                        channel_type: "unknown".into(),
+                        description: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert_eq!(
+            resolver
+                .resolve(known_id)
+                .await
+                .expect("known metadata")
+                .name,
+            "known"
+        );
+        assert!(resolver.resolve(unknown_id).await.is_none());
     }
 
     /// A normal channel yields a non-DM (canvas allowed) and its name for the

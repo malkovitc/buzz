@@ -314,6 +314,8 @@ test-unit:
     set -euo pipefail
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
+        # Broker contracts are shared by every broker client and host.
+        cargo nextest run -p buzz-sdk
         cargo nextest run -p buzz-voice --lib
         cargo nextest run -p buzz-cli
         # buzz-db migrator/lint tests: pure SQL-parsing unit tests (no infra).
