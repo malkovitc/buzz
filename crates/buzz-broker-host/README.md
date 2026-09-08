@@ -6,8 +6,9 @@ other broker action is rejected as unsupported until atomic action commit is
 implemented in a later slice.
 
 The host stores canonical authority identities, lifecycle state, credential
-hashes, and request receipts in SQLite. It never stores or prints the raw bearer.
-The database must be an absolute path inside an owner-only directory. The HTTP
+hashes, and bounded request receipts in SQLite. It never stores or prints the
+raw bearer. On Unix, the database and its owner-only directory must belong to
+the broker's effective user. The database path must be absolute. The HTTP
 listener is loopback-only, so a colocated runtime can use plaintext without
 publishing its bearer.
 
@@ -37,8 +38,10 @@ buzz-broker-host --state /var/lib/buzz-broker/authority.db fence \
 ```
 
 Fencing is monotonic and idempotent. A fenced exact generation cannot be
-reissued. The bearer remains recognizable only so a fresh `authority.status`
-can return the terminal `fenced` verdict; it cannot regain active authority.
+reissued. Fencing atomically invalidates prior status receipts so a lost
+pre-fence `active` response can never be replayed after the transition. The
+bearer remains recognizable only so a fresh `authority.status` can return the
+terminal `fenced` verdict; it cannot regain active authority.
 
 ## Serve
 
@@ -50,6 +53,12 @@ buzz-broker-host --state /var/lib/buzz-broker/authority.db serve \
 Non-loopback binds are rejected. Point `BUZZ_BROKER_URL` at the loopback origin,
 read `BUZZ_BROKER_CREDENTIAL` from the mode-0600 file in the launcher, and pass
 the same canonical authority JSON as `BUZZ_MANAGED_ACP_AUTHORITY`.
+
+The host retains the latest 64 receipts per credential. This bounds polling and
+unsupported-action storage while preserving exact-byte replay for recent
+retries. Eviction is safe in this slice because every served action is
+read-only or rejected; a later effect host requires a separate durable effect
+ledger rather than relying on this bounded read receipt cache.
 
 ## Deliberate boundary
 

@@ -13,6 +13,7 @@ use sqlx::{Connection as _, Row, SqlitePool};
 use crate::credential::CredentialDigest;
 
 const SCHEMA_VERSION: i64 = 1;
+pub(crate) const MAX_RECEIPTS_PER_CREDENTIAL: i64 = 64;
 
 #[derive(Clone)]
 pub(crate) struct AuthorityStore {
@@ -111,11 +112,12 @@ impl AuthorityStore {
         .map_err(|_| StoreError::Unavailable)?;
         sqlx::query(
             "CREATE TABLE broker_receipts (
+                receipt_sequence INTEGER PRIMARY KEY,
                 credential_hash BLOB NOT NULL,
                 request_id TEXT NOT NULL,
                 request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
                 response_json TEXT NOT NULL,
-                PRIMARY KEY (credential_hash, request_id),
+                UNIQUE (credential_hash, request_id),
                 FOREIGN KEY (credential_hash) REFERENCES broker_authorities(credential_hash)
             ) STRICT",
         )
@@ -226,7 +228,7 @@ impl AuthorityStore {
                     "UPDATE broker_authorities SET state = 'fenced'
                      WHERE authority_json = ? AND state = 'active'",
                 )
-                .bind(authority_json)
+                .bind(&authority_json)
                 .execute(&mut *transaction)
                 .await
                 .map_err(|_| StoreError::Unavailable)?;
@@ -234,6 +236,7 @@ impl AuthorityStore {
             Some(_) => return Err(StoreError::Integrity),
             None => return Err(StoreError::AuthorityNotFound),
         }
+        invalidate_authority_receipts(&mut transaction, &authority_json).await?;
         transaction
             .commit()
             .await
@@ -312,12 +315,53 @@ impl AuthorityStore {
         .execute(&mut *transaction)
         .await
         .map_err(|_| StoreError::Conflict)?;
+        prune_receipts(&mut transaction, credential).await?;
         transaction
             .commit()
             .await
             .map_err(|_| StoreError::Unavailable)?;
         Ok(response)
     }
+}
+
+async fn invalidate_authority_receipts(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    authority_json: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "DELETE FROM broker_receipts
+         WHERE credential_hash = (
+             SELECT credential_hash FROM broker_authorities WHERE authority_json = ?
+         )",
+    )
+    .bind(authority_json)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| StoreError::Unavailable)?;
+    Ok(())
+}
+
+async fn prune_receipts(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    credential: &CredentialDigest,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "DELETE FROM broker_receipts
+         WHERE credential_hash = ?
+           AND receipt_sequence NOT IN (
+               SELECT receipt_sequence FROM broker_receipts
+               WHERE credential_hash = ?
+               ORDER BY receipt_sequence DESC
+               LIMIT ?
+           )",
+    )
+    .bind(credential.as_bytes())
+    .bind(credential.as_bytes())
+    .bind(MAX_RECEIPTS_PER_CREDENTIAL)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| StoreError::Unavailable)?;
+    Ok(())
 }
 
 async fn require_canonical_authority_state(
@@ -479,11 +523,16 @@ fn validate_state_path(path: &Path) -> Result<(), StoreError> {
 
 #[cfg(unix)]
 fn require_private_directory(metadata: &std::fs::Metadata) -> Result<(), StoreError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    if metadata.permissions().mode() & 0o077 != 0 {
+    if !is_private_owned_directory(metadata) {
         return Err(StoreError::InsecureDirectory);
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_private_owned_directory(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    metadata.permissions().mode() & 0o077 == 0 && is_owned_by_effective_user(metadata)
 }
 
 #[cfg(not(unix))]
@@ -533,7 +582,16 @@ fn require_private_file(path: &Path) -> Result<(), StoreError> {
 #[cfg(unix)]
 fn is_private_regular_file(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
-    metadata.is_file() && metadata.permissions().mode() & 0o077 == 0
+    metadata.is_file()
+        && metadata.permissions().mode() & 0o077 == 0
+        && is_owned_by_effective_user(metadata)
+}
+
+#[cfg(unix)]
+fn is_owned_by_effective_user(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    // SAFETY: geteuid(2) has no preconditions and only reads process identity.
+    metadata.uid() == unsafe { libc::geteuid() }
 }
 
 #[cfg(not(unix))]
@@ -551,9 +609,10 @@ fn require_private_file(path: &Path) -> Result<(), StoreError> {
 pub(crate) enum StoreError {
     #[error("broker state path is invalid")]
     InvalidPath,
-    #[error("broker state directory must be owner-only")]
+    #[cfg(unix)]
+    #[error("broker state directory must be owned by this process user and owner-only")]
     InsecureDirectory,
-    #[error("broker state file must be owner-only")]
+    #[error("broker state file must be owned by this process user and owner-only")]
     InsecureFile,
     #[error("broker state is unavailable")]
     Unavailable,

@@ -316,6 +316,8 @@ test-unit:
         cargo nextest run -p buzz-core -p buzz-auth --lib
         # Broker contracts are shared by every broker client and host.
         cargo nextest run -p buzz-sdk
+        # Durable authority lifecycle, receipt, and secret-boundary regressions.
+        cargo nextest run -p buzz-broker-host
         cargo nextest run -p buzz-voice --lib
         cargo nextest run -p buzz-cli
         # buzz-db migrator/lint tests: pure SQL-parsing unit tests (no infra).

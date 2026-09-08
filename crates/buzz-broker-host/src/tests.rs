@@ -8,7 +8,7 @@ use buzz_sdk::broker::{
 use tempfile::TempDir;
 
 use crate::issuer::{fence_from_file, issue_to_file, IssuerError};
-use crate::store::{AuthorityStore, StoreError};
+use crate::store::{AuthorityStore, StoreError, MAX_RECEIPTS_PER_CREDENTIAL};
 
 const PUBKEY: &str = "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971";
 const TASK_ID: &str = "40b68c08-ed45-4c4b-a1d8-e46d6478d642";
@@ -302,11 +302,18 @@ async fn request_receipts_replay_exact_bytes_and_reject_conflicts() {
     fence_from_file(&store, &fixture.authority_file)
         .await
         .expect("authority fenced");
+    let (_, refreshed_body) = send(&base_url, &credential, request.body()).await;
+    let refreshed: BrokerResponse =
+        serde_json::from_slice(&refreshed_body).expect("refreshed response");
+    assert!(!refreshed.replayed);
+    let refreshed_json = serde_json::to_value(&refreshed).expect("refreshed response serializes");
+    assert_eq!(refreshed_json["outcome"]["state"], "fenced");
+
     let (_, replay_body) = send(&base_url, &credential, request.body()).await;
     let replay: BrokerResponse = serde_json::from_slice(&replay_body).expect("replay response");
     assert!(replay.replayed);
     let replay_json = serde_json::to_value(&replay).expect("replay serializes");
-    assert_eq!(replay_json["outcome"]["state"], "active");
+    assert_eq!(replay_json["outcome"]["state"], "fenced");
 
     let conflicting = BrokerRequest::new(
         "same-id",
@@ -328,6 +335,39 @@ async fn request_receipts_replay_exact_bytes_and_reject_conflicts() {
     let fresh: BrokerResponse = serde_json::from_slice(&fresh_body).expect("fresh response");
     let fresh_json = serde_json::to_value(&fresh).expect("fresh serializes");
     assert_eq!(fresh_json["outcome"]["state"], "fenced");
+    host.abort();
+}
+
+#[tokio::test]
+async fn read_only_receipts_are_bounded_and_recent_retries_still_replay() {
+    let fixture = Fixture::new();
+    let store = AuthorityStore::open(&fixture.state)
+        .await
+        .expect("store opens");
+    let credential = fixture.issue(&store).await;
+    let (base_url, host) = spawn_host(store).await;
+
+    for index in 0..MAX_RECEIPTS_PER_CREDENTIAL + 5 {
+        let request = status_request(&format!("bounded-{index}"));
+        let (status, _) = send(&base_url, &credential, request.body()).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+    }
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(&fixture.state),
+    )
+    .await
+    .expect("receipt inspection opens");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM broker_receipts")
+        .fetch_one(&pool)
+        .await
+        .expect("receipt count");
+    assert_eq!(count, MAX_RECEIPTS_PER_CREDENTIAL);
+    pool.close().await;
+
+    let latest = status_request(&format!("bounded-{}", MAX_RECEIPTS_PER_CREDENTIAL + 4));
+    let (_, replay_body) = send(&base_url, &credential, latest.body()).await;
+    let replay: BrokerResponse = serde_json::from_slice(&replay_body).expect("recent replay");
+    assert!(replay.replayed);
     host.abort();
 }
 
