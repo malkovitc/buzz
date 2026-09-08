@@ -8,16 +8,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use buzz_broker_client::HttpBrokerClient;
 use buzz_sdk::broker::{
-    ActionArgs, ActionOutcome, BrokerClientExt, BrokerErrorCode, BrokerRequest, BrokerResult,
-    ChannelReadArgs, EventPublished, LivenessPingArgs, ObserverEmitArgs, ObserverFrame,
-    ObserverReceipt, PresenceSetArgs, StorageAddressArgs, StorageGetArgs, StorageRecord,
-    TypingSetArgs,
+    ActionArgs, ActionOutcome, ChannelReadArgs, EventPublished, LivenessPingArgs, ObserverEmitArgs,
+    ObserverFrame, ObserverReceipt, PresenceSetArgs, StorageAddressArgs, StorageGetArgs,
+    StorageRecord, TypingSetArgs,
 };
 use nostr::{Event, Keys};
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
+
+use buzz_broker_client::AuthorityFence;
 
 use crate::config::ChannelFilter;
 use crate::relay::{
@@ -101,18 +101,20 @@ impl RuntimeSignalPublisher {
 }
 
 pub struct BrokerRuntime {
-    client: HttpBrokerClient,
+    authority: AuthorityFence,
     channel_ids: Vec<Uuid>,
     filters: HashMap<Uuid, ChannelFilter>,
     filter_tx: tokio::sync::watch::Sender<HashMap<Uuid, ChannelFilter>>,
     event_rx: tokio::sync::mpsc::Receiver<BuzzEvent>,
+    authority_loss_rx: Option<tokio::sync::oneshot::Receiver<String>>,
     poll_task: tokio::task::JoinHandle<()>,
     placeholder_keys: Keys,
     terminal_error: Arc<Mutex<Option<String>>>,
 }
 
 struct BrokerPoller {
-    client: HttpBrokerClient,
+    authority: AuthorityFence,
+    authority_loss_tx: Option<tokio::sync::oneshot::Sender<String>>,
     channel_ids: Vec<Uuid>,
     filter_rx: tokio::sync::watch::Receiver<HashMap<Uuid, ChannelFilter>>,
     cursors: HashMap<Uuid, String>,
@@ -126,14 +128,15 @@ struct BrokerPoller {
 /// loop (memory, presence, typing, observer telemetry, and turn liveness).
 #[derive(Clone)]
 pub struct BrokerActions {
-    client: HttpBrokerClient,
+    authority: AuthorityFence,
 }
 
 impl BrokerActions {
     async fn run(&self, args: ActionArgs) -> Result<ActionOutcome, RelayError> {
-        execute(&self.client, args)
+        self.authority
+            .execute(args)
             .await
-            .map_err(BrokerActionError::relay_error)
+            .map_err(|error| RelayError::Http(error.to_string()))
     }
 
     pub async fn storage_get(&self, slug: String) -> Result<StorageRecord, RelayError> {
@@ -218,55 +221,40 @@ fn advance_cursor(
     }
 }
 
-struct BrokerActionError {
-    detail: String,
-    code: Option<BrokerErrorCode>,
-}
-
-impl std::fmt::Display for BrokerActionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.detail)
-    }
-}
-
-impl BrokerActionError {
-    fn relay_error(self) -> RelayError {
-        RelayError::Http(self.detail)
-    }
-}
-
 impl BrokerRuntime {
     pub async fn connect(
-        base_url: String,
-        credential: String,
+        authority: AuthorityFence,
         channel_ids: Vec<Uuid>,
         poll_interval: Duration,
         placeholder_keys: Keys,
     ) -> Result<(Self, String), RelayError> {
-        let client = HttpBrokerClient::new(base_url, credential)
-            .map_err(|error| RelayError::Http(format!("broker config: {error}")))?;
-        let outcome = execute(
-            &client,
-            ActionArgs::StorageAddress(StorageAddressArgs {
+        let outcome = authority
+            .execute(ActionArgs::StorageAddress(StorageAddressArgs {
                 slug: "core".into(),
-            }),
-        )
-        .await
-        .map_err(BrokerActionError::relay_error)?;
+            }))
+            .await
+            .map_err(|error| RelayError::Http(error.to_string()))?;
         let ActionOutcome::StorageAddress(address) = outcome else {
             return Err(RelayError::Http(
                 "broker returned the wrong outcome for storage.address".into(),
             ));
         };
+        if &address.author_pubkey != authority.expected_executor_pubkey() {
+            return Err(RelayError::Http(
+                "broker signing identity does not match managed ACP authority".into(),
+            ));
+        }
         let agent_pubkey = address.author_pubkey.as_str().to_string();
         let mut poll = tokio::time::interval(poll_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let filters = HashMap::new();
         let (filter_tx, filter_rx) = tokio::sync::watch::channel(filters.clone());
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+        let (authority_loss_tx, authority_loss_rx) = tokio::sync::oneshot::channel();
         let terminal_error = Arc::new(Mutex::new(None));
         let poller = BrokerPoller {
-            client: client.clone(),
+            authority: authority.clone(),
+            authority_loss_tx: Some(authority_loss_tx),
             channel_ids: channel_ids.clone(),
             filter_rx,
             cursors: HashMap::new(),
@@ -278,11 +266,12 @@ impl BrokerRuntime {
         let poll_task = tokio::spawn(poller.run(event_tx));
         Ok((
             Self {
-                client,
+                authority,
                 channel_ids,
                 filters,
                 filter_tx,
                 event_rx,
+                authority_loss_rx: Some(authority_loss_rx),
                 poll_task,
                 placeholder_keys,
                 terminal_error,
@@ -303,6 +292,10 @@ impl BrokerRuntime {
     async fn next_event(&mut self) -> Option<BuzzEvent> {
         self.event_rx.recv().await
     }
+
+    fn take_authority_loss_rx(&mut self) -> Option<tokio::sync::oneshot::Receiver<String>> {
+        self.authority_loss_rx.take()
+    }
 }
 
 impl Drop for BrokerRuntime {
@@ -312,6 +305,15 @@ impl Drop for BrokerRuntime {
 }
 
 impl BrokerPoller {
+    fn terminate(&mut self, message: String) {
+        if let Ok(mut terminal) = self.terminal_error.lock() {
+            *terminal = Some(message.clone());
+        }
+        if let Some(tx) = self.authority_loss_tx.take() {
+            let _ = tx.send(message);
+        }
+    }
+
     fn remember(&mut self, event_id: String) -> bool {
         if self.seen_current.contains(&event_id) || self.seen_previous.contains(&event_id) {
             return false;
@@ -326,6 +328,10 @@ impl BrokerPoller {
     async fn run(mut self, event_tx: tokio::sync::mpsc::Sender<BuzzEvent>) {
         loop {
             self.poll.tick().await;
+            if let Err(error) = self.authority.permit().await {
+                self.terminate(error.to_string());
+                return;
+            }
             let filters = self.filter_rx.borrow().clone();
             let subscriptions: Vec<(Uuid, bool)> = self
                 .channel_ids
@@ -337,32 +343,25 @@ impl BrokerPoller {
                 })
                 .collect();
             for (channel_id, mentions_only) in subscriptions {
-                let result = execute(
-                    &self.client,
-                    ActionArgs::ChannelRead(ChannelReadArgs {
+                let result = self
+                    .authority
+                    .execute(ActionArgs::ChannelRead(ChannelReadArgs {
                         channel_id: channel_id.to_string(),
                         root_event_id: None,
                         mentions_only,
                         cursor: self.cursors.get(&channel_id).cloned(),
                         limit: Some(100),
-                    }),
-                )
-                .await;
+                    }))
+                    .await;
                 let page = match result {
                     Ok(ActionOutcome::ChannelRead(page)) => page,
                     Ok(_) => {
                         tracing::warn!(%channel_id, "broker returned the wrong channel.read outcome");
                         continue;
                     }
-                    Err(error) if error.code == Some(BrokerErrorCode::Unauthenticated) => {
-                        tracing::error!(%channel_id, "broker credential was rejected: {error}");
-                        *self.terminal_error.lock().expect("terminal error lock") =
-                            Some(error.to_string());
-                        return;
-                    }
                     Err(error) => {
-                        tracing::warn!(%channel_id, "broker channel.read failed: {error}");
-                        continue;
+                        self.terminate(error.to_string());
+                        return;
                     }
                 };
                 // `nextCursor` is a pagination continuation, not a durable
@@ -400,58 +399,19 @@ impl BrokerPoller {
     }
 }
 
-async fn execute(
-    client: &HttpBrokerClient,
-    args: ActionArgs,
-) -> Result<ActionOutcome, BrokerActionError> {
-    let request = BrokerRequest::new(Uuid::new_v4().to_string(), args)
-        .and_then(BrokerRequest::prepare)
-        .map_err(|error| BrokerActionError {
-            detail: format!("broker request: {error}"),
-            code: None,
-        })?;
-    let response = client
-        .execute(&request)
-        .await
-        .map_err(|error| BrokerActionError {
-            detail: format!("broker transport: {error}"),
-            code: None,
-        })?;
-    match response.into_envelope().result {
-        BrokerResult::Succeeded { outcome } => Ok(outcome),
-        BrokerResult::Failed { error } | BrokerResult::Indeterminate { error } => {
-            Err(BrokerActionError {
-                detail: format!(
-                    "broker verdict: {} [{}]",
-                    error.message,
-                    error.code.as_str()
-                ),
-                code: Some(error.code),
-            })
-        }
-    }
-}
-
 impl RuntimeTransport {
     pub fn local(relay: HarnessRelay) -> Self {
         Self::Local(relay)
     }
 
     pub async fn broker(
-        base_url: String,
-        credential: String,
+        authority: AuthorityFence,
         channel_ids: Vec<Uuid>,
         poll_interval: Duration,
         placeholder_keys: Keys,
     ) -> Result<(Self, String), RelayError> {
-        let (runtime, pubkey) = BrokerRuntime::connect(
-            base_url,
-            credential,
-            channel_ids,
-            poll_interval,
-            placeholder_keys,
-        )
-        .await?;
+        let (runtime, pubkey) =
+            BrokerRuntime::connect(authority, channel_ids, poll_interval, placeholder_keys).await?;
         Ok((Self::Broker(runtime), pubkey))
     }
 
@@ -556,6 +516,13 @@ impl RuntimeTransport {
         }
     }
 
+    pub fn take_authority_loss_rx(&mut self) -> Option<tokio::sync::oneshot::Receiver<String>> {
+        match self {
+            Self::Local(_) => None,
+            Self::Broker(runtime) => runtime.take_authority_loss_rx(),
+        }
+    }
+
     pub async fn reconnect(&mut self) -> Result<(), RelayError> {
         match self {
             Self::Local(relay) => relay.reconnect().await,
@@ -579,7 +546,7 @@ impl RuntimeTransport {
         match self {
             Self::Local(_) => None,
             Self::Broker(runtime) => Some(BrokerActions {
-                client: runtime.client.clone(),
+                authority: runtime.authority.clone(),
             }),
         }
     }
@@ -591,7 +558,7 @@ impl RuntimeTransport {
                 keys,
             },
             Self::Broker(runtime) => RuntimeSignalPublisher::Broker(BrokerActions {
-                client: runtime.client.clone(),
+                authority: runtime.authority.clone(),
             }),
         }
     }
@@ -627,6 +594,20 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
 
+    fn authority_fence(base_url: String, pubkey: &str) -> AuthorityFence {
+        let identity = serde_json::from_value(serde_json::json!({
+            "communityRelayUrl": "wss://relay.example.invalid",
+            "logicalAgentPubkey": pubkey,
+            "executorAgentPubkey": pubkey,
+            "taskId": "40b68c08-ed45-4c4b-a1d8-e46d6478d642",
+            "generation": "8d86e776-0f6a-418b-b7fb-4f87be556591",
+            "location": {"kind": "cloud", "id": "runtime-b"},
+            "runtimeSupport": "portable"
+        }))
+        .unwrap();
+        AuthorityFence::new(base_url, "credential".into(), identity).unwrap()
+    }
+
     #[test]
     fn terminal_page_returns_polling_to_the_default_window() {
         let channel_id = Uuid::new_v4();
@@ -656,6 +637,18 @@ mod tests {
                         let action = request["action"].as_str().unwrap();
                         seen.lock().unwrap().push(action.to_string());
                         let outcome = match action {
+                            "authority.status" => serde_json::json!({
+                                "identity": {
+                                    "communityRelayUrl": "wss://relay.example.invalid",
+                                    "logicalAgentPubkey": "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971",
+                                    "executorAgentPubkey": "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971",
+                                    "taskId": "40b68c08-ed45-4c4b-a1d8-e46d6478d642",
+                                    "generation": "8d86e776-0f6a-418b-b7fb-4f87be556591",
+                                    "location": {"kind": "cloud", "id": "runtime-b"},
+                                    "runtimeSupport": "portable"
+                                },
+                                "state": "active"
+                            }),
                             "storage.get" => serde_json::json!({ "value": "core" }),
                             "observer.emit" => serde_json::json!({ "accepted": 1 }),
                             _ => serde_json::json!({
@@ -684,7 +677,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let actions = BrokerActions {
-            client: HttpBrokerClient::new(format!("http://{address}"), "credential").unwrap(),
+            authority: authority_fence(
+                format!("http://{address}"),
+                "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971",
+            ),
         };
         let channel_id = Uuid::new_v4();
 
@@ -717,10 +713,15 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             [
+                "authority.status",
                 "storage.get",
+                "authority.status",
                 "presence.set",
+                "authority.status",
                 "typing.set",
+                "authority.status",
                 "observer.emit",
+                "authority.status",
                 "liveness.ping",
             ]
         );
@@ -736,42 +737,60 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
         let pubkey = keys.public_key().to_hex();
+        let authority_state = Arc::new(Mutex::new("active".to_string()));
         let app = Router::new().route(
             "/v1/action",
-            post(move |body: Bytes| {
-                let ready_event = ready_event.clone();
-                let pubkey = pubkey.clone();
-                async move {
-                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    let request_id = request["requestId"].as_str().unwrap();
-                    let action = request["action"].as_str().unwrap();
-                    let outcome = if action == "storage.address" {
-                        serde_json::json!({
-                            "authorPubkey": pubkey,
-                            "kind": 30078,
-                            "dTag": "a".repeat(64),
-                        })
-                    } else {
-                        let channel = request["args"]["channelId"].as_str().unwrap();
-                        if channel == slow_channel.to_string() {
-                            tokio::time::sleep(Duration::from_millis(80)).await;
-                            serde_json::json!({ "messages": [] })
+            post({
+                let authority_state = Arc::clone(&authority_state);
+                move |body: Bytes| {
+                    let ready_event = ready_event.clone();
+                    let pubkey = pubkey.clone();
+                    let authority_state = Arc::clone(&authority_state);
+                    async move {
+                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let request_id = request["requestId"].as_str().unwrap();
+                        let action = request["action"].as_str().unwrap();
+                        let outcome = if action == "storage.address" {
+                            serde_json::json!({
+                                "authorPubkey": pubkey,
+                                "kind": 30078,
+                                "dTag": "a".repeat(64),
+                            })
+                        } else if action == "authority.status" {
+                            serde_json::json!({
+                                "identity": {
+                                    "communityRelayUrl": "wss://relay.example.invalid",
+                                    "logicalAgentPubkey": pubkey,
+                                    "executorAgentPubkey": pubkey,
+                                    "taskId": "40b68c08-ed45-4c4b-a1d8-e46d6478d642",
+                                    "generation": "8d86e776-0f6a-418b-b7fb-4f87be556591",
+                                    "location": {"kind": "cloud", "id": "runtime-b"},
+                                    "runtimeSupport": "portable"
+                                },
+                                "state": authority_state.lock().unwrap().clone()
+                            })
                         } else {
-                            serde_json::json!({ "messages": [ready_event] })
-                        }
-                    };
-                    let response = serde_json::json!({
-                        "type": "broker_result",
-                        "protocolVersion": 1,
-                        "requestId": request_id,
-                        "status": "succeeded",
-                        "action": action,
-                        "outcome": outcome,
-                    });
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .body(Body::from(response.to_string()))
-                        .unwrap()
+                            let channel = request["args"]["channelId"].as_str().unwrap();
+                            if channel == slow_channel.to_string() {
+                                tokio::time::sleep(Duration::from_millis(80)).await;
+                                serde_json::json!({ "messages": [] })
+                            } else {
+                                serde_json::json!({ "messages": [ready_event] })
+                            }
+                        };
+                        let response = serde_json::json!({
+                            "type": "broker_result",
+                            "protocolVersion": 1,
+                            "requestId": request_id,
+                            "status": "succeeded",
+                            "action": action,
+                            "outcome": outcome,
+                        });
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Body::from(response.to_string()))
+                            .unwrap()
+                    }
                 }
             }),
         );
@@ -780,8 +799,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let (mut runtime, _) = BrokerRuntime::connect(
-            format!("http://{address}"),
-            "credential".into(),
+            authority_fence(format!("http://{address}"), &keys.public_key().to_hex()),
             vec![slow_channel, ready_channel],
             Duration::from_millis(1),
             Keys::generate(),
@@ -813,5 +831,15 @@ mod tests {
 
         assert_eq!(received.channel_id, ready_channel);
         assert_eq!(received.event.content, "ready");
+
+        let authority_loss = runtime
+            .take_authority_loss_rx()
+            .expect("broker runtime has one authority watcher");
+        *authority_state.lock().unwrap() = "fenced".into();
+        let loss = tokio::time::timeout(Duration::from_millis(300), authority_loss)
+            .await
+            .expect("fenced generation must stop polling promptly")
+            .expect("authority watcher reports its terminal reason");
+        assert!(loss.contains("not active"));
     }
 }

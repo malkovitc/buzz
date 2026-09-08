@@ -6,6 +6,8 @@ use nostr::{EventBuilder, Keys, Kind, Tag};
 const CHANNEL: &str = "b2c38ca8-9ec3-411e-bab5-f9deab34d52e";
 const PUBKEY: &str = "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971";
 const EVENT: &str = "78d47c4f36a2d048f45b57a31d964a3ce239f0fc46162c5d7c90db2b5aa52bc6";
+const TASK_ID: &str = "40b68c08-ed45-4c4b-a1d8-e46d6478d642";
+const GENERATION: &str = "8d86e776-0f6a-418b-b7fb-4f87be556591";
 
 fn pubkey() -> PubkeyHex {
     PubkeyHex::parse(PUBKEY).expect("fixture pubkey is valid hex")
@@ -13,6 +15,21 @@ fn pubkey() -> PubkeyHex {
 
 /// A genuinely signed event, so read fixtures exercise real verification rather
 /// than a hand-built value that could never verify.
+fn authority_identity() -> AuthorityIdentity {
+    AuthorityIdentity {
+        community_relay_url: "wss://relay.example.invalid".into(),
+        logical_agent_pubkey: pubkey(),
+        executor_agent_pubkey: pubkey(),
+        task_id: TASK_ID.into(),
+        generation: GENERATION.into(),
+        location: RuntimeLocation {
+            kind: RuntimeLocationKind::Cloud,
+            id: "provider-instance-7".into(),
+        },
+        runtime_support: RuntimeSupport::Portable,
+    }
+}
+
 fn signed_message(keys: &Keys) -> BrokerMessage {
     let event = EventBuilder::new(Kind::Custom(9), "hello")
         .tags([
@@ -48,6 +65,7 @@ fn all_error_codes() -> [BrokerErrorCode; 11] {
 /// skip an action: [`fixtures_cover_every_action`] pins the coverage.
 fn action_fixtures() -> Vec<ActionArgs> {
     vec![
+        ActionArgs::AuthorityStatus(AuthorityStatusArgs {}),
         ActionArgs::ChannelRead(ChannelReadArgs {
             channel_id: CHANNEL.into(),
             root_event_id: Some(EVENT.into()),
@@ -138,6 +156,10 @@ fn outcome_fixtures(keys: &Keys) -> Vec<ActionOutcome> {
         created_at: 1_764_000_003,
     };
     vec![
+        ActionOutcome::AuthorityStatus(ManagedAcpAuthority {
+            identity: authority_identity(),
+            state: AuthorityState::Active,
+        }),
         ActionOutcome::ChannelRead(page),
         ActionOutcome::MessagePost(published.clone()),
         ActionOutcome::MessageReply(published.clone()),
@@ -225,6 +247,52 @@ fn fixtures_cover_every_action() {
 }
 
 // ── Envelope round-trip ─────────────────────────────────────────────────────
+
+#[test]
+fn authority_status_is_host_derived_normalized_and_fail_closed() {
+    let args = serde_json::from_value::<AuthorityStatusArgs>(serde_json::json!({})).unwrap();
+    assert_eq!(args.validated().unwrap(), AuthorityStatusArgs {});
+    assert!(
+        serde_json::from_value::<AuthorityStatusArgs>(serde_json::json!({
+            "generation": GENERATION
+        }))
+        .is_err()
+    );
+
+    let mut identity = authority_identity();
+    identity.community_relay_url = " WSS://Relay.Example.Invalid:443/ ".into();
+    identity.task_id = TASK_ID.to_ascii_uppercase();
+    identity.generation = GENERATION.to_ascii_uppercase();
+    let normalized = identity.validated().unwrap();
+    assert_eq!(
+        normalized.community_relay_url,
+        "wss://relay.example.invalid"
+    );
+    assert_eq!(normalized.task_id, TASK_ID);
+    assert_eq!(normalized.generation, GENERATION);
+
+    let mut location_boundary = serde_json::to_value(authority_identity()).unwrap();
+    location_boundary["location"]["id"] = serde_json::json!("  provider-instance-7  ");
+    let location_boundary: AuthorityIdentity = serde_json::from_value(location_boundary).unwrap();
+    assert_eq!(location_boundary.location.id, "provider-instance-7");
+
+    for invalid in [
+        serde_json::json!({"communityRelayUrl": "https://relay.example.invalid"}),
+        serde_json::json!({"taskId": "not-a-uuid"}),
+        serde_json::json!({"generation": "not-a-uuid"}),
+        serde_json::json!({"location": {"kind": "cloud", "id": " "}}),
+    ] {
+        let mut value = serde_json::to_value(authority_identity()).unwrap();
+        for (key, replacement) in invalid.as_object().unwrap() {
+            value[key] = replacement.clone();
+        }
+        let rejected = match serde_json::from_value::<AuthorityIdentity>(value) {
+            Err(_) => true,
+            Ok(identity) => identity.validated().is_err(),
+        };
+        assert!(rejected);
+    }
+}
 
 #[test]
 fn every_action_round_trips_through_a_request_envelope() {
@@ -955,6 +1023,7 @@ fn every_payload_has_an_exact_and_secret_free_wire_schema() {
         ),
         ("error", vec!["code", "message"]),
         // Args, fully populated (optional fields present).
+        ("authority.status/args", vec![]),
         (
             "channel.read/args",
             vec![
@@ -1011,6 +1080,7 @@ fn every_payload_has_an_exact_and_secret_free_wire_schema() {
         ),
         ("agents.delete/args", vec!["target"]),
         // Outcomes.
+        ("authority.status/outcome", vec!["identity", "state"]),
         ("channel.read/outcome", vec!["messages", "nextCursor"]),
         ("message.post/outcome", vec!["createdAt", "eventId", "kind"]),
         (
@@ -1041,6 +1111,19 @@ fn every_payload_has_an_exact_and_secret_free_wire_schema() {
             vec!["agentPubkey", "displayName", "updatedFields"],
         ),
         ("agents.delete/outcome", vec!["agentPubkey", "displayName"]),
+        (
+            "authority.status/identity",
+            vec![
+                "communityRelayUrl",
+                "executorAgentPubkey",
+                "generation",
+                "location",
+                "logicalAgentPubkey",
+                "runtimeSupport",
+                "taskId",
+            ],
+        ),
+        ("authority.status/location", vec!["id", "kind"]),
     ];
 
     let mut actual: Vec<(String, Vec<String>)> = Vec::new();
@@ -1099,6 +1182,12 @@ fn every_payload_has_an_exact_and_secret_free_wire_schema() {
             keys_of(&json["outcome"]),
         ));
     }
+    let identity = serde_json::to_value(authority_identity()).expect("identity serializes");
+    actual.push(("authority.status/identity".to_string(), keys_of(&identity)));
+    actual.push((
+        "authority.status/location".to_string(),
+        keys_of(&identity["location"]),
+    ));
 
     let expected: Vec<(String, Vec<String>)> = expected
         .into_iter()

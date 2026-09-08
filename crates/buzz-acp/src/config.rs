@@ -6,12 +6,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use buzz_sdk::broker::AuthorityIdentity;
 use clap::Parser;
 use clap::ValueEnum;
 use nostr::{Keys, PublicKey};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
+
+use buzz_broker_client::AuthorityFence;
 
 use crate::filter::SubscriptionRule;
 
@@ -102,6 +105,10 @@ pub struct BrokerConfig {
     /// Canonical relay identity for observer/runtime pairing. The harness does
     /// not connect to this URL in broker mode.
     pub relay_url: String,
+    /// Host-derived generation fence paired with this credential.
+    pub fence: AuthorityFence,
+    /// Canonical non-secret expectation passed to broker-aware effect clients.
+    pub authority_json: String,
     pub poll_interval: std::time::Duration,
 }
 
@@ -111,6 +118,8 @@ impl std::fmt::Debug for BrokerConfig {
             .field("base_url", &self.base_url)
             .field("credential", &"<redacted>")
             .field("relay_url", &self.relay_url)
+            .field("fence", &"<host-bound>")
+            .field("authority_json", &"<authority-identity>")
             .field("poll_interval", &self.poll_interval)
             .finish()
     }
@@ -321,6 +330,11 @@ pub struct CliArgs {
 
     #[arg(long, env = "BUZZ_BROKER_CREDENTIAL", hide_env_values = true)]
     pub broker_credential: Option<String>,
+
+    /// Strict non-secret authority identity expected from the authenticated
+    /// broker session. The JSON object cannot grant authority by itself.
+    #[arg(long, env = "BUZZ_MANAGED_ACP_AUTHORITY", hide_env_values = true)]
+    pub managed_authority: Option<String>,
 
     /// Relay identity behind the broker, used only for observer/runtime
     /// pairing. Broker mode never opens a connection to this URL.
@@ -1014,6 +1028,30 @@ impl Config {
                         "invalid broker relay identity in BUZZ_BROKER_RELAY_URL / --broker-relay-url: {error}"
                     ))
                 })?;
+                let authority_json = args.managed_authority.take().ok_or_else(|| {
+                    ConfigError::ConfigFile(
+                        "BUZZ_MANAGED_ACP_AUTHORITY / --managed-authority is required in broker mode"
+                            .into(),
+                    )
+                })?;
+                let authority: AuthorityIdentity =
+                    serde_json::from_str(&authority_json).map_err(|_| {
+                        ConfigError::ConfigFile(
+                        "BUZZ_MANAGED_ACP_AUTHORITY must be a strict authority identity JSON object"
+                            .into(),
+                    )
+                    })?;
+                let authority = authority.validated().map_err(|_| {
+                    ConfigError::ConfigFile(
+                        "BUZZ_MANAGED_ACP_AUTHORITY contains an invalid authority identity".into(),
+                    )
+                })?;
+                if authority.community_relay_url != relay_url {
+                    return Err(ConfigError::ConfigFile(
+                        "managed ACP authority community does not match broker relay identity"
+                            .into(),
+                    ));
+                }
                 if args.broker_poll_interval_ms < 100 {
                     return Err(ConfigError::ConfigFile(
                         "broker poll interval must be at least 100ms".into(),
@@ -1051,10 +1089,23 @@ impl Config {
                     ))
                 })?;
                 args.agent_owner = Some(owner.to_hex());
+                let authority_json = serde_json::to_string(&authority).map_err(|_| {
+                    ConfigError::ConfigFile(
+                        "managed ACP authority expectation cannot be encoded".into(),
+                    )
+                })?;
+                let fence = AuthorityFence::new(base_url.clone(), credential.clone(), authority)
+                    .map_err(|_| {
+                        ConfigError::ConfigFile(
+                            "managed ACP broker authority provisioning is invalid".into(),
+                        )
+                    })?;
                 Some(BrokerConfig {
                     base_url,
                     credential,
                     relay_url,
+                    fence,
+                    authority_json,
                     poll_interval: std::time::Duration::from_millis(args.broker_poll_interval_ms),
                 })
             }
@@ -1289,6 +1340,10 @@ impl Config {
                 // Explicit tombstones keep inherited local credentials and
                 // routing out of the spawned agent process.
                 ("BUZZ_BROKER_RELAY_URL".into(), String::new()),
+                (
+                    "BUZZ_MANAGED_ACP_AUTHORITY".into(),
+                    broker.authority_json.clone(),
+                ),
                 ("BUZZ_RELAY_URL".into(), String::new()),
                 ("BUZZ_PRIVATE_KEY".into(), String::new()),
                 ("BUZZ_AUTH_TAG".into(), String::new()),
@@ -1298,6 +1353,7 @@ impl Config {
                 ("BUZZ_BROKER_URL".into(), String::new()),
                 ("BUZZ_BROKER_CREDENTIAL".into(), String::new()),
                 ("BUZZ_BROKER_RELAY_URL".into(), String::new()),
+                ("BUZZ_MANAGED_ACP_AUTHORITY".into(), String::new()),
                 ("BUZZ_RELAY_URL".into(), relay_url.clone()),
                 ("BUZZ_PRIVATE_KEY".into(), keys.secret_key().to_secret_hex()),
             ]),
@@ -1802,6 +1858,7 @@ mod tests {
     fn broker_args(extra: &[&str]) -> CliArgs {
         const CHANNEL: &str = "5df7dfa8-e919-43df-8efd-f1dcb8af7071";
         const OWNER: &str = "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971";
+        const AUTHORITY: &str = r#"{"communityRelayUrl":"wss://relay.example","logicalAgentPubkey":"a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971","executorAgentPubkey":"a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971","taskId":"40b68c08-ed45-4c4b-a1d8-e46d6478d642","generation":"8d86e776-0f6a-418b-b7fb-4f87be556591","location":{"kind":"cloud","id":"runtime-b"},"runtimeSupport":"portable"}"#;
         let mut args = vec![
             "buzz-acp",
             "--agent-mode",
@@ -1812,6 +1869,8 @@ mod tests {
             "http://127.0.0.1:8787",
             "--broker-credential",
             "cred",
+            "--managed-authority",
+            AUTHORITY,
             "--broker-relay-url",
             "wss://relay.example",
             "--channels",
@@ -1843,6 +1902,30 @@ mod tests {
             .persona_env_vars
             .iter()
             .any(|(name, value)| name == "BUZZ_PRIVATE_KEY" && value.is_empty()));
+        assert!(config.persona_env_vars.iter().any(|(name, value)| {
+            name == "BUZZ_MANAGED_ACP_AUTHORITY"
+                && value == &config.broker.as_ref().unwrap().authority_json
+        }));
+    }
+
+    #[test]
+    fn broker_mode_requires_exact_matching_authority_metadata() {
+        let mut missing = broker_args(&[]);
+        missing.managed_authority = None;
+        assert!(Config::from_args(missing)
+            .expect_err("authority expectation must be required")
+            .to_string()
+            .contains("BUZZ_MANAGED_ACP_AUTHORITY"));
+
+        let mut mismatched = broker_args(&[]);
+        let mut authority: serde_json::Value =
+            serde_json::from_str(mismatched.managed_authority.as_deref().unwrap()).unwrap();
+        authority["communityRelayUrl"] = serde_json::json!("wss://other.example");
+        mismatched.managed_authority = Some(authority.to_string());
+        assert!(Config::from_args(mismatched)
+            .expect_err("community mismatch must fail closed")
+            .to_string()
+            .contains("does not match"));
     }
 
     #[test]
@@ -1936,22 +2019,8 @@ mod tests {
 
     #[test]
     fn broker_mode_requires_explicit_channels() {
-        const OWNER: &str = "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971";
-        let args = CliArgs::parse_from([
-            "buzz-acp",
-            "--agent-mode",
-            "broker",
-            "--private-key",
-            "",
-            "--broker-url",
-            "http://127.0.0.1:8787",
-            "--broker-credential",
-            "cred",
-            "--broker-relay-url",
-            "wss://relay.example",
-            "--agent-owner",
-            OWNER,
-        ]);
+        let mut args = broker_args(&[]);
+        args.channels = None;
 
         assert!(Config::from_args(args)
             .expect_err("channels are required")

@@ -6,8 +6,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    absent_or_valued, channel, channel_id, cursor, event_id, hex64_field, required, Action,
-    PubkeyHex, MAX_CONTENT_BYTES, MAX_ENCODED_MESSAGE_BYTES, MAX_NAME_CHARS, MAX_PAGE_LIMIT,
+    absent_or_valued, authority_uuid, authority_uuid_field, channel, channel_id,
+    community_relay_url, community_relay_url_field, cursor, event_id, hex64_field, required,
+    Action, PubkeyHex, MAX_CONTENT_BYTES, MAX_ENCODED_MESSAGE_BYTES, MAX_NAME_CHARS,
+    MAX_PAGE_LIMIT, MAX_SCALAR_CHARS,
 };
 use crate::SdkError;
 use nostr::{Event, EventId, Kind, PublicKey, Tags, Timestamp};
@@ -194,6 +196,141 @@ pub struct ObserverReceipt {
     pub accepted: u32,
 }
 
+/// Whether a runtime can restore vendor-private state, consume only portable
+/// continuation context, or cannot safely participate in handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeSupport {
+    /// Exact runtime/session continuation is supported.
+    Exact,
+    /// Only runtime-neutral semantic continuation is supported.
+    Portable,
+    /// The runtime must fail closed before handoff.
+    Unsupported,
+}
+
+/// Coarse execution substrate. The opaque id distinguishes concrete hosts
+/// without coupling the contract to a provider, process name, or filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeLocationKind {
+    /// An owner-controlled local host.
+    Local,
+    /// A remotely hosted execution target.
+    Cloud,
+}
+
+/// Exact destination of one managed ACP generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeLocation {
+    /// Local or cloud substrate class.
+    pub kind: RuntimeLocationKind,
+    /// Host-owned opaque destination identifier.
+    pub id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RuntimeLocationWire {
+    kind: RuntimeLocationKind,
+    id: String,
+}
+
+impl<'de> Deserialize<'de> for RuntimeLocation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = RuntimeLocationWire::deserialize(deserializer)?;
+        let id = required(&wire.id, "location id", MAX_SCALAR_CHARS)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            kind: wire.kind,
+            id,
+        })
+    }
+}
+
+impl RuntimeLocation {
+    fn validated(&self) -> Result<Self, SdkError> {
+        Ok(Self {
+            kind: self.kind,
+            id: required(&self.id, "location id", MAX_SCALAR_CHARS)?,
+        })
+    }
+}
+
+/// Canonical identity bound to one broker credential by the host.
+///
+/// The community is identified by its normalized relay URL, matching Buzz's
+/// URL-is-the-community product contract. No field is accepted in
+/// `authority.status` arguments, so this value can only be asserted by the
+/// authenticated host response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityIdentity {
+    /// Canonical relay URL selecting the Buzz community.
+    #[serde(deserialize_with = "community_relay_url_field")]
+    pub community_relay_url: String,
+    /// Stable communication identity seen by existing clients.
+    pub logical_agent_pubkey: PubkeyHex,
+    /// Managed ACP executor represented by this credential.
+    pub executor_agent_pubkey: PubkeyHex,
+    /// Host-issued task binding.
+    #[serde(deserialize_with = "authority_uuid_field")]
+    pub task_id: String,
+    /// Host-issued generation binding.
+    #[serde(deserialize_with = "authority_uuid_field")]
+    pub generation: String,
+    /// Exact execution destination.
+    pub location: RuntimeLocation,
+    /// Continuation mode supported by the provisioned runtime.
+    pub runtime_support: RuntimeSupport,
+}
+
+impl AuthorityIdentity {
+    /// Return the single normalized authority identity used for all comparisons.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdkError::InvalidInput`] for any malformed or non-usable
+    /// boundary identifier.
+    pub fn validated(&self) -> Result<Self, SdkError> {
+        Ok(Self {
+            community_relay_url: community_relay_url(&self.community_relay_url)?,
+            logical_agent_pubkey: PubkeyHex::parse(self.logical_agent_pubkey.as_str())?,
+            executor_agent_pubkey: PubkeyHex::parse(self.executor_agent_pubkey.as_str())?,
+            task_id: authority_uuid(&self.task_id, "task id")?,
+            generation: authority_uuid(&self.generation, "generation")?,
+            location: self.location.validated()?,
+            runtime_support: self.runtime_support,
+        })
+    }
+}
+
+/// Current lifecycle verdict for an authenticated managed-ACP generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthorityState {
+    /// New intake and mutating turns may proceed.
+    Active,
+    /// Intake is closed while the host waits for bounded drain.
+    Quiescing,
+    /// The generation is terminal and can never be admitted again.
+    Fenced,
+}
+
+/// Success outcome of `authority.status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ManagedAcpAuthority {
+    /// Exact host-derived identity bound to this credential.
+    pub identity: AuthorityIdentity,
+    /// Current lifecycle state.
+    pub state: AuthorityState,
+}
+
 /// Outcome of a successful `agents.create`.
 ///
 /// Carries the new agent's **public** identity only — there is no field for
@@ -237,6 +374,9 @@ pub struct AgentsDeleteOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", content = "outcome", deny_unknown_fields)]
 pub enum ActionOutcome {
+    /// `authority.status` succeeded.
+    #[serde(rename = "authority.status")]
+    AuthorityStatus(ManagedAcpAuthority),
     /// `channel.read` succeeded.
     #[serde(rename = "channel.read")]
     ChannelRead(MessagePage),
@@ -289,6 +429,7 @@ impl ActionOutcome {
     #[must_use]
     pub fn action(&self) -> Action {
         match self {
+            Self::AuthorityStatus(_) => Action::AuthorityStatus,
             Self::ChannelRead(_) => Action::ChannelRead,
             Self::MessagePost(_) => Action::MessagePost,
             Self::MessageReply(_) => Action::MessageReply,
@@ -319,6 +460,9 @@ impl ActionOutcome {
     /// channel UUID, or cursor, an empty name, or an over-long page.
     pub fn validate(&self) -> Result<(), SdkError> {
         match self {
+            Self::AuthorityStatus(authority) => {
+                authority.identity.validated()?;
+            }
             Self::ChannelRead(page) => {
                 if page.messages.len() > MAX_PAGE_LIMIT as usize {
                     return Err(SdkError::InvalidInput(format!(

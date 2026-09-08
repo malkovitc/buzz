@@ -631,6 +631,7 @@ impl AcpClient {
                     | "BUZZ_BROKER_URL"
                     | "BUZZ_BROKER_CREDENTIAL"
                     | "BUZZ_BROKER_RELAY_URL"
+                    | "BUZZ_MANAGED_ACP_AUTHORITY"
                     | "BUZZ_RELAY_URL"
                     | "BUZZ_PRIVATE_KEY"
                     | "BUZZ_AUTH_TAG"
@@ -3597,6 +3598,26 @@ mod tests {
         .await;
 
         assert_eq!(observed, "unset");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_authority_overrides_conflicting_inherited_value() {
+        const VAR: &str = "BUZZ_MANAGED_ACP_AUTHORITY";
+        let previous = std::env::var_os(VAR);
+        std::env::set_var(VAR, "stale-inherited-generation");
+        let observed = spawn_named_and_read_child_env(
+            "goose",
+            VAR,
+            &[(VAR.into(), "canonical-current-generation".into())],
+        )
+        .await;
+        match previous {
+            Some(value) => std::env::set_var(VAR, value),
+            None => std::env::remove_var(VAR),
+        }
+
+        assert_eq!(observed, "canonical-current-generation");
     }
 
     #[cfg(unix)]

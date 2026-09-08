@@ -86,11 +86,13 @@ mod wire;
 use actions::absent_or_valued;
 pub use actions::{
     Action, ActionArgs, ActionOutcome, AgentTarget, AgentsCreateArgs, AgentsCreateOutcome,
-    AgentsDeleteArgs, AgentsDeleteOutcome, AgentsUpdateArgs, AgentsUpdateOutcome, BrokerMessage,
-    ChannelReadArgs, EventPublished, LivenessPingArgs, MessagePage, MessagePostArgs,
+    AgentsDeleteArgs, AgentsDeleteOutcome, AgentsUpdateArgs, AgentsUpdateOutcome,
+    AuthorityIdentity, AuthorityState, AuthorityStatusArgs, BrokerMessage, ChannelReadArgs,
+    EventPublished, LivenessPingArgs, ManagedAcpAuthority, MessagePage, MessagePostArgs,
     MessageReplyArgs, ObserverEmitArgs, ObserverFrame, ObserverReceipt, PresenceSetArgs,
-    PresenceStatus, ProfileSetArgs, PubkeyHex, ReactionAddArgs, StorageAddress, StorageAddressArgs,
-    StorageGetArgs, StoragePutArgs, StorageRecord, TypingSetArgs,
+    PresenceStatus, ProfileSetArgs, PubkeyHex, ReactionAddArgs, RuntimeLocation,
+    RuntimeLocationKind, RuntimeSupport, StorageAddress, StorageAddressArgs, StorageGetArgs,
+    StoragePutArgs, StorageRecord, TypingSetArgs,
 };
 pub use client::{
     BrokerClient, BrokerClientExt, BrokerFuture, BrokerTransportError, Dispatch, ValidatedFuture,

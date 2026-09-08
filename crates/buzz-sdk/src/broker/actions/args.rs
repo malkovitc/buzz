@@ -18,6 +18,27 @@ use buzz_core::{
     presence::PresenceStatus,
 };
 
+/// Empty arguments for `authority.status`.
+///
+/// Authority comes entirely from the authenticated broker session. Keeping the
+/// object empty makes it structurally impossible for a runtime to name its own
+/// agent, task, generation, location, or status.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityStatusArgs {}
+
+impl AuthorityStatusArgs {
+    /// Validate the closed empty object.
+    ///
+    /// # Errors
+    ///
+    /// Never fails after deserialization; the strict empty schema rejects all
+    /// members before this method is reached.
+    pub fn validated(&self) -> Result<Self, SdkError> {
+        Ok(Self {})
+    }
+}
+
 /// Arguments for `channel.read` — the one read action.
 ///
 /// One action covers channel, thread, and mention-feed scope, because they
@@ -763,6 +784,9 @@ impl AgentsDeleteArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", content = "args", deny_unknown_fields)]
 pub enum ActionArgs {
+    /// Read the authenticated session's managed-ACP authority binding.
+    #[serde(rename = "authority.status")]
+    AuthorityStatus(AuthorityStatusArgs),
     /// Read a channel, thread, or mention feed.
     #[serde(rename = "channel.read")]
     ChannelRead(ChannelReadArgs),
@@ -815,6 +839,7 @@ impl ActionArgs {
     #[must_use]
     pub fn action(&self) -> Action {
         match self {
+            Self::AuthorityStatus(_) => Action::AuthorityStatus,
             Self::ChannelRead(_) => Action::ChannelRead,
             Self::MessagePost(_) => Action::MessagePost,
             Self::MessageReply(_) => Action::MessageReply,
@@ -843,6 +868,7 @@ impl ActionArgs {
     /// Propagates the per-action validation error.
     pub fn validated(&self) -> Result<Self, SdkError> {
         Ok(match self {
+            Self::AuthorityStatus(args) => Self::AuthorityStatus(args.validated()?),
             Self::ChannelRead(args) => Self::ChannelRead(args.validated()?),
             Self::MessagePost(args) => Self::MessagePost(args.validated()?),
             Self::MessageReply(args) => Self::MessageReply(args.validated()?),

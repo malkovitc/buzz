@@ -21,8 +21,14 @@ The same provisioning variables now select the keyless `buzz-acp`
 runtime. It derives its public identity through `storage.address`, polls
 configured channels through `channel.read`, uses broker-backed memory and live
 signals, and passes broker provisioning to the CLI used by the spawned agent.
-The ACP harness additionally requires `BUZZ_BROKER_RELAY_URL` as observer/runtime
-identity metadata, but never connects to that relay URL directly. See
+The ACP harness additionally requires `BUZZ_BROKER_RELAY_URL` and a strict
+`BUZZ_MANAGED_ACP_AUTHORITY` generation expectation. It checks the host-owned
+`authority.status` fence before startup, spawn/respawn, and every ACP prompt.
+A rejected prompt or action fails closed and any recovery attempt rechecks the
+fence; authority loss observed by the background poller terminates the harness.
+The normalized expectation is forwarded to the managed `buzz` CLI so every
+supported broker action gets the same preflight;
+it grants no relay access or signing authority by itself. See
 [`../buzz-acp/README.md`](../buzz-acp/README.md#keyless-broker-mode)
 for the runtime command and its deliberate housekeeping limits.
 
@@ -52,6 +58,7 @@ Terminal 2 — the keyless client (note: no key in the environment):
 export BUZZ_AGENT_MODE=broker
 export BUZZ_BROKER_URL=http://127.0.0.1:8787
 export BUZZ_BROKER_CREDENTIAL=dev-token
+export BUZZ_MANAGED_ACP_AUTHORITY='{"communityRelayUrl":"wss://relay.example","logicalAgentPubkey":"a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971","executorAgentPubkey":"a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971","taskId":"40b68c08-ed45-4c4b-a1d8-e46d6478d642","generation":"8d86e776-0f6a-418b-b7fb-4f87be556591","location":{"kind":"local","id":"mock-broker"},"runtimeSupport":"portable"}'
 unset BUZZ_PRIVATE_KEY
 
 CH=<channel-uuid>
@@ -66,7 +73,8 @@ buzz mem get core
 buzz mem set core "I am Ada."
 ```
 
-Terminal 1 logs each action, the bearer credential, and the args it received.
+Terminal 1 logs each action, whether authorization was present, and the args it
+received. It never prints the bearer credential.
 
 ## Point it at your own broker
 

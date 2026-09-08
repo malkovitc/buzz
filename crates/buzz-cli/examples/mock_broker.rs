@@ -21,6 +21,8 @@ use tokio::net::TcpListener;
 const ADDR: &str = "127.0.0.1:8787";
 const FAKE_EVENT_ID: &str = "cacf5f811cc8ef3f4af3f92cc222f92a86cdf6a26728a144c8e63b74ab6db359";
 const FAKE_PUBKEY: &str = "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971";
+const FAKE_TASK_ID: &str = "40b68c08-ed45-4c4b-a1d8-e46d6478d642";
+const FAKE_GENERATION: &str = "8d86e776-0f6a-418b-b7fb-4f87be556591";
 
 #[tokio::main]
 async fn main() {
@@ -38,17 +40,30 @@ async fn action(headers: axum::http::HeaderMap, body: Bytes) -> Response {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let action = request.get("action").and_then(|v| v.as_str()).unwrap_or("");
-    let credential = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("<none>");
+    let credential_present = headers.get("authorization").is_some();
     eprintln!(
-        "→ {action}  requestId={request_id}  auth={credential}\n  args={}",
+        "→ {action}  requestId={request_id}  auth_present={credential_present}\n  args={}",
         request.get("args").unwrap_or(&serde_json::Value::Null)
     );
 
     // A host verdict always rides in the body at HTTP 200; only the shape varies.
     let body = match action {
+        "authority.status" => succeeded(
+            request_id,
+            action,
+            serde_json::json!({
+                "identity": {
+                    "communityRelayUrl": "wss://relay.example",
+                    "logicalAgentPubkey": FAKE_PUBKEY,
+                    "executorAgentPubkey": FAKE_PUBKEY,
+                    "taskId": FAKE_TASK_ID,
+                    "generation": FAKE_GENERATION,
+                    "location": {"kind": "local", "id": "mock-broker"},
+                    "runtimeSupport": "portable"
+                },
+                "state": "active"
+            }),
+        ),
         "message.post" | "message.reply" => succeeded(
             request_id,
             action,

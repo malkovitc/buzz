@@ -979,8 +979,10 @@ dependencies = [
  "nostr 0.44.7",
  "reqwest 0.13.4",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]

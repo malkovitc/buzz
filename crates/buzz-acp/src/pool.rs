@@ -34,6 +34,8 @@ use crate::acp::{
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
     ModelSwitchMethod, StopReason, SystemPromptTransport,
 };
+use buzz_broker_client::AuthorityFence;
+
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
 use crate::queue::{
@@ -681,6 +683,8 @@ pub struct PromptContext {
     /// Broker-backed features that replace direct relay operations in keyless
     /// mode. `None` for local mode.
     pub broker_actions: Option<BrokerActions>,
+    /// Exact host-derived generation permit checked before every prompt.
+    pub authority_fence: Option<AuthorityFence>,
     /// REST client for pre-prompt context fetches (thread/DM history).
     pub rest_client: RestClient,
     /// Shared channel metadata for startup-known and dynamically joined channels.
@@ -1222,6 +1226,9 @@ async fn create_session_and_apply_model(
         ctx.session_title.as_deref(),
     );
 
+    // Context assembly can involve network I/O. Fence at the actual session
+    // creation boundary rather than relying only on the turn's entry snapshot.
+    require_prompt_authority(ctx).await?;
     let resp = agent
         .acp
         .session_new_full(
@@ -1908,6 +1915,16 @@ fn send_prompt_result(
     });
 }
 
+async fn require_prompt_authority(ctx: &PromptContext) -> Result<(), AcpError> {
+    let Some(authority) = ctx.authority_fence.as_ref() else {
+        return Ok(());
+    };
+    authority
+        .permit()
+        .await
+        .map_err(|error| AcpError::Protocol(error.to_string()))
+}
+
 /// Core async function spawned for each prompt.
 ///
 /// Lifecycle:
@@ -1936,6 +1953,17 @@ pub async fn run_prompt_task(
         Some(b) => PromptSource::Channel(b.channel_id),
         None => PromptSource::Heartbeat,
     };
+    if let Err(error) = require_prompt_authority(&ctx).await {
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Error(error),
+            batch,
+        );
+        return;
+    }
     let observer_channel_id = match &source {
         PromptSource::Channel(channel_id) => Some(*channel_id),
         PromptSource::Heartbeat => None,
@@ -2399,6 +2427,18 @@ pub async fn run_prompt_task(
                 &standing,
                 initial_msg,
             );
+            if let Err(error) = require_prompt_authority(&ctx).await {
+                agent.state.invalidate(&source);
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(error),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
             let init_result = agent
                 .acp
                 .session_prompt_with_idle_timeout(
@@ -2830,6 +2870,21 @@ pub async fn run_prompt_task(
         "turn starting for {}",
         prompt_label(&source)
     );
+
+    // Context/session setup may be slow. Revalidate at the actual prompt
+    // boundary so an authority cutover during preparation cannot admit either
+    // an initial message or a restored-session turn.
+    if let Err(error) = require_prompt_authority(&ctx).await {
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Error(error),
+            batch,
+        );
+        return;
+    }
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
@@ -5332,6 +5387,8 @@ mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
+
+    mod authority_tests;
 
     fn test_mcp_server() -> McpServer {
         McpServer {
@@ -8697,6 +8754,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             cwd: ".".to_string(),
             relay_features_enabled: true,
             broker_actions: None,
+            authority_fence: None,
             rest_client: RestClient {
                 http: reqwest::Client::new(),
                 base_url: "http://127.0.0.1:0".to_string(),

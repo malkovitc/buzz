@@ -12,16 +12,15 @@ use nostr::Event;
 use uuid::Uuid;
 
 use buzz_sdk::broker::{
-    ActionArgs, ActionOutcome, BrokerClientExt, BrokerError, BrokerRequest, BrokerResult,
-    ChannelReadArgs, EventPublished, MessagePage, MessagePostArgs, MessageReplyArgs,
-    PresenceSetArgs, ProfileSetArgs, PubkeyHex, ReactionAddArgs, StorageAddress,
-    StorageAddressArgs, StorageGetArgs, StoragePutArgs, StorageRecord,
+    ActionArgs, ActionOutcome, AuthorityIdentity, ChannelReadArgs, EventPublished, MessagePage,
+    MessagePostArgs, MessageReplyArgs, PresenceSetArgs, ProfileSetArgs, PubkeyHex, ReactionAddArgs,
+    StorageAddress, StorageAddressArgs, StorageGetArgs, StoragePutArgs, StorageRecord,
 };
 use buzz_sdk::ThreadRef;
 
 use crate::client::BuzzClient;
 use crate::error::CliError;
-use buzz_broker_client::HttpBrokerClient;
+use buzz_broker_client::AuthorityFence;
 
 /// The operations an agent performs, in the broker's vocabulary.
 ///
@@ -43,30 +42,22 @@ pub trait AgentBackend {
 
 /// Keyless backend: no key, no relay route. Every operation is a broker request.
 pub struct BrokerBackend {
-    client: HttpBrokerClient,
+    authority: AuthorityFence,
 }
 
 impl BrokerBackend {
     #[must_use]
-    pub fn new(client: HttpBrokerClient) -> Self {
-        Self { client }
+    pub fn new(authority: AuthorityFence) -> Self {
+        Self { authority }
     }
 
-    /// Freeze one action, send it, and unwrap the host's verdict to its outcome.
+    /// Revalidate the host-owned generation immediately before each broker
+    /// action. The host remains responsible for atomic effect admission.
     async fn run(&self, args: ActionArgs) -> Result<ActionOutcome, CliError> {
-        let request = BrokerRequest::new(Uuid::new_v4().to_string(), args)
-            .and_then(BrokerRequest::prepare)
-            .map_err(|e| CliError::Other(format!("broker request: {e}")))?;
-        let validated = self
-            .client
-            .execute(&request)
+        self.authority
+            .execute(args)
             .await
-            .map_err(|e| CliError::Other(format!("broker transport: {e}")))?;
-        match validated.into_envelope().result {
-            BrokerResult::Succeeded { outcome } => Ok(outcome),
-            BrokerResult::Failed { error } => Err(broker_verdict("failed", &error)),
-            BrokerResult::Indeterminate { error } => Err(broker_verdict("indeterminate", &error)),
-        }
+            .map_err(|error| CliError::Other(format!("managed ACP broker action: {error}")))
     }
 }
 
@@ -295,7 +286,7 @@ impl AgentBackend for LocalBackend {
 /// commands hold one value and never branch on custody.
 pub enum Backend {
     Local(Box<LocalBackend>),
-    Broker(BrokerBackend),
+    Broker(Box<BrokerBackend>),
 }
 
 impl Backend {
@@ -303,10 +294,11 @@ impl Backend {
     pub fn broker(
         base_url: impl Into<String>,
         credential: impl Into<String>,
+        authority: AuthorityIdentity,
     ) -> Result<Self, CliError> {
-        let client = HttpBrokerClient::new(base_url, credential)
+        let fence = AuthorityFence::new(base_url.into(), credential.into(), authority)
             .map_err(|error| CliError::Usage(format!("invalid broker configuration: {error}")))?;
-        Ok(Self::Broker(BrokerBackend::new(client)))
+        Ok(Self::Broker(Box::new(BrokerBackend::new(fence))))
     }
 
     /// Local: hold the key and talk to the relay.
@@ -381,14 +373,6 @@ impl AgentBackend for Backend {
     }
 }
 
-fn broker_verdict(status: &str, error: &BrokerError) -> CliError {
-    CliError::Other(format!(
-        "broker {status}: {} [{}]",
-        error.message,
-        error.code.as_str()
-    ))
-}
-
 fn unexpected_outcome(action: &str) -> CliError {
     CliError::Other(format!(
         "broker returned an outcome that is not for {action}"
@@ -413,6 +397,21 @@ mod tests {
     const CHANNEL: &str = "5df7dfa8-e919-43df-8efd-f1dcb8af7071";
     const EVENT_ID: &str = "cacf5f811cc8ef3f4af3f92cc222f92a86cdf6a26728a144c8e63b74ab6db359";
     const PUBKEY: &str = "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971";
+    const TASK_ID: &str = "40b68c08-ed45-4c4b-a1d8-e46d6478d642";
+    const GENERATION: &str = "8d86e776-0f6a-418b-b7fb-4f87be556591";
+
+    fn authority_identity() -> AuthorityIdentity {
+        serde_json::from_value(serde_json::json!({
+            "communityRelayUrl": "wss://relay.example.invalid",
+            "logicalAgentPubkey": PUBKEY,
+            "executorAgentPubkey": PUBKEY,
+            "taskId": TASK_ID,
+            "generation": GENERATION,
+            "location": {"kind": "cloud", "id": "runtime-b"},
+            "runtimeSupport": "portable"
+        }))
+        .unwrap()
+    }
 
     type Responder = Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync>;
 
@@ -422,7 +421,29 @@ mod tests {
     where
         F: Fn(&str, &str) -> (StatusCode, String) + Send + Sync + 'static,
     {
-        let responder: Responder = Arc::new(f);
+        spawn_host_with_state(f, buzz_sdk::broker::AuthorityState::Active).await
+    }
+
+    async fn spawn_host_with_state<F>(
+        f: F,
+        authority_state: buzz_sdk::broker::AuthorityState,
+    ) -> BrokerBackend
+    where
+        F: Fn(&str, &str) -> (StatusCode, String) + Send + Sync + 'static,
+    {
+        let responder: Responder = Arc::new(move |request_id, action| {
+            if action == "authority.status" {
+                return succeeded(
+                    request_id,
+                    action,
+                    serde_json::json!({
+                        "identity": authority_identity(),
+                        "state": authority_state,
+                    }),
+                );
+            }
+            f(request_id, action)
+        });
         let app = Router::new()
             .route(
                 "/v1/action",
@@ -443,7 +464,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        BrokerBackend::new(HttpBrokerClient::new(format!("http://{addr}"), "cred").unwrap())
+        let fence = AuthorityFence::new(
+            format!("http://{addr}"),
+            "cred".into(),
+            authority_identity(),
+        )
+        .unwrap();
+        BrokerBackend::new(fence)
     }
 
     fn succeeded(rid: &str, action: &str, outcome: serde_json::Value) -> (StatusCode, String) {
@@ -644,6 +671,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fenced_generation_never_reaches_the_requested_effect() {
+        let effect_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = Arc::clone(&effect_called);
+        let backend = spawn_host_with_state(
+            move |rid, action| {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                succeeded(
+                    rid,
+                    action,
+                    serde_json::json!({ "eventId": EVENT_ID, "kind": 9, "createdAt": 1_700_000_000u64 }),
+                )
+            },
+            buzz_sdk::broker::AuthorityState::Fenced,
+        )
+        .await;
+
+        let error = backend
+            .message_post(MessagePostArgs {
+                channel_id: CHANNEL.into(),
+                content: "must not publish".into(),
+                mentions: Vec::new(),
+            })
+            .await
+            .expect_err("fenced generation must fail closed");
+
+        assert!(error.to_string().contains("not active"));
+        assert!(!effect_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn broker_failure_is_surfaced_as_an_error() {
         let backend = spawn_host(|rid, _action| {
             let body = serde_json::json!({
@@ -666,6 +723,6 @@ mod tests {
             .await
             .expect_err("a failure");
 
-        assert!(err.to_string().contains("unauthorized"));
+        assert!(err.to_string().contains("rejected"));
     }
 }

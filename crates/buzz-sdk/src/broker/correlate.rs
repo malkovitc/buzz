@@ -79,7 +79,8 @@ pub(super) fn correlate_identities(
             }
         }
         // These outcomes echo no identity the request supplied.
-        (ActionArgs::ChannelRead(_), _)
+        (ActionArgs::AuthorityStatus(_), _)
+        | (ActionArgs::ChannelRead(_), _)
         | (ActionArgs::MessagePost(_), _)
         | (ActionArgs::MessageReply(_), _)
         | (ActionArgs::ReactionAdd(_), _)

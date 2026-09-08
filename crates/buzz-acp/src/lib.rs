@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::{ensure, Context, Result};
+use buzz_broker_client::AuthorityFence;
 use buzz_core::kind::{
     is_ephemeral, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_MEMBER_ADDED_NOTIFICATION,
     KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
@@ -2048,6 +2049,13 @@ async fn tokio_main() -> Result<()> {
         .init();
 
     let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+    let authority_fence = config.broker.as_ref().map(|broker| broker.fence.clone());
+    if let Some(authority) = authority_fence.as_ref() {
+        authority
+            .permit()
+            .await
+            .map_err(|error| anyhow::anyhow!("managed ACP admission failed: {error}"))?;
+    }
     if std::env::var_os("BUZZ_ACP_CLOUD_CONTROL_CHANNEL_ID").is_some()
         && std::env::var("BUZZ_ACP_DISPLAY_NAME")
             .ok()
@@ -2097,7 +2105,11 @@ async fn tokio_main() -> Result<()> {
     let mut pool = if config.lazy_pool {
         AgentPool::from_slots((0..config.agents).map(|_| None).collect())
     } else {
-        initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None).await?
+        initialize_agent_pool(
+            &PoolStartup::from_config(&config, observer.clone(), authority_fence.clone()),
+            None,
+        )
+        .await?
     };
     let mut pool_ready = !config.lazy_pool;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
@@ -2146,8 +2158,7 @@ async fn tokio_main() -> Result<()> {
                 .map(|channel| Uuid::parse_str(channel).expect("channel validated"))
                 .collect();
             RuntimeTransport::broker(
-                broker.base_url.clone(),
-                broker.credential.clone(),
+                broker.fence.clone(),
                 channel_ids,
                 broker.poll_interval,
                 config.keys.clone(),
@@ -2156,6 +2167,8 @@ async fn tokio_main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("broker connect error: {e}"))?
         }
     };
+
+    let mut authority_loss_rx = relay.take_authority_loss_rx();
 
     // Tell the relay background task the watermark so it can use
     // `since = watermark - 5s` on the first REQ instead of `since=now`.
@@ -2401,6 +2414,7 @@ async fn tokio_main() -> Result<()> {
         cwd,
         relay_features_enabled: config.agent_mode == AgentMode::Local,
         broker_actions,
+        authority_fence: authority_fence.clone(),
         rest_client: relay.rest_client(),
         channel_info,
         context_message_limit: config.context_message_limit,
@@ -2617,7 +2631,8 @@ async fn tokio_main() -> Result<()> {
                     "waking",
                     None,
                 );
-                let startup = PoolStartup::from_config(&config, observer.clone());
+                let startup =
+                    PoolStartup::from_config(&config, observer.clone(), authority_fence.clone());
                 let wake_tx = wake_tx.clone();
                 let wake_shutdown = shutdown_rx.clone();
                 wake_tasks.spawn(async move {
@@ -2655,9 +2670,12 @@ async fn tokio_main() -> Result<()> {
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
+                let authority = authority_fence.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result =
+                        spawn_and_init(&cmd, &args, &env, has_codex, idx, observer, authority)
+                            .await;
                     guard.send(result);
                 });
             }
@@ -2818,6 +2836,19 @@ async fn tokio_main() -> Result<()> {
                         }
                     }
                     None
+                }
+                authority_loss = async {
+                    match authority_loss_rx.as_mut() {
+                        Some(rx) => rx.await.ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    match authority_loss {
+                        Some(error) => tracing::error!(error, "managed ACP authority lost — exiting"),
+                        None => tracing::error!("managed ACP authority watcher closed — exiting"),
+                    }
+                    break;
                 }
                 // Remaining branches don't touch pool — evaluated when pool is idle.
                 buzz_event = relay.next_event() => {
@@ -3233,15 +3264,21 @@ async fn tokio_main() -> Result<()> {
                                     // to the universal cancel+merge `Steer`
                                     // signal so the event still reaches the
                                     // agent.
-                                    let native_attempted = matches!(signal, ControlSignal::Steer)
-                                        && try_native_steer(
+                                    let native_attempted = if matches!(signal, ControlSignal::Steer)
+                                    {
+                                        try_native_steer(
                                             &mut pool,
                                             &mut queue,
                                             buzz_event.channel_id,
                                             event_for_steer,
                                             prompt_tag_for_steer,
                                             &steer_ack_tx,
-                                        );
+                                            authority_fence.as_ref(),
+                                        )
+                                        .await
+                                    } else {
+                                        false
+                                    };
                                     if !native_attempted {
                                         signal_in_flight_task(
                                             &mut pool,
@@ -3938,14 +3975,32 @@ fn typing_scope_for_event(event: &nostr::Event) -> ThreadTags {
     scope
 }
 
-fn try_native_steer(
+async fn native_steer_authorized(authority: Option<&AuthorityFence>) -> bool {
+    let Some(authority) = authority else {
+        return true;
+    };
+    match authority.permit().await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, "managed ACP native steer rejected by authority fence");
+            false
+        }
+    }
+}
+
+async fn try_native_steer(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     channel_id: uuid::Uuid,
     event: nostr::Event,
     prompt_tag: String,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
+    authority: Option<&AuthorityFence>,
 ) -> bool {
+    if !native_steer_authorized(authority).await {
+        return false;
+    }
+
     // Build the steer body: framing strings come from
     // `queue::native_steer_framing()` (Eva's drift-proof requirement —
     // native and cancel+merge fallback share these so the agent gets the
@@ -4686,12 +4741,13 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let authority = config.broker.as_ref().map(|broker| broker.fence.clone());
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer, authority).await;
         guard.send(result);
     });
 }
@@ -4907,6 +4963,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let authority = config.broker.as_ref().map(|broker| broker.fence.clone());
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -4918,7 +4975,7 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer, authority).await;
         guard.send(result);
     });
 
@@ -4958,6 +5015,7 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
 
 struct PoolStartup {
     agents: u32,
+    authority_fence: Option<AuthorityFence>,
     command: String,
     args: Vec<String>,
     extra_env: Vec<(String, String)>,
@@ -4968,9 +5026,14 @@ struct PoolStartup {
 }
 
 impl PoolStartup {
-    fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
+    fn from_config(
+        config: &Config,
+        observer: Option<observer::ObserverHandle>,
+        authority_fence: Option<AuthorityFence>,
+    ) -> Self {
         Self {
             agents: config.agents,
+            authority_fence,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
             extra_env: config.persona_env_vars.clone(),
@@ -4990,6 +5053,14 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
+        if let Some(authority) = startup.authority_fence.as_ref() {
+            if let Err(error) = authority.permit().await {
+                shutdown_agent_slots(&mut agent_slots).await;
+                return Err(anyhow::anyhow!(
+                    "managed ACP spawn admission failed: {error}"
+                ));
+            }
+        }
         let spawn_result = AcpClient::spawn(
             &startup.command,
             &startup.args,
@@ -5100,7 +5171,14 @@ async fn spawn_and_init(
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
+    authority_fence: Option<AuthorityFence>,
 ) -> Result<(AcpClient, u32, String)> {
+    if let Some(authority) = authority_fence.as_ref() {
+        authority
+            .permit()
+            .await
+            .map_err(|error| anyhow::anyhow!("managed ACP spawn admission failed: {error}"))?;
+    }
     let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
@@ -5411,6 +5489,10 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                         value: String::new(),
                     },
                     EnvVar {
+                        name: "BUZZ_MANAGED_ACP_AUTHORITY".into(),
+                        value: String::new(),
+                    },
+                    EnvVar {
                         name: "BUZZ_RELAY_URL".into(),
                         value: config.relay_url.clone(),
                     },
@@ -5441,6 +5523,10 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                         EnvVar {
                             name: "BUZZ_BROKER_CREDENTIAL".into(),
                             value: broker.credential.clone(),
+                        },
+                        EnvVar {
+                            name: "BUZZ_MANAGED_ACP_AUTHORITY".into(),
+                            value: broker.authority_json.clone(),
                         },
                     ]
                 }
@@ -7246,13 +7332,33 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
-    fn broker_mcp_server_receives_only_broker_credentials() {
+    fn broker_mcp_server_receives_only_managed_broker_provisioning() {
         let mut config = test_config();
         config.agent_mode = config::AgentMode::Broker;
+        let authority: buzz_sdk::broker::AuthorityIdentity = serde_json::from_value(
+            serde_json::json!({
+                "communityRelayUrl": "wss://relay.example",
+                "logicalAgentPubkey": "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971",
+                "executorAgentPubkey": "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971",
+                "taskId": "40b68c08-ed45-4c4b-a1d8-e46d6478d642",
+                "generation": "8d86e776-0f6a-418b-b7fb-4f87be556591",
+                "location": {"kind": "local", "id": "desktop-a"},
+                "runtimeSupport": "exact"
+            }),
+        )
+        .unwrap();
+        let expected_authority_json = serde_json::to_string(&authority).unwrap();
         config.broker = Some(config::BrokerConfig {
             base_url: "http://127.0.0.1:8787".into(),
             credential: "broker-token".into(),
             relay_url: "wss://relay.example".into(),
+            authority_json: expected_authority_json.clone(),
+            fence: AuthorityFence::new(
+                "http://127.0.0.1:8787".into(),
+                "broker-token".into(),
+                authority,
+            )
+            .unwrap(),
             poll_interval: std::time::Duration::from_secs(1),
         });
 
@@ -7262,6 +7368,12 @@ mod build_mcp_servers_tests {
         assert!(names.contains(&"BUZZ_AGENT_MODE"));
         assert!(names.contains(&"BUZZ_BROKER_URL"));
         assert!(names.contains(&"BUZZ_BROKER_CREDENTIAL"));
+        let authority_env = server
+            .env
+            .iter()
+            .find(|env| env.name == "BUZZ_MANAGED_ACP_AUTHORITY")
+            .expect("managed authority is forwarded to the MCP effect client");
+        assert_eq!(authority_env.value, expected_authority_json);
         assert!(!names.contains(&"BUZZ_RELAY_URL"));
         assert!(!names.contains(&"BUZZ_PRIVATE_KEY"));
         assert!(!names.contains(&"BUZZ_AUTH_TAG"));

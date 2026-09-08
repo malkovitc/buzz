@@ -12,15 +12,17 @@ pub mod args;
 pub mod outcomes;
 
 pub use args::{
-    ActionArgs, AgentTarget, AgentsCreateArgs, AgentsDeleteArgs, AgentsUpdateArgs, ChannelReadArgs,
-    LivenessPingArgs, MessagePostArgs, MessageReplyArgs, ObserverEmitArgs, ObserverFrame,
-    PresenceSetArgs, ProfileSetArgs, ReactionAddArgs, StorageAddressArgs, StorageGetArgs,
-    StoragePutArgs, TypingSetArgs,
+    ActionArgs, AgentTarget, AgentsCreateArgs, AgentsDeleteArgs, AgentsUpdateArgs,
+    AuthorityStatusArgs, ChannelReadArgs, LivenessPingArgs, MessagePostArgs, MessageReplyArgs,
+    ObserverEmitArgs, ObserverFrame, PresenceSetArgs, ProfileSetArgs, ReactionAddArgs,
+    StorageAddressArgs, StorageGetArgs, StoragePutArgs, TypingSetArgs,
 };
 pub use buzz_core::presence::PresenceStatus;
 pub use outcomes::{
-    ActionOutcome, AgentsCreateOutcome, AgentsDeleteOutcome, AgentsUpdateOutcome, BrokerMessage,
-    EventPublished, MessagePage, ObserverReceipt, StorageAddress, StorageRecord,
+    ActionOutcome, AgentsCreateOutcome, AgentsDeleteOutcome, AgentsUpdateOutcome,
+    AuthorityIdentity, AuthorityState, BrokerMessage, EventPublished, ManagedAcpAuthority,
+    MessagePage, ObserverReceipt, RuntimeLocation, RuntimeLocationKind, RuntimeSupport,
+    StorageAddress, StorageRecord,
 };
 
 /// Maximum characters in a display name or agent name.
@@ -164,6 +166,8 @@ impl std::fmt::Display for PubkeyHex {
 /// An action name the broker can dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
+    /// Read the authenticated session's managed-ACP authority binding.
+    AuthorityStatus,
     /// Read messages from a channel, thread, or mention feed after a cursor.
     ChannelRead,
     /// Post a top-level channel message.
@@ -198,10 +202,11 @@ pub enum Action {
 
 impl Action {
     /// Every action in this protocol version, in wire-name order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::AgentsCreate,
         Self::AgentsDelete,
         Self::AgentsUpdate,
+        Self::AuthorityStatus,
         Self::ChannelRead,
         Self::LivenessPing,
         Self::MessagePost,
@@ -220,6 +225,7 @@ impl Action {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::AuthorityStatus => "authority.status",
             Self::ChannelRead => "channel.read",
             Self::MessagePost => "message.post",
             Self::MessageReply => "message.reply",
@@ -344,6 +350,38 @@ fn channel(value: &str) -> Result<String, SdkError> {
     uuid::Uuid::parse_str(&value)
         .map(|id| id.as_hyphenated().to_string())
         .map_err(|_| SdkError::InvalidInput(format!("invalid channel UUID: {value}")))
+}
+
+fn authority_uuid(value: &str, label: &str) -> Result<String, SdkError> {
+    let value = required(value, label, 128)?;
+    uuid::Uuid::parse_str(&value)
+        .map(|id| id.as_hyphenated().to_string())
+        .map_err(|_| SdkError::InvalidInput(format!("invalid {label} UUID")))
+}
+
+fn authority_uuid_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let raw = String::deserialize(deserializer)?;
+    authority_uuid(&raw, "authority identifier").map_err(D::Error::custom)
+}
+
+fn community_relay_url(value: &str) -> Result<String, SdkError> {
+    buzz_core::relay::normalize_relay_url(value)
+        .map_err(|error| SdkError::InvalidInput(format!("invalid community relay URL: {error}")))
+}
+
+fn community_relay_url_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let raw = String::deserialize(deserializer)?;
+    community_relay_url(&raw).map_err(D::Error::custom)
 }
 
 /// Deserialize a `channelId`, canonicalizing it and rejecting a non-UUID.

@@ -81,6 +81,7 @@ export BUZZ_AGENT_MODE=broker
 export BUZZ_BROKER_URL=http://127.0.0.1:8787
 export BUZZ_BROKER_CREDENTIAL=dev-token
 export BUZZ_BROKER_RELAY_URL=wss://relay.example
+export BUZZ_MANAGED_ACP_AUTHORITY='{"communityRelayUrl":"wss://relay.example","logicalAgentPubkey":"<64-hex-pubkey>","executorAgentPubkey":"<64-hex-pubkey>","taskId":"<uuid>","generation":"<uuid>","location":{"kind":"cloud","id":"runtime-b"},"runtimeSupport":"portable"}'
 export BUZZ_ACP_CHANNELS=5df7dfa8-e919-43df-8efd-f1dcb8af7071
 export BUZZ_ACP_AGENT_OWNER=a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971
 unset BUZZ_PRIVATE_KEY BUZZ_RELAY_URL BUZZ_AUTH_TAG
@@ -88,8 +89,20 @@ unset BUZZ_PRIVATE_KEY BUZZ_RELAY_URL BUZZ_AUTH_TAG
 buzz-acp
 ```
 
-Broker mode requires explicit channel UUIDs and `respond-to=owner-only` because
-the contract does not expose channel discovery or metadata. Core-memory reads,
+Broker mode requires explicit channel UUIDs, `respond-to=owner-only`, and an
+exact `BUZZ_MANAGED_ACP_AUTHORITY` expectation issued alongside the credential.
+Before startup, every agent spawn/respawn, native steer, and every ACP prompt,
+the harness asks the authenticated host for `authority.status` and admits only
+an `active`, exact identity with `exact` or `portable` runtime support. Prompt
+admission is checked again after context/session setup at the actual ACP call. A mismatched, quiescing,
+fenced, malformed, unreachable, or unauthenticated verdict fails closed. A
+background verdict loss closes intake and terminates the harness. Broker-mode
+children receive the normalized non-secret expectation so the managed `buzz`
+CLI can preflight each action, but never receive direct relay credentials.
+Client preflight narrows the race; a production broker must still validate the
+credential generation atomically with response publication or effect commit.
+
+The contract does not expose channel discovery or metadata. Core-memory reads,
 presence, typing, observer telemetry, and turn liveness use broker actions.
 `BUZZ_BROKER_RELAY_URL` identifies the relay behind the broker for desktop
 observer/runtime pairing only; the harness and its children never connect to it.
@@ -153,6 +166,7 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_BROKER_URL` | broker only | — | Broker base URL; actions are posted to `/v1/action`. |
 | `BUZZ_BROKER_CREDENTIAL` | broker only | — | Bearer credential issued by the broker host. |
 | `BUZZ_BROKER_RELAY_URL` | broker only | — | Relay identity behind the broker, used only for observer/runtime pairing; never connected to directly. |
+| `BUZZ_MANAGED_ACP_AUTHORITY` | broker only | — | Strict host-issued JSON expectation binding community, logical/executor pubkeys, task UUID, generation UUID, runtime location, and continuation support. |
 | `BUZZ_BROKER_POLL_INTERVAL_MS` | no | `1000` | Broker `channel.read` polling interval; minimum `100`. |
 | `BUZZ_ACP_CHANNELS` | broker only | — | Comma-separated channel UUIDs to poll. |
 | `BUZZ_ACP_AGENT_OWNER` | broker only | — | Owner pubkey accepted by the broker-mode author gate. |

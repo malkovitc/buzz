@@ -107,6 +107,10 @@ struct Cli {
     #[arg(long, env = "BUZZ_BROKER_CREDENTIAL", hide_env_values = true)]
     broker_credential: Option<String>,
 
+    /// Strict non-secret managed-ACP generation expected from the host.
+    #[arg(long, env = "BUZZ_MANAGED_ACP_AUTHORITY", hide_env_values = true)]
+    managed_authority: Option<String>,
+
     /// Output format: 'json' (default, full fields) or 'compact' (reduced fields).
     #[arg(long, value_enum, default_value = "json")]
     format: OutputFormat,
@@ -2142,7 +2146,18 @@ async fn run_broker(cli: Cli) -> Result<(), CliError> {
                 .into(),
         )
     })?;
-    let backend = backend::Backend::broker(base_url, credential)?;
+    let authority_json = cli.managed_authority.ok_or_else(|| {
+        CliError::Auth(
+            "--managed-authority (BUZZ_MANAGED_ACP_AUTHORITY) is required when --agent-mode=broker"
+                .into(),
+        )
+    })?;
+    let authority: buzz_sdk::broker::AuthorityIdentity = serde_json::from_str(&authority_json)
+        .map_err(|_| CliError::Auth("managed ACP authority identity is malformed".into()))?;
+    let authority = authority
+        .validated()
+        .map_err(|_| CliError::Auth("managed ACP authority identity is invalid".into()))?;
+    let backend = backend::Backend::broker(base_url, credential, authority)?;
 
     match cli.command {
         Cmd::Messages(sub) => commands::messages::dispatch_broker(sub, &backend).await,

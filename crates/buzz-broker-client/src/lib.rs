@@ -5,6 +5,10 @@
 //! back. Callers use [`buzz_sdk::broker::BrokerClientExt::execute`], which adds
 //! correlation checks; this type never interprets a verdict.
 
+mod authority;
+
+pub use authority::{AuthorityError, AuthorityFence};
+
 use buzz_sdk::broker::actions::MAX_ENCODED_MESSAGE_BYTES;
 use buzz_sdk::broker::{
     BrokerClient, BrokerFuture, BrokerResponse, BrokerTransportError, Dispatch, PreparedRequest,
