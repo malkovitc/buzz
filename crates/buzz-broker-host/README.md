@@ -31,7 +31,21 @@ logs, or shell history. Issuance fails if the exact generation was ever issued
 before or another generation is active for the same normalized
 community/logical-agent/task scope.
 
-Fence the exact identity using the non-secret authority file:
+Close new admission for the exact identity using the non-secret authority file:
+
+```bash
+buzz-broker-host --state /var/lib/buzz-broker/authority.db quiesce \
+  --authority-file /secure/input/authority.json
+```
+
+Quiescing is durable and idempotent. `authority.status` reports `quiescing`, so
+managed clients refuse new turns. The generation still reserves its scope, and
+exact retries of already admitted message effects can reconcile while new
+message requests fail. Old `active` status receipts are invalidated at the
+transition. An already-running v2 host sees the underlying state as `fenced`
+and fails closed; the v3 host retains the scope reservation until final fence.
+
+Fence the exact identity after pending effects have resolved:
 
 ```bash
 buzz-broker-host --state /var/lib/buzz-broker/authority.db fence \
@@ -41,7 +55,7 @@ buzz-broker-host --state /var/lib/buzz-broker/authority.db fence \
 Fencing is monotonic and idempotent. It refuses to complete while a previously
 admitted message effect is unresolved. A fenced exact generation cannot be
 reissued. Fencing atomically invalidates prior status receipts so a lost
-pre-fence `active` response can never be replayed after the transition. The
+pre-fence `active` or `quiescing` response can never be replayed after the transition. The
 bearer remains recognizable only so a fresh `authority.status` can return the
 terminal `fenced` verdict; it cannot regain active authority.
 
@@ -80,7 +94,8 @@ origin, including when the WebSocket identity URL contains a path or query.
 
 This slice does **not** provision signer files or broker credentials into
 Desktop/Kubernetes launchers, serve the other broker actions, execute Git
-effects, quiesce/drain a runtime, activate a second runtime, or serve TLS.
+effects, drain a runtime or pending effect automatically, activate a second
+runtime, or serve TLS.
 An unresolved effect currently needs an exact request retry while the relay is
 reachable; automatic background drain and two-runtime cutover remain MOBILITY
 3B3. Voice 2 remains blocked until the host boundary is adopted by its launch

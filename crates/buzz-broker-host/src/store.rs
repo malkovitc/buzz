@@ -18,8 +18,10 @@ use crate::credential::CredentialDigest;
 #[cfg(unix)]
 use crate::signing::HostSigner;
 
+mod lifecycle;
+
 #[cfg(unix)]
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 #[cfg(unix)]
 const EFFECTS_TABLE_SQL: &str = "CREATE TABLE broker_effects (
     credential_hash BLOB NOT NULL,
@@ -93,15 +95,18 @@ impl AuthorityStore {
 
     #[cfg(unix)]
     async fn initialize(&self) -> Result<(), StoreError> {
-        let current: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        match current {
-            0 => self.create_schema().await?,
-            1 => self.migrate_schema_v2().await?,
-            SCHEMA_VERSION => {}
-            _ => return Err(StoreError::UnsupportedSchema),
+        loop {
+            let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+            match current {
+                0 => self.create_schema().await?,
+                1 => self.migrate_schema_v2().await?,
+                2 => self.migrate_schema_v3().await?,
+                SCHEMA_VERSION => break,
+                _ => return Err(StoreError::UnsupportedSchema),
+            }
         }
         let integrity: String = sqlx::query_scalar("PRAGMA quick_check")
             .fetch_one(&self.pool)
@@ -125,6 +130,13 @@ impl AuthorityStore {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|_| StoreError::Unavailable)?;
+        let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if current != 0 {
+            return Ok(());
+        }
         sqlx::query(
             "CREATE TABLE broker_authorities (
                 credential_hash BLOB PRIMARY KEY NOT NULL CHECK(length(credential_hash) = 32),
@@ -132,6 +144,7 @@ impl AuthorityStore {
                 authority_scope BLOB NOT NULL CHECK(length(authority_scope) = 32),
                 generation TEXT NOT NULL,
                 state TEXT NOT NULL CHECK(state IN ('active', 'fenced')),
+                quiescing INTEGER NOT NULL DEFAULT 0 CHECK(quiescing IN (0, 1)),
                 UNIQUE(authority_scope, generation)
             ) STRICT",
         )
@@ -139,8 +152,9 @@ impl AuthorityStore {
         .await
         .map_err(|_| StoreError::Unavailable)?;
         sqlx::query(
-            "CREATE UNIQUE INDEX one_active_generation_per_scope
-             ON broker_authorities(authority_scope) WHERE state = 'active'",
+            "CREATE UNIQUE INDEX one_unfenced_generation_per_scope
+             ON broker_authorities(authority_scope)
+             WHERE state = 'active' OR quiescing = 1",
         )
         .execute(&mut *transaction)
         .await
@@ -163,7 +177,7 @@ impl AuthorityStore {
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
-        sqlx::query("PRAGMA user_version = 2")
+        sqlx::query("PRAGMA user_version = 3")
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
@@ -184,7 +198,14 @@ impl AuthorityStore {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|_| StoreError::Unavailable)?;
-        require_canonical_authority_state(&mut transaction).await?;
+        let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if current != 1 {
+            return Ok(());
+        }
+        lifecycle::require_canonical_authority_state_v2(&mut transaction).await?;
         sqlx::query(EFFECTS_TABLE_SQL)
             .execute(&mut *transaction)
             .await
@@ -237,7 +258,10 @@ impl AuthorityStore {
         }
 
         let scope_active: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM broker_authorities WHERE authority_scope = ? AND state = 'active')",
+            "SELECT EXISTS(
+                SELECT 1 FROM broker_authorities
+                WHERE authority_scope = ? AND (state = 'active' OR quiescing = 1)
+            )",
         )
         .bind(scope.as_slice())
         .fetch_one(&mut *transaction)
@@ -280,8 +304,8 @@ impl AuthorityStore {
             .await
             .map_err(|_| StoreError::Unavailable)?;
         require_canonical_authority_state(&mut transaction).await?;
-        let state: Option<String> =
-            sqlx::query_scalar("SELECT state FROM broker_authorities WHERE authority_json = ?")
+        let row =
+            sqlx::query("SELECT state, quiescing FROM broker_authorities WHERE authority_json = ?")
                 .bind(&authority_json)
                 .fetch_optional(&mut *transaction)
                 .await
@@ -301,20 +325,28 @@ impl AuthorityStore {
         if pending {
             return Err(StoreError::EffectsPending);
         }
-        match state.as_deref() {
-            Some("fenced") => {}
-            Some("active") => {
+        let state = row
+            .map(|row| {
+                let state: String = row.try_get("state").map_err(|_| StoreError::Integrity)?;
+                let quiescing: i64 = row
+                    .try_get("quiescing")
+                    .map_err(|_| StoreError::Integrity)?;
+                parse_state(&state, quiescing)
+            })
+            .transpose()?
+            .ok_or(StoreError::AuthorityNotFound)?;
+        match state {
+            AuthorityState::Fenced => {}
+            AuthorityState::Active | AuthorityState::Quiescing => {
                 sqlx::query(
-                    "UPDATE broker_authorities SET state = 'fenced'
-                     WHERE authority_json = ? AND state = 'active'",
+                    "UPDATE broker_authorities SET state = 'fenced', quiescing = 0
+                     WHERE authority_json = ? AND (state = 'active' OR quiescing = 1)",
                 )
                 .bind(&authority_json)
                 .execute(&mut *transaction)
                 .await
                 .map_err(|_| StoreError::Unavailable)?;
             }
-            Some(_) => return Err(StoreError::Integrity),
-            None => return Err(StoreError::AuthorityNotFound),
         }
         invalidate_authority_receipts(&mut transaction, &authority_json).await?;
         transaction
@@ -705,7 +737,7 @@ async fn require_canonical_authority_state(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<(), StoreError> {
     let rows = sqlx::query(
-        "SELECT authority_json, authority_scope, generation, state FROM broker_authorities",
+        "SELECT authority_json, authority_scope, generation, state, quiescing FROM broker_authorities",
     )
     .fetch_all(&mut **transaction)
     .await
@@ -721,8 +753,11 @@ async fn require_canonical_authority_state(
             .try_get("generation")
             .map_err(|_| StoreError::Integrity)?;
         let state: String = row.try_get("state").map_err(|_| StoreError::Integrity)?;
+        let quiescing: i64 = row
+            .try_get("quiescing")
+            .map_err(|_| StoreError::Integrity)?;
         decode_canonical_identity(&authority_json, &stored_scope, &stored_generation)?;
-        parse_state(&state)?;
+        parse_state(&state, quiescing)?;
     }
     Ok(())
 }
@@ -732,7 +767,7 @@ async fn load_authority(
     credential: &CredentialDigest,
 ) -> Result<StoredAuthority, StoreError> {
     let row = sqlx::query(
-        "SELECT authority_json, authority_scope, generation, state
+        "SELECT authority_json, authority_scope, generation, state, quiescing
          FROM broker_authorities WHERE credential_hash = ?",
     )
     .bind(credential.as_bytes())
@@ -744,6 +779,9 @@ async fn load_authority(
         .try_get("authority_json")
         .map_err(|_| StoreError::Integrity)?;
     let state: String = row.try_get("state").map_err(|_| StoreError::Integrity)?;
+    let quiescing: i64 = row
+        .try_get("quiescing")
+        .map_err(|_| StoreError::Integrity)?;
     let stored_scope: Vec<u8> = row
         .try_get("authority_scope")
         .map_err(|_| StoreError::Integrity)?;
@@ -753,7 +791,7 @@ async fn load_authority(
     let identity = decode_canonical_identity(&authority_json, &stored_scope, &stored_generation)?;
     Ok(StoredAuthority {
         identity,
-        state: parse_state(&state)?,
+        state: parse_state(&state, quiescing)?,
     })
 }
 
@@ -820,10 +858,11 @@ fn decode_canonical_identity(
     Ok(identity)
 }
 
-fn parse_state(value: &str) -> Result<AuthorityState, StoreError> {
-    match value {
-        "active" => Ok(AuthorityState::Active),
-        "fenced" => Ok(AuthorityState::Fenced),
+fn parse_state(value: &str, quiescing: i64) -> Result<AuthorityState, StoreError> {
+    match (value, quiescing) {
+        ("active", 0) => Ok(AuthorityState::Active),
+        ("fenced", 1) => Ok(AuthorityState::Quiescing),
+        ("fenced", 0) => Ok(AuthorityState::Fenced),
         _ => Err(StoreError::Integrity),
     }
 }

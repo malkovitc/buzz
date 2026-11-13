@@ -44,6 +44,12 @@ enum Command {
         #[arg(long)]
         authority_file: PathBuf,
     },
+    /// Stop new work for one exact authority while existing effects drain.
+    Quiesce {
+        /// JSON file containing the exact issued AuthorityIdentity.
+        #[arg(long)]
+        authority_file: PathBuf,
+    },
     /// Serve the broker action endpoint on loopback.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
@@ -72,6 +78,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Fence { authority_file } => {
             issuer::fence_from_file(&store, &authority_file).await?;
             println!("fenced");
+        }
+        Command::Quiesce { authority_file } => {
+            let state = issuer::quiesce_from_file(&store, &authority_file).await?;
+            match state {
+                buzz_sdk::broker::AuthorityState::Quiescing => println!("quiescing"),
+                buzz_sdk::broker::AuthorityState::Fenced => println!("fenced"),
+                buzz_sdk::broker::AuthorityState::Active => unreachable!("quiesce closes intake"),
+            }
         }
         Command::Serve {
             bind,
