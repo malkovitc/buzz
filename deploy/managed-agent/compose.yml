@@ -1,0 +1,79 @@
+name: buzz-managed-agent
+
+services:
+  broker-host:
+    image: ${BUZZ_BROKER_HOST_IMAGE:?pin a broker-host image}
+    user: "1000:1000"
+    command:
+      - --state
+      - /broker/state/authority.db
+      - serve
+      - --bind
+      - 127.0.0.1:8787
+      - --signing-key-file
+      - /broker/signing/agent.key
+      - --auth-tag-file
+      - /broker/signing/owner.auth-tag
+    volumes:
+      - type: bind
+        source: ${BUZZ_BROKER_STATE_DIR:?set the private state directory}
+        target: /broker/state
+      - type: bind
+        source: ${BUZZ_BROKER_SIGNING_DIR:?set the private signing directory}
+        target: /broker/signing
+        read_only: true
+      - type: bind
+        source: ${BUZZ_BROKER_CREDENTIAL_DIR:?set the private credential directory}
+        target: /broker/credential
+      - type: bind
+        source: ${BUZZ_BROKER_AUTHORITY_FILE:?set the authority JSON file}
+        target: /broker/authority.json
+        read_only: true
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--show-error", "--max-time", "2", "--output", "/dev/null", "http://127.0.0.1:8787/v1/action"]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+      start_period: 10s
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  agent:
+    image: ${BUZZ_SPRIG_IMAGE:?pin a Sprig image}
+    user: "1000:1000"
+    network_mode: service:broker-host
+    depends_on:
+      broker-host:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/run/buzz/agent-entrypoint.sh"]
+    working_dir: /workspace
+    environment:
+      BUZZ_AGENT_MODE: broker
+      BUZZ_BROKER_URL: http://127.0.0.1:8787
+      BUZZ_BROKER_RELAY_URL: ${BUZZ_RELAY_URL:?set the community relay URL}
+      BUZZ_ACP_CHANNELS: ${BUZZ_ACP_CHANNELS:?set at least one channel UUID}
+      BUZZ_ACP_AGENT_OWNER: ${BUZZ_ACP_AGENT_OWNER:?set the owner pubkey}
+      BUZZ_ACP_RESPOND_TO: owner-only
+      BUZZ_ACP_AGENT_COMMAND: ${BUZZ_ACP_AGENT_COMMAND:-buzz-agent}
+      BUZZ_ACP_AGENT_ARGS: ${BUZZ_ACP_AGENT_ARGS:-}
+      RUST_LOG: ${BUZZ_ACP_RUST_LOG:-buzz_acp=info}
+    volumes:
+      - type: bind
+        source: ${BUZZ_BROKER_CREDENTIAL_DIR:?set the private credential directory}
+        target: /run/buzz/credential
+        read_only: true
+      - type: bind
+        source: ${BUZZ_BROKER_AUTHORITY_FILE:?set the authority JSON file}
+        target: /run/buzz/authority.json
+        read_only: true
+      - type: bind
+        source: ./agent-entrypoint.sh
+        target: /run/buzz/agent-entrypoint.sh
+        read_only: true
+      - type: bind
+        source: ${BUZZ_AGENT_WORKSPACE_DIR:?set the agent workspace directory}
+        target: /workspace
+    restart: "on-failure:3"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]

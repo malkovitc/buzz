@@ -72,6 +72,10 @@ jobs:
             broker_host:
               - 'crates/buzz-broker-host/**'
               - '.github/workflows/ci.yml'
+            managed_agent_launcher:
+              - 'Dockerfile.broker-host'
+              - 'deploy/managed-agent/**'
+              - '.github/workflows/ci.yml'
             desktop:
               - 'scripts/model-capabilities.json'
               - 'scripts/normative-corpus.json'
@@ -138,6 +142,9 @@ jobs:
         run: |
           scripts/test-rust-cache-contract.sh
           scripts/test-rust-cache-contract-regressions.sh
+      - name: Managed agent launcher contract
+        if: github.ref == 'refs/heads/release' || steps.filter.outputs.managed_agent_launcher == 'true'
+        run: bash deploy/managed-agent/test-compose.sh
       - name: File size policy
         run: just file-size-check
 
