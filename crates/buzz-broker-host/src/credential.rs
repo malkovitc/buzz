@@ -10,6 +10,11 @@ const ENCODED_BYTES: usize = 43;
 pub(crate) struct CredentialDigest([u8; 32]);
 
 impl CredentialDigest {
+    #[cfg(unix)]
+    pub(crate) fn from_hash(hash: [u8; 32]) -> Self {
+        Self(hash)
+    }
+
     pub(crate) fn from_bearer(value: &str) -> Result<Self, CredentialError> {
         let encoded = value
             .strip_prefix(PREFIX)

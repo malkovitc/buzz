@@ -30,7 +30,7 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["user"] }
+nix = { version = "0.31", default-features = false, features = ["user", "fs"] }
 
 [dev-dependencies]
 buzz-broker-client = { workspace = true }

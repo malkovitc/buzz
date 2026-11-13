@@ -41,7 +41,7 @@ pub(crate) async fn quiesce_from_file(
     store.quiesce(&identity).await.map_err(IssuerError::Store)
 }
 
-fn read_identity(path: &Path) -> Result<AuthorityIdentity, IssuerError> {
+pub(crate) fn read_identity(path: &Path) -> Result<AuthorityIdentity, IssuerError> {
     let metadata = std::fs::metadata(path).map_err(|_| IssuerError::AuthorityFile)?;
     if !is_bounded_authority_file(&metadata) {
         return Err(IssuerError::AuthorityFile);
