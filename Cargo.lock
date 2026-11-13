@@ -986,6 +986,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-broker-host"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "buzz-broker-client",
+ "buzz-sdk",
+ "clap",
+ "hex",
+ "nix 0.31.3",
+ "rand 0.10.1",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "buzz-cli"
 version = "0.1.0"
 dependencies = [
@@ -4597,6 +4622,7 @@ version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]

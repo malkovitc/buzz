@@ -20,6 +20,7 @@ members = [
     "crates/buzz-media",
     "crates/buzz-cli",
     "crates/buzz-broker-client",
+    "crates/buzz-broker-host",
     "crates/buzz-pairing-cli",
     "crates/buzz-sdk",
     "crates/buzz-persona",
