@@ -187,11 +187,11 @@ async fn action(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         return broker_response(response);
     }
     #[cfg(unix)]
-    if request.action() == Action::MessagePost {
+    if matches!(request.action(), Action::MessagePost | Action::MessageReply) {
         if let Some(effects) = &state.effects {
             return broker_response(
                 effects
-                    .execute_message_post(&state.store, &credential, &body, &request)
+                    .execute_message_effect(&state.store, &credential, &body, &request)
                     .await,
             );
         }
@@ -206,7 +206,7 @@ async fn action(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
 
 #[cfg(unix)]
 impl EffectService {
-    async fn execute_message_post(
+    async fn execute_message_effect(
         &self,
         store: &AuthorityStore,
         credential: &CredentialDigest,
@@ -215,11 +215,49 @@ impl EffectService {
     ) -> BrokerResponse {
         let mut publication_guard = None;
         let mut was_pending_before_lock = false;
+        let mut thread = None;
         let admission = loop {
-            match store
-                .prepare_message_post(credential, body, request, &self.signer)
-                .await
-            {
+            let prepared = match request.args() {
+                ActionArgs::MessagePost(_) => {
+                    store
+                        .prepare_message_post(credential, body, request, &self.signer)
+                        .await
+                }
+                ActionArgs::MessageReply(_) => {
+                    store
+                        .prepare_message_reply(
+                            credential,
+                            body,
+                            request,
+                            &self.signer,
+                            thread.as_ref(),
+                        )
+                        .await
+                }
+                _ => return internal_failure(request.request_id()),
+            };
+            match prepared {
+                Ok(EffectAdmission::NeedsReplyTarget(relay_url)) => {
+                    let ActionArgs::MessageReply(args) = request.args() else {
+                        return internal_failure(request.request_id());
+                    };
+                    thread = match self
+                        .publisher
+                        .resolve_reply_target(&self.signer, &relay_url, args)
+                        .await
+                    {
+                        Ok(thread) => Some(thread),
+                        Err(_) => {
+                            return BrokerResponse::new(
+                                request.request_id(),
+                                BrokerResult::failed(BrokerError::new(
+                                    BrokerErrorCode::ActionFailed,
+                                    "reply target could not be verified in this channel",
+                                )),
+                            )
+                        }
+                    };
+                }
                 Ok(EffectAdmission::Pending(_, _, was_pending)) if publication_guard.is_none() => {
                     was_pending_before_lock = was_pending;
                     publication_guard =
@@ -262,6 +300,7 @@ impl EffectService {
         };
         let _publication_guard = publication_guard;
         match admission {
+            EffectAdmission::NeedsReplyTarget(_) => internal_failure(request.request_id()),
             EffectAdmission::Conflict => BrokerResponse::new(
                 request.request_id(),
                 BrokerResult::failed(BrokerError::new(
@@ -284,7 +323,7 @@ impl EffectService {
                     return indeterminate(request.request_id());
                 }
                 store
-                    .complete_message_post(credential, request.request_id(), &event.id.to_hex())
+                    .complete_message_effect(credential, request.request_id(), &event.id.to_hex())
                     .await
                     .unwrap_or_else(|_| indeterminate(request.request_id()))
             }

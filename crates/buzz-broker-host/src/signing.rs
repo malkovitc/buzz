@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use buzz_sdk::broker::{AuthorityIdentity, MessagePostArgs, PubkeyHex, StorageAddress};
+use buzz_sdk::broker::{
+    AuthorityIdentity, MessagePostArgs, MessageReplyArgs, PubkeyHex, StorageAddress,
+};
+use buzz_sdk::ThreadRef;
 use nostr::{Event, EventBuilder, JsonUtil as _, Keys, Kind, PublicKey, Tag};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
@@ -129,6 +132,29 @@ impl HostSigner {
             uuid::Uuid::parse_str(&args.channel_id).map_err(|_| SigningError::InvalidMessage)?;
         let mentions: Vec<&str> = args.mentions.iter().map(PubkeyHex::as_str).collect();
         buzz_sdk::build_message(channel, &args.content, None, &mentions, false, &[])
+            .map_err(|_| SigningError::InvalidMessage)?
+            .tags([self.auth_tag.clone()])
+            .sign_with_keys(&self.keys)
+            .map_err(|_| SigningError::Sign)
+    }
+
+    pub(crate) fn sign_reply(
+        &self,
+        identity: &AuthorityIdentity,
+        args: &MessageReplyArgs,
+        thread: &ThreadRef,
+    ) -> Result<Event, SigningError> {
+        if !self.matches_executor(identity) {
+            return Err(SigningError::ExecutorMismatch);
+        }
+        let args = args.validated().map_err(|_| SigningError::InvalidMessage)?;
+        if thread.parent_event_id.to_hex() != args.reply_to_event_id {
+            return Err(SigningError::InvalidMessage);
+        }
+        let channel =
+            uuid::Uuid::parse_str(&args.channel_id).map_err(|_| SigningError::InvalidMessage)?;
+        let mentions: Vec<&str> = args.mentions.iter().map(PubkeyHex::as_str).collect();
+        buzz_sdk::build_message(channel, &args.content, Some(thread), &mentions, false, &[])
             .map_err(|_| SigningError::InvalidMessage)?
             .tags([self.auth_tag.clone()])
             .sign_with_keys(&self.keys)

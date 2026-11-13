@@ -24,6 +24,7 @@ mod effects;
 mod lifecycle;
 mod read;
 mod receipts;
+mod reply;
 mod storage;
 
 struct Fixture {

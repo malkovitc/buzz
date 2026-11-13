@@ -15,7 +15,7 @@ use std::{
 
 #[tokio::test]
 #[ignore = "requires built buzz-acp and buzz binaries; run with BUZZ_E2E_ACP_BIN and BUZZ_E2E_CLI_BIN"]
-async fn actual_keyless_acp_reads_posts_and_loses_authority_after_fence() {
+async fn actual_keyless_acp_reads_replies_and_loses_authority_after_fence() {
     let acp_bin = std::env::var("BUZZ_E2E_ACP_BIN").expect("absolute buzz-acp binary path");
     let cli_bin = std::env::var("BUZZ_E2E_CLI_BIN").expect("absolute buzz binary path");
     let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -154,6 +154,12 @@ async fn actual_keyless_acp_reads_posts_and_loses_authority_after_fence() {
         .tags
         .iter()
         .any(|tag| { tag.kind().to_string() == "h" && tag.content() == Some(CHANNEL_ID) }));
+    assert!(reply.tags.iter().any(|tag| {
+        let parts = tag.as_slice();
+        parts.first().map(String::as_str) == Some("e")
+            && parts.get(1).map(String::as_str) == Some(owner_event.id.to_hex().as_str())
+            && parts.get(3).map(String::as_str) == Some("reply")
+    }));
 
     assert!(
         child.try_wait().unwrap().is_none(),

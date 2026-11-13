@@ -63,8 +63,8 @@ fn host_signer_rejects_private_files_in_writable_directory() {
 
 #[test]
 fn host_signer_only_signs_message_for_bound_executor_identity() {
-    use buzz_sdk::broker::MessagePostArgs;
-    use nostr::Keys;
+    use buzz_sdk::broker::{MessagePostArgs, MessageReplyArgs};
+    use nostr::{EventBuilder, Keys, Kind, Tag};
     use std::os::unix::fs::PermissionsExt as _;
 
     let directory = tempfile::tempdir().expect("private fixture directory");
@@ -106,6 +106,33 @@ fn host_signer_only_signs_message_for_bound_executor_identity() {
             .count(),
         1
     );
+    let parent = EventBuilder::new(Kind::Custom(9), "parent")
+        .tags([Tag::parse(["h", CHANNEL_ID]).unwrap()])
+        .sign_with_keys(&owner)
+        .unwrap();
+    let reply_args = MessageReplyArgs {
+        channel_id: CHANNEL_ID.into(),
+        reply_to_event_id: parent.id.to_hex(),
+        content: "thread reply".into(),
+        mentions: Vec::new(),
+    };
+    let reply = signer
+        .sign_reply(
+            &identity,
+            &reply_args,
+            &buzz_sdk::ThreadRef {
+                root_event_id: parent.id,
+                parent_event_id: parent.id,
+            },
+        )
+        .expect("matching executor signs reply");
+    assert!(reply.verify().is_ok());
+    assert!(reply.tags.iter().any(|tag| {
+        let parts = tag.as_slice();
+        parts.first().map(String::as_str) == Some("e")
+            && parts.get(1).map(String::as_str) == Some(parent.id.to_hex().as_str())
+            && parts.get(3).map(String::as_str) == Some("reply")
+    }));
 
     identity.executor_agent_pubkey =
         buzz_sdk::broker::PubkeyHex::parse(Keys::generate().public_key().to_hex())
@@ -198,9 +225,51 @@ async fn message_effect_admission_survives_restart_and_blocks_fence_until_termin
             if error.code == BrokerErrorCode::RequestIdConflict
     ));
 
+    drop(store);
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(&fixture.state),
+    )
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE broker_effects RENAME TO broker_effects_v6")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE broker_effects (
+            credential_hash BLOB NOT NULL,
+            request_id TEXT NOT NULL,
+            request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+            action TEXT NOT NULL CHECK(action = 'message.post'),
+            event_json TEXT NOT NULL,
+            response_json TEXT,
+            PRIMARY KEY (credential_hash, request_id),
+            FOREIGN KEY (credential_hash) REFERENCES broker_authorities(credential_hash)
+        ) STRICT",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO broker_effects SELECT credential_hash, request_id, request_digest,
+             action, event_json, response_json FROM broker_effects_v6",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TABLE broker_effects_v6")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA user_version = 5")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
     let reopened = AuthorityStore::open(&fixture.state)
         .await
-        .expect("pending journal survives restart");
+        .expect("v5 pending journal survives upgrade");
     let duplicate = reopened
         .prepare_message_post(&credential, request.body(), &validated, &signer)
         .await
@@ -254,7 +323,7 @@ async fn message_effect_admission_survives_restart_and_blocks_fence_until_termin
     ));
 
     let outcome = reopened
-        .complete_message_post(&credential, "effect-1", &event_id)
+        .complete_message_effect(&credential, "effect-1", &event_id)
         .await
         .expect("publisher acknowledgement commits outcome");
     assert_eq!(
@@ -816,7 +885,7 @@ async fn v1_migration_keeps_issued_authority_and_adds_effect_journal() {
         .fetch_one(&pool)
         .await
         .expect("schema version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let journal_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'broker_effects')",
     )
