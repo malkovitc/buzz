@@ -151,6 +151,24 @@ their verified owner and cannot replay after owner rotation. Denied receipts
 retain the normal exact-retry contract. Fresh reads under another owner are
 rejected once the generation is bound.
 
+## Local keyless ACP smoke test
+
+Build the actual runtime and CLI, then run the explicit host test:
+
+```bash
+cargo build -p buzz-acp --bin buzz-acp -p buzz-cli --bin buzz
+BUZZ_E2E_ACP_BIN="$PWD/target/debug/buzz-acp" \
+BUZZ_E2E_CLI_BIN="$PWD/target/debug/buzz" \
+  cargo test -p buzz-broker-host actual_keyless_acp_reads_posts_and_loses_authority_after_fence -- --ignored
+```
+
+The test uses a local signed relay fixture and owner-only temporary files. It
+launches the real keyless `buzz-acp`, receives one owner event, publishes one
+host-signed `message.post` through the real `buzz` CLI, then quiesces and fences
+the generation. It is ignored in the normal host CI job because that job does
+not build the ACP and CLI binaries. `message.reply`, presence, memory reads,
+and Huddle audio publication are outside this smoke test.
+
 ## Deliberate boundary
 
 This slice does **not** provision signer files or broker credentials into
