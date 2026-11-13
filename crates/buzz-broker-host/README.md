@@ -117,7 +117,15 @@ origin, including when the WebSocket identity URL contains a path or query.
 key and the verified owner pubkey. It returns only the agent pubkey, event kind,
 and keyed `d` tag for the requested slug. The bearer must name an active
 generation whose executor matches the signer; quiescing invalidates previous
-address receipts. This action does not fetch or decrypt a memory record.
+address receipts. An exact retry also checks the current signer and derived
+address before replaying a receipt, so a restarted host without the signer or
+with a different verified owner cannot return an old address. Denied requests
+also retain their exact-retry receipt. The host does not persist an owner binding
+for the generation: a fresh request ID with a different valid owner attestation
+can derive a different address while the generation remains active. Keep the
+owner attestation stable for one generation; quiesce, drain, and fence before
+issuing a successor with another owner. This action does not fetch or decrypt
+a memory record.
 
 ## Deliberate boundary
 

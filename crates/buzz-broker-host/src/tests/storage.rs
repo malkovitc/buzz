@@ -68,6 +68,49 @@ async fn storage_address_uses_verified_owner_and_host_key_only_while_active() {
     let (_, replay_body) = send(&host_url, &bearer, request.body()).await;
     let replay: BrokerResponse = serde_json::from_slice(&replay_body).expect("replay response");
     assert!(replay.replayed, "same address request replays its receipt");
+    let (status_only_url, status_only_host) = spawn_host(store.clone()).await;
+    let (_, status_only_body) = send(&status_only_url, &bearer, request.body()).await;
+    let status_only: BrokerResponse =
+        serde_json::from_slice(&status_only_body).expect("status-only response");
+    assert!(matches!(status_only.result, BrokerResult::Failed { .. }));
+    assert!(
+        !status_only.replayed,
+        "status-only host cannot replay an address"
+    );
+    let denied_request = BrokerRequest::new(
+        "address-denied-first",
+        ActionArgs::StorageAddress(StorageAddressArgs {
+            slug: "core".into(),
+        }),
+    )
+    .and_then(BrokerRequest::prepare)
+    .expect("status-only request");
+    let (_, denied_body) = send(&status_only_url, &bearer, denied_request.body()).await;
+    let denied: BrokerResponse = serde_json::from_slice(&denied_body).expect("denial response");
+    assert!(matches!(denied.result, BrokerResult::Failed { .. }));
+    assert!(!denied.replayed);
+    let (_, denied_retry_body) = send(&host_url, &bearer, denied_request.body()).await;
+    let denied_retry: BrokerResponse =
+        serde_json::from_slice(&denied_retry_body).expect("denial replay");
+    assert!(matches!(denied_retry.result, BrokerResult::Failed { .. }));
+    assert!(
+        denied_retry.replayed,
+        "denial follows the exact retry contract"
+    );
+    let changed_request = BrokerRequest::new(
+        "address-denied-first",
+        ActionArgs::StorageAddress(StorageAddressArgs {
+            slug: "mem/other".into(),
+        }),
+    )
+    .and_then(BrokerRequest::prepare)
+    .expect("changed request");
+    let (_, conflict_body) = send(&host_url, &bearer, changed_request.body()).await;
+    let conflict: BrokerResponse = serde_json::from_slice(&conflict_body).expect("conflict");
+    assert!(matches!(
+        conflict.result,
+        BrokerResult::Failed { ref error } if error.code == BrokerErrorCode::RequestIdConflict
+    ));
 
     let other_agent = Keys::generate();
     let other_key = fixture.directory.path().join("other-agent.key");
@@ -101,17 +144,47 @@ async fn storage_address_uses_verified_owner_and_host_key_only_while_active() {
         .await
         .unwrap();
     });
-    let wrong_request = BrokerRequest::new(
-        "address-wrong-signer",
-        ActionArgs::StorageAddress(StorageAddressArgs {
-            slug: "core".into(),
-        }),
-    )
-    .and_then(BrokerRequest::prepare)
-    .expect("other host request");
-    let (_, wrong_body) = send(&wrong_url, &bearer, wrong_request.body()).await;
+    let (_, wrong_body) = send(&wrong_url, &bearer, request.body()).await;
     let wrong: BrokerResponse = serde_json::from_slice(&wrong_body).expect("other host response");
     assert!(matches!(wrong.result, BrokerResult::Failed { .. }));
+    assert!(!wrong.replayed, "wrong signer cannot replay an address");
+
+    let rotated_owner = Keys::generate();
+    let rotated_tag = fixture.directory.path().join("rotated-owner.auth-tag");
+    std::fs::write(
+        &rotated_tag,
+        buzz_sdk::nip_oa::compute_auth_tag(&rotated_owner, &agent.public_key(), "kind=9")
+            .expect("rotated owner attestation"),
+    )
+    .expect("rotated tag");
+    std::fs::set_permissions(&rotated_tag, std::fs::Permissions::from_mode(0o600))
+        .expect("private rotated tag");
+    let rotated_signer = HostSigner::load(&key_path, &rotated_tag).expect("rotated signer");
+    let rotated_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("rotated host listener");
+    let rotated_url = format!("http://{}", rotated_listener.local_addr().unwrap());
+    let rotated_store = store.clone();
+    let rotated_host = tokio::spawn(async move {
+        axum::serve(
+            rotated_listener,
+            crate::http::app_with_effects(
+                rotated_store,
+                rotated_signer,
+                RelayPublisher::new().unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let (_, rotated_body) = send(&rotated_url, &bearer, request.body()).await;
+    let rotated: BrokerResponse =
+        serde_json::from_slice(&rotated_body).expect("rotated owner response");
+    assert!(matches!(rotated.result, BrokerResult::Failed { .. }));
+    assert!(
+        !rotated.replayed,
+        "old owner address cannot replay after rotation"
+    );
 
     store
         .quiesce(&fixture.identity)
@@ -122,5 +195,7 @@ async fn storage_address_uses_verified_owner_and_host_key_only_while_active() {
     assert!(matches!(after.result, BrokerResult::Failed { .. }));
     assert!(!after.replayed, "active address receipt was invalidated");
     host.abort();
+    status_only_host.abort();
     wrong_host.abort();
+    rotated_host.abort();
 }

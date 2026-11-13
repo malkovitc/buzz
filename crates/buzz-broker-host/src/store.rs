@@ -424,7 +424,30 @@ impl AuthorityStore {
         )
         .await?
         {
-            ReceiptMatch::Replay(response) => return Ok((*response).replayed()),
+            ReceiptMatch::Replay(response) => {
+                if request.action() == Action::StorageAddress {
+                    if let BrokerResult::Succeeded {
+                        outcome: ActionOutcome::StorageAddress(stored),
+                    } = &response.result
+                    {
+                        let still_authorized = authority.state == AuthorityState::Active
+                            && address.as_ref().is_some_and(|current| {
+                                current == stored
+                                    && current.author_pubkey
+                                        == authority.identity.executor_agent_pubkey
+                            });
+                        if !still_authorized {
+                            return Ok(BrokerResponse::new(
+                                request.request_id(),
+                                BrokerResult::failed(BrokerError::unauthorized(
+                                    "verified signer or owner changed for this generation",
+                                )),
+                            ));
+                        }
+                    }
+                }
+                return Ok((*response).replayed());
+            }
             ReceiptMatch::Conflict => return Ok(conflict_response(request.request_id())),
             ReceiptMatch::Missing => {}
         }
