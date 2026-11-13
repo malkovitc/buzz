@@ -8,13 +8,17 @@ use buzz_sdk::broker::{
 use tempfile::TempDir;
 
 use crate::issuer::{fence_from_file, issue_to_file, IssuerError};
-use crate::store::{AuthorityStore, StoreError, MAX_RECEIPTS_PER_CREDENTIAL};
+use crate::publisher::RelayPublisher;
+use crate::signing::{HostSigner, SigningError};
+use crate::store::{AuthorityStore, EffectAdmission, StoreError, MAX_RECEIPTS_PER_CREDENTIAL};
 
 const PUBKEY: &str = "a02c4e0850e5e612b4ddf95dbe2f5c56467cf27c6552203bc833ff438fb31971";
 const TASK_ID: &str = "40b68c08-ed45-4c4b-a1d8-e46d6478d642";
 const GENERATION: &str = "8d86e776-0f6a-418b-b7fb-4f87be556591";
 const OTHER_GENERATION: &str = "22222222-2222-4222-8222-222222222222";
 const CHANNEL_ID: &str = "5df7dfa8-e919-43df-8efd-f1dcb8af7071";
+
+mod effects;
 
 struct Fixture {
     directory: TempDir,
