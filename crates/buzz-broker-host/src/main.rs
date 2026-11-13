@@ -3,7 +3,7 @@ mod http;
 mod issuer;
 mod store;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
 use std::net::SocketAddr;

@@ -7,10 +7,11 @@ implemented in a later slice.
 
 The host stores canonical authority identities, lifecycle state, credential
 hashes, and bounded request receipts in SQLite. It never stores or prints the
-raw bearer. On Unix, the database and its owner-only directory must belong to
-the broker's effective user. The database path must be absolute. The HTTP
-listener is loopback-only, so a colocated runtime can use plaintext without
-publishing its bearer.
+raw bearer. The host runs on Unix only: the database and its owner-only
+directory must belong to the broker's effective user. Startup fails closed on
+other platforms until equivalent ownership and ACL checks exist. The database
+path must be absolute. The HTTP listener is loopback-only, so a colocated
+runtime can use plaintext without publishing its bearer.
 
 ## Issue and fence
 

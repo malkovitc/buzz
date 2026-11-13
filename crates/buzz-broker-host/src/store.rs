@@ -1,4 +1,5 @@
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
 
 use buzz_sdk::broker::{
@@ -7,6 +8,7 @@ use buzz_sdk::broker::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Connection as _, Row, SqlitePool};
 
@@ -40,6 +42,12 @@ enum ReceiptMatch {
 }
 
 impl AuthorityStore {
+    #[cfg(not(unix))]
+    pub(crate) async fn open(_path: &Path) -> Result<Self, StoreError> {
+        Err(StoreError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
     pub(crate) async fn open(path: &Path) -> Result<Self, StoreError> {
         validate_state_path(path)?;
         ensure_private_database_file(path)?;
@@ -324,6 +332,13 @@ impl AuthorityStore {
     }
 }
 
+#[cfg(all(test, not(unix)))]
+#[tokio::test]
+async fn unsupported_platform_rejects_authority_state() {
+    let result = AuthorityStore::open(Path::new("authority.db")).await;
+    assert!(matches!(result, Err(StoreError::UnsupportedPlatform)));
+}
+
 async fn invalidate_authority_receipts(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     authority_json: &str,
@@ -505,6 +520,7 @@ fn authority_scope(identity: &AuthorityIdentity) -> Result<[u8; 32], StoreError>
     Ok(Sha256::digest(bytes).into())
 }
 
+#[cfg(unix)]
 fn validate_state_path(path: &Path) -> Result<(), StoreError> {
     if !path.is_absolute() {
         return Err(StoreError::InvalidPath);
@@ -535,11 +551,7 @@ fn is_private_owned_directory(metadata: &std::fs::Metadata) -> bool {
     metadata.permissions().mode() & 0o077 == 0 && is_owned_by_effective_user(metadata)
 }
 
-#[cfg(not(unix))]
-fn require_private_directory(_metadata: &std::fs::Metadata) -> Result<(), StoreError> {
-    Ok(())
-}
-
+#[cfg(unix)]
 fn ensure_private_database_file(path: &Path) -> Result<(), StoreError> {
     if path.exists() {
         require_private_file(path)?;
@@ -555,16 +567,6 @@ fn create_private_file(path: &Path) -> Result<(), StoreError> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-        .map_err(|_| StoreError::Unavailable)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_private_file(path: &Path) -> Result<(), StoreError> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
         .open(path)
         .map_err(|_| StoreError::Unavailable)?;
     Ok(())
@@ -593,24 +595,18 @@ fn is_owned_by_effective_user(metadata: &std::fs::Metadata) -> bool {
     metadata.uid() == nix::unistd::geteuid().as_raw()
 }
 
-#[cfg(not(unix))]
-fn require_private_file(path: &Path) -> Result<(), StoreError> {
-    if !std::fs::metadata(path)
-        .map_err(|_| StoreError::Unavailable)?
-        .is_file()
-    {
-        return Err(StoreError::InsecureFile);
-    }
-    Ok(())
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StoreError {
+    #[cfg(not(unix))]
+    #[error("broker authority state is unsupported without Unix owner checks")]
+    UnsupportedPlatform,
+    #[cfg(unix)]
     #[error("broker state path is invalid")]
     InvalidPath,
     #[cfg(unix)]
     #[error("broker state directory must be owned by this process user and owner-only")]
     InsecureDirectory,
+    #[cfg(unix)]
     #[error("broker state file must be owned by this process user and owner-only")]
     InsecureFile,
     #[error("broker state is unavailable")]
