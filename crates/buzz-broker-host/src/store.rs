@@ -27,13 +27,13 @@ mod effect_lock;
 mod lifecycle;
 
 #[cfg(unix)]
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 #[cfg(unix)]
 const EFFECTS_TABLE_SQL: &str = "CREATE TABLE broker_effects (
     credential_hash BLOB NOT NULL,
     request_id TEXT NOT NULL,
     request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
-    action TEXT NOT NULL CHECK(action = 'message.post'),
+    action TEXT NOT NULL CHECK(action IN ('message.post', 'message.reply')),
     event_json TEXT NOT NULL,
     response_json TEXT,
     PRIMARY KEY (credential_hash, request_id),
@@ -75,6 +75,7 @@ enum ReceiptMatch {
 pub(crate) enum EffectAdmission {
     Pending(nostr::Event, String, bool),
     Completed(BrokerResponse),
+    NeedsReplyTarget(String),
     Conflict,
 }
 
@@ -126,6 +127,7 @@ impl AuthorityStore {
                 2 => self.migrate_schema_v3().await?,
                 3 => self.migrate_schema_v4().await?,
                 4 => self.migrate_schema_v5().await?,
+                5 => self.migrate_schema_v6().await?,
                 SCHEMA_VERSION => break,
                 _ => return Err(StoreError::UnsupportedSchema),
             }
@@ -201,7 +203,7 @@ impl AuthorityStore {
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
-        sqlx::query("PRAGMA user_version = 5")
+        sqlx::query("PRAGMA user_version = 6")
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
@@ -254,6 +256,55 @@ impl AuthorityStore {
         .await
         .map_err(|_| StoreError::Unavailable)?;
         sqlx::query("PRAGMA user_version = 5")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| StoreError::Unavailable)
+    }
+
+    #[cfg(unix)]
+    async fn migrate_schema_v6(&self) -> Result<(), StoreError> {
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let mut transaction = connection
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if current != 5 {
+            return Ok(());
+        }
+        sqlx::query("ALTER TABLE broker_effects RENAME TO broker_effects_v5")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        sqlx::query(EFFECTS_TABLE_SQL)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        sqlx::query(
+            "INSERT INTO broker_effects
+             (credential_hash, request_id, request_digest, action, event_json, response_json)
+             SELECT credential_hash, request_id, request_digest, action, event_json, response_json
+             FROM broker_effects_v5",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+        sqlx::query("DROP TABLE broker_effects_v5")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        sqlx::query("PRAGMA user_version = 6")
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
@@ -398,7 +449,7 @@ impl AuthorityStore {
     #[cfg(unix)]
     async fn validate_effect_state(&self) -> Result<(), StoreError> {
         let rows = sqlx::query(
-            "SELECT e.request_id, e.event_json, e.response_json, a.authority_json
+            "SELECT e.request_id, e.action, e.event_json, e.response_json, a.authority_json
              FROM broker_effects e
              JOIN broker_authorities a ON a.credential_hash = e.credential_hash",
         )
@@ -409,6 +460,10 @@ impl AuthorityStore {
             let request_id: String = row
                 .try_get("request_id")
                 .map_err(|_| StoreError::Integrity)?;
+            let action: String = row.try_get("action").map_err(|_| StoreError::Integrity)?;
+            if action != "message.post" && action != "message.reply" {
+                return Err(StoreError::Integrity);
+            }
             let event_json: String = row
                 .try_get("event_json")
                 .map_err(|_| StoreError::Integrity)?;
@@ -432,9 +487,12 @@ impl AuthorityStore {
                 if response.request_id != request_id
                     || !matches!(
                         response.result,
-                        BrokerResult::Succeeded {
-                            outcome: ActionOutcome::MessagePost(ref published)
-                        } if published.event_id == event.id.to_hex()
+                        BrokerResult::Succeeded { outcome: ActionOutcome::MessagePost(ref published) }
+                            if action == "message.post" && published.event_id == event.id.to_hex()
+                    ) && !matches!(
+                        response.result,
+                        BrokerResult::Succeeded { outcome: ActionOutcome::MessageReply(ref published) }
+                            if action == "message.reply" && published.event_id == event.id.to_hex()
                     )
                 {
                     return Err(StoreError::Integrity);
@@ -763,8 +821,36 @@ impl AuthorityStore {
         request: &ValidatedRequest,
         signer: &HostSigner,
     ) -> Result<EffectAdmission, StoreError> {
-        let ActionArgs::MessagePost(args) = request.args() else {
-            return Err(StoreError::InvalidIdentity);
+        self.prepare_message_effect(credential, request_bytes, request, signer, None)
+            .await
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn prepare_message_reply(
+        &self,
+        credential: &CredentialDigest,
+        request_bytes: &[u8],
+        request: &ValidatedRequest,
+        signer: &HostSigner,
+        thread: Option<&buzz_sdk::ThreadRef>,
+    ) -> Result<EffectAdmission, StoreError> {
+        self.prepare_message_effect(credential, request_bytes, request, signer, thread)
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn prepare_message_effect(
+        &self,
+        credential: &CredentialDigest,
+        request_bytes: &[u8],
+        request: &ValidatedRequest,
+        signer: &HostSigner,
+        thread: Option<&buzz_sdk::ThreadRef>,
+    ) -> Result<EffectAdmission, StoreError> {
+        let action = match request.args() {
+            ActionArgs::MessagePost(_) => "message.post",
+            ActionArgs::MessageReply(_) => "message.reply",
+            _ => return Err(StoreError::InvalidIdentity),
         };
         let request_digest: [u8; 32] = Sha256::digest(request_bytes).into();
         let mut connection = self
@@ -782,7 +868,7 @@ impl AuthorityStore {
         }
 
         let existing = sqlx::query(
-            "SELECT request_digest, event_json, response_json FROM broker_effects
+            "SELECT action, request_digest, event_json, response_json FROM broker_effects
              WHERE credential_hash = ? AND request_id = ?",
         )
         .bind(credential.as_bytes())
@@ -791,6 +877,10 @@ impl AuthorityStore {
         .await
         .map_err(|_| StoreError::Unavailable)?;
         if let Some(row) = existing {
+            let stored_action: String = row.try_get("action").map_err(|_| StoreError::Integrity)?;
+            if stored_action != action {
+                return Ok(EffectAdmission::Conflict);
+            }
             let stored_digest: Vec<u8> = row
                 .try_get("request_digest")
                 .map_err(|_| StoreError::Integrity)?;
@@ -847,19 +937,35 @@ impl AuthorityStore {
         if authority.state != AuthorityState::Active {
             return Err(StoreError::AuthorityFenced);
         }
-        let event = signer
-            .sign_message(&authority.identity, args)
-            .map_err(|_| StoreError::InvalidIdentity)?;
+        if !signer.matches_executor(&authority.identity) {
+            return Err(StoreError::InvalidIdentity);
+        }
+        if action == "message.reply" && thread.is_none() {
+            return Ok(EffectAdmission::NeedsReplyTarget(
+                authority.identity.community_relay_url,
+            ));
+        }
+        let event = match request.args() {
+            ActionArgs::MessagePost(args) => signer.sign_message(&authority.identity, args),
+            ActionArgs::MessageReply(args) => signer.sign_reply(
+                &authority.identity,
+                args,
+                thread.ok_or(StoreError::InvalidIdentity)?,
+            ),
+            _ => return Err(StoreError::InvalidIdentity),
+        }
+        .map_err(|_| StoreError::InvalidIdentity)?;
         let event_json = serde_json::to_string(&event).map_err(|_| StoreError::Integrity)?;
         bind_owner(&mut transaction, credential, &signer.owner_hex()).await?;
         sqlx::query(
             "INSERT INTO broker_effects
              (credential_hash, request_id, request_digest, action, event_json)
-             VALUES (?, ?, ?, 'message.post', ?)",
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(credential.as_bytes())
         .bind(request.request_id())
         .bind(request_digest.as_slice())
+        .bind(action)
         .bind(event_json)
         .execute(&mut *transaction)
         .await
@@ -876,7 +982,7 @@ impl AuthorityStore {
     }
 
     #[cfg(unix)]
-    pub(crate) async fn complete_message_post(
+    pub(crate) async fn complete_message_effect(
         &self,
         credential: &CredentialDigest,
         request_id: &str,
@@ -893,7 +999,7 @@ impl AuthorityStore {
             .map_err(|_| StoreError::Unavailable)?;
         load_authority(&mut transaction, credential).await?;
         let row = sqlx::query(
-            "SELECT event_json, response_json FROM broker_effects
+            "SELECT action, event_json, response_json FROM broker_effects
              WHERE credential_hash = ? AND request_id = ?",
         )
         .bind(credential.as_bytes())
@@ -905,6 +1011,7 @@ impl AuthorityStore {
         let event_json: String = row
             .try_get("event_json")
             .map_err(|_| StoreError::Integrity)?;
+        let action: String = row.try_get("action").map_err(|_| StoreError::Integrity)?;
         let event = decode_effect_event(&event_json)?;
         if event.id.to_hex() != event_id {
             return Err(StoreError::Conflict);
@@ -915,14 +1022,17 @@ impl AuthorityStore {
         if let Some(response_json) = response_json {
             return serde_json::from_str(&response_json).map_err(|_| StoreError::Integrity);
         }
-        let response = BrokerResponse::new(
-            request_id,
-            BrokerResult::succeeded(ActionOutcome::MessagePost(EventPublished {
-                event_id: event.id.to_hex(),
-                kind: u32::from(event.kind.as_u16()),
-                created_at: event.created_at.as_secs(),
-            })),
-        );
+        let published = EventPublished {
+            event_id: event.id.to_hex(),
+            kind: u32::from(event.kind.as_u16()),
+            created_at: event.created_at.as_secs(),
+        };
+        let outcome = match action.as_str() {
+            "message.post" => ActionOutcome::MessagePost(published),
+            "message.reply" => ActionOutcome::MessageReply(published),
+            _ => return Err(StoreError::Integrity),
+        };
+        let response = BrokerResponse::new(request_id, BrokerResult::succeeded(outcome));
         let response_json = serde_json::to_string(&response).map_err(|_| StoreError::Integrity)?;
         sqlx::query(
             "UPDATE broker_effects SET response_json = ?

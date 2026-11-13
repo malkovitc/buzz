@@ -2,7 +2,8 @@
 
 `buzz-broker-host` is the host-owned durable authority boundary for managed ACP
 runtimes. It always serves `authority.status`. With a host-owned signing key and
-verified owner attestation, it also serves `storage.address`, `channel.read`, and `message.post`.
+verified owner attestation, it also serves `storage.address`, `channel.read`,
+`message.post`, and `message.reply`.
 Other broker actions remain unsupported.
 
 The host stores canonical authority identities, lifecycle state, credential
@@ -15,7 +16,9 @@ runtime can use plaintext without publishing its bearer.
 
 Schema v5 binds the first successful signer-backed action to the verified owner
 for the entire generation. Later `storage.address`, `channel.read`, and
-`message.post` requests with another owner are rejected. Upgrading a v1-v4
+`message.post` and `message.reply` requests with another owner are rejected.
+Schema v6 adds reply effects to the durable journal and preserves pending v5
+posts during migration. Upgrading a v1-v4
 database quiesces every previously active generation and clears its old
 read-only receipts because earlier schemas could not prove which owner had
 used it. Drain and fence those generations, then issue successors. Stop older
@@ -106,11 +109,11 @@ read `BUZZ_BROKER_CREDENTIAL` from the mode-0600 file in the launcher, and pass
 the same canonical authority JSON as `BUZZ_MANAGED_ACP_AUTHORITY`. Both signer
 files must be regular files owned by the broker user inside owner-only
 directories; the key is never passed in argv. The host verifies the NIP-OA
-owner signature against the key and only signs `message.post` when that key
+owner signature against the key and only signs `message.post` or `message.reply` when that key
 matches the authority's executor pubkey. Omitting both signer flags keeps the
 status-only host mode.
 
-`message.post` admission and the signed event are committed to a separate,
+`message.post` and `message.reply` admission and the signed event are committed to a separate,
 non-evicting SQLite effect journal under the same generation lock as fencing.
 The host submits that exact event to the authority's relay and records success
 only after an accepted ACK or an authenticated query proves the same event ID
@@ -122,6 +125,13 @@ read-only/unsupported receipts per credential independently of this journal.
 An exact retry first queries the stored event ID and only republishes it if
 the relay confirms it is absent. HTTP endpoints are derived from the relay
 origin, including when the WebSocket identity URL contains a path or query.
+
+For `message.reply`, the host first uses a signed relay query to verify the exact
+parent event ID, signature, kind 9, and channel. A nested reply also requires
+the root event to be present and signed in that channel. The host then signs
+NIP-10 root and reply tags and journals the exact event. A missing, forged, or
+cross-channel parent fails before any effect is admitted. An exact retry uses
+the journaled event without querying the parent again.
 
 `storage.address` derives the NIP-AE record address from the host-held agent
 key and the verified owner pubkey. It returns only the agent pubkey, event kind,
@@ -159,15 +169,15 @@ Build the actual runtime and CLI, then run the explicit host test:
 cargo build -p buzz-acp --bin buzz-acp -p buzz-cli --bin buzz
 BUZZ_E2E_ACP_BIN="$PWD/target/debug/buzz-acp" \
 BUZZ_E2E_CLI_BIN="$PWD/target/debug/buzz" \
-  cargo test -p buzz-broker-host actual_keyless_acp_reads_posts_and_loses_authority_after_fence -- --ignored
+  cargo test -p buzz-broker-host actual_keyless_acp_reads_replies_and_loses_authority_after_fence -- --ignored
 ```
 
 The test uses a local signed relay fixture and owner-only temporary files. It
 launches the real keyless `buzz-acp`, receives one owner event, publishes one
-host-signed `message.post` through the real `buzz` CLI, then quiesces and fences
+host-signed `message.reply` through the real `buzz` CLI, then quiesces and fences
 the generation. It is ignored in the normal host CI job because that job does
-not build the ACP and CLI binaries. `message.reply`, presence, memory reads,
-and Huddle audio publication are outside this smoke test.
+not build the ACP and CLI binaries. Presence, memory reads, and Huddle audio
+publication are outside this smoke test.
 
 ## Deliberate boundary
 

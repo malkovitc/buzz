@@ -107,7 +107,7 @@ async fn v3_migration_quiesces_authority_and_clears_old_receipts() {
         .fetch_one(&inspect)
         .await
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     inspect.close().await;
 }
 
@@ -270,7 +270,7 @@ async fn v2_migration_keeps_existing_authority_and_adds_quiescing_state() {
         .fetch_one(&pool)
         .await
         .expect("schema version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     pool.close().await;
 }
 

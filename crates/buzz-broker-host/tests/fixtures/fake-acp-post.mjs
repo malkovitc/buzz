@@ -34,14 +34,15 @@ for await (const line of input) {
         .map((part) => part.text ?? "")
         .join("\n");
       const channel = prompt.match(/^Channel: ([0-9a-f-]{36})$/m)?.[1];
+      const parent = prompt.match(/^Event ID: ([0-9a-f]{64})$/m)?.[1];
       const marker = prompt.match(/\bAE-ID:([A-Za-z0-9._:-]+)\b/)?.[1];
-      if (!channel || !marker || !process.env.BUZZ_E2E_CLI_BIN) {
-        throw new Error("keyless prompt omitted channel, marker, or CLI path");
+      if (!channel || !parent || !marker || !process.env.BUZZ_E2E_CLI_BIN) {
+        throw new Error("keyless prompt omitted channel, parent, marker, or CLI path");
       }
       const answer = `AE-ACK:${marker}`;
       await exec(
         process.env.BUZZ_E2E_CLI_BIN,
-        ["messages", "send", "--channel", channel, "--content", answer],
+        ["messages", "send", "--channel", channel, "--content", answer, "--reply-to", parent],
         { env: process.env },
       );
       write({

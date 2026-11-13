@@ -21,7 +21,7 @@ pub(crate) async fn drain_pending(
         .publish_pending(signer, &pending.relay_url, &pending.event)
         .await?;
     store
-        .complete_message_post(
+        .complete_message_effect(
             &pending.credential,
             &pending.request_id,
             &pending.event.id.to_hex(),

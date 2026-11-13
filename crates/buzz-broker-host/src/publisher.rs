@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use base64::Engine as _;
-use buzz_sdk::broker::{ActionOutcome, BrokerMessage, ChannelReadArgs, MessagePage};
+use buzz_sdk::broker::{
+    ActionOutcome, BrokerMessage, ChannelReadArgs, MessagePage, MessageReplyArgs,
+};
+use buzz_sdk::ThreadRef;
 use nostr::Event;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -14,6 +17,7 @@ pub(crate) struct RelayPublisher {
 
 const MAX_READ_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_READ_PAGE_EVENTS: u32 = 16;
+const MAX_EXACT_EVENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
 struct RelayAck {
@@ -30,6 +34,100 @@ impl RelayPublisher {
             .build()
             .map_err(|_| PublishError::Unavailable)?;
         Ok(Self { client })
+    }
+
+    pub(crate) async fn resolve_reply_target(
+        &self,
+        signer: &HostSigner,
+        community_relay_url: &str,
+        args: &MessageReplyArgs,
+    ) -> Result<ThreadRef, PublishError> {
+        let parent = self
+            .query_exact_channel_event(
+                signer,
+                community_relay_url,
+                &args.channel_id,
+                &args.reply_to_event_id,
+            )
+            .await?;
+        let root_event_id = reply_root(&parent)?;
+        if root_event_id != parent.id {
+            self.query_exact_channel_event(
+                signer,
+                community_relay_url,
+                &args.channel_id,
+                &root_event_id.to_hex(),
+            )
+            .await?;
+        }
+        Ok(ThreadRef {
+            root_event_id,
+            parent_event_id: parent.id,
+        })
+    }
+
+    async fn query_exact_channel_event(
+        &self,
+        signer: &HostSigner,
+        community_relay_url: &str,
+        channel_id: &str,
+        event_id: &str,
+    ) -> Result<Event, PublishError> {
+        let url = relay_endpoint(community_relay_url, "/query")?;
+        let body = serde_json::to_vec(&serde_json::json!([{
+            "ids": [event_id],
+            "kinds": [9],
+            "#h": [channel_id],
+            "limit": 1
+        }]))
+        .map_err(|_| PublishError::InvalidEvent)?;
+        let authorization = signer
+            .nip98_authorization(url.as_str(), &body)
+            .map_err(|_| PublishError::Unavailable)?;
+        let mut response = self
+            .client
+            .post(url)
+            .header("authorization", authorization)
+            .header("x-auth-tag", signer.auth_tag_json())
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| PublishError::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(PublishError::Unavailable);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| PublishError::Unavailable)?
+        {
+            if chunk.len() > MAX_EXACT_EVENT_BYTES - bytes.len() {
+                return Err(PublishError::ResponseTooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let mut events: Vec<Event> =
+            serde_json::from_slice(&bytes).map_err(|_| PublishError::InvalidEvent)?;
+        if events.len() != 1 {
+            return Err(PublishError::InvalidEvent);
+        }
+        let event = events.pop().ok_or(PublishError::InvalidEvent)?;
+        let channels: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.kind().to_string() == "h")
+            .collect();
+        if event.id.to_hex() != event_id
+            || event.kind.as_u16() != 9
+            || event.verify().is_err()
+            || channels.len() != 1
+            || channels[0].content() != Some(channel_id)
+        {
+            return Err(PublishError::InvalidEvent);
+        }
+        Ok(event)
     }
 
     pub(crate) async fn query_channel(
@@ -280,6 +378,14 @@ fn decode_cursor(
             .map_err(|_| PublishError::InvalidCursor)?,
     );
     Ok((until, hex::encode(&payload[9..41])))
+}
+
+fn reply_root(parent: &Event) -> Result<nostr::EventId, PublishError> {
+    let markers = buzz_core::nip10::parse_thread_markers(&parent.tags);
+    let Some((root, _)) = markers.resolve() else {
+        return Ok(parent.id);
+    };
+    nostr::EventId::from_hex(&root).map_err(|_| PublishError::InvalidEvent)
 }
 
 fn relay_endpoint(community_relay_url: &str, path: &str) -> Result<reqwest::Url, PublishError> {
