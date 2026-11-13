@@ -1,6 +1,10 @@
 mod credential;
 mod http;
 mod issuer;
+#[cfg(unix)]
+mod publisher;
+#[cfg(unix)]
+mod signing;
 mod store;
 
 #[cfg(all(test, unix))]
@@ -44,6 +48,12 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: SocketAddr,
+        /// Owner-only file containing the agent signing key for host-owned effects.
+        #[arg(long)]
+        signing_key_file: Option<PathBuf>,
+        /// Owner-only file containing the signed NIP-OA owner attestation.
+        #[arg(long)]
+        auth_tag_file: Option<PathBuf>,
     },
 }
 
@@ -63,13 +73,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             issuer::fence_from_file(&store, &authority_file).await?;
             println!("fenced");
         }
-        Command::Serve { bind } => {
+        Command::Serve {
+            bind,
+            signing_key_file,
+            auth_tag_file,
+        } => {
             if !bind.ip().is_loopback() {
                 return Err(http::HostError::NonLoopback.into());
             }
             let listener = tokio::net::TcpListener::bind(bind).await?;
             eprintln!("broker authority host listening on loopback");
-            http::serve(listener, store).await?;
+            #[cfg(unix)]
+            match (signing_key_file, auth_tag_file) {
+                (Some(key), Some(tag)) => {
+                    let signer = signing::HostSigner::load(&key, &tag)?;
+                    http::serve_with_effects(listener, store, signer).await?;
+                }
+                (None, None) => http::serve(listener, store).await?,
+                _ => return Err("both signer files are required for host-owned effects".into()),
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (signing_key_file, auth_tag_file);
+                http::serve(listener, store).await?;
+            }
         }
     }
     Ok(())

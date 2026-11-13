@@ -996,6 +996,7 @@ dependencies = [
  "clap",
  "hex",
  "nix 0.31.3",
+ "nostr 0.44.7",
  "rand 0.10.1",
  "reqwest 0.13.4",
  "serde",
