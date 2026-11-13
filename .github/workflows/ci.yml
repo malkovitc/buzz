@@ -23,6 +23,7 @@ jobs:
       pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      broker_host: ${{ steps.filter.outputs.broker_host }}
       desktop: ${{ steps.filter.outputs.desktop }}
       desktop-rust: ${{ steps.filter.outputs.desktop-rust }}
       desktop-shared: ${{ steps.filter.outputs.desktop-shared }}
@@ -43,17 +44,20 @@ jobs:
           filters: |
             rust:
               - 'crates/**'
+              - '!crates/buzz-broker-host/**'
               - 'migrations/**'
               - 'schema/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - 'deny.toml'
-              - '.github/workflows/ci.yml'
               - 'scripts/run-tests.sh'
               - 'scripts/model-capabilities.json'
               - 'scripts/normative-corpus.json'
               - 'justfile'
+            broker_host:
+              - 'crates/buzz-broker-host/**'
+              - '.github/workflows/ci.yml'
             desktop:
               - 'scripts/model-capabilities.json'
               - 'scripts/normative-corpus.json'
@@ -85,7 +89,6 @@ jobs:
             pi_acp:
               - 'tools/pi-acp/**'
               - 'pnpm-lock.yaml'
-              - '.github/workflows/ci.yml'
             mobile:
               - 'mobile/**'
               - 'scripts/mobile-release.sh'
@@ -97,7 +100,6 @@ jobs:
               - 'scripts/test-mobile-release-candidate-publisher.sh'
               - 'scripts/test-mobile-worktree-overrides.sh'
               - '.github/workflows/mobile-release-candidate.yml'
-              - '.github/workflows/ci.yml'
       - name: Release workflow source contract
         run: scripts/test-release-ref-contract.sh
       - name: Desktop release candidate contract
@@ -155,6 +157,34 @@ jobs:
         run: just desktop-tauri-fmt-check
       - name: Clippy
         run: just clippy
+
+  broker-host:
+    name: Broker Host (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    needs: [changes]
+    if: github.ref == 'refs/heads/release' || needs.changes.outputs.broker_host == 'true'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+        if: runner.os == 'Linux'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: broker-host-${{ matrix.os }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Format check
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy -p buzz-broker-host --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test -p buzz-broker-host --all-targets
 
   unit-tests:
     name: Unit Tests

@@ -19,6 +19,7 @@ const OTHER_GENERATION: &str = "22222222-2222-4222-8222-222222222222";
 const CHANNEL_ID: &str = "5df7dfa8-e919-43df-8efd-f1dcb8af7071";
 
 mod effects;
+mod lifecycle;
 
 struct Fixture {
     directory: TempDir,
@@ -83,6 +84,28 @@ fn write_identity(path: &Path, identity: &AuthorityIdentity) {
         serde_json::to_vec(identity).expect("serializable identity"),
     )
     .expect("authority fixture written");
+}
+
+async fn simulate_v2_schema(pool: &sqlx::SqlitePool) {
+    sqlx::query("DROP INDEX one_unfenced_generation_per_scope")
+        .execute(pool)
+        .await
+        .expect("remove v3 reservation index");
+    sqlx::query(
+        "CREATE UNIQUE INDEX one_active_generation_per_scope
+         ON broker_authorities(authority_scope) WHERE state = 'active'",
+    )
+    .execute(pool)
+    .await
+    .expect("restore v2 reservation index");
+    sqlx::query("ALTER TABLE broker_authorities DROP COLUMN quiescing")
+        .execute(pool)
+        .await
+        .expect("remove v3 lifecycle column");
+    sqlx::query("PRAGMA user_version = 2")
+        .execute(pool)
+        .await
+        .expect("v2 schema version");
 }
 
 async fn spawn_host(store: AuthorityStore) -> (String, tokio::task::JoinHandle<()>) {

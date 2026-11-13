@@ -33,6 +33,14 @@ pub(crate) async fn fence_from_file(
     store.fence(&identity).await.map_err(IssuerError::Store)
 }
 
+pub(crate) async fn quiesce_from_file(
+    store: &AuthorityStore,
+    authority_file: &Path,
+) -> Result<buzz_sdk::broker::AuthorityState, IssuerError> {
+    let identity = read_identity(authority_file)?;
+    store.quiesce(&identity).await.map_err(IssuerError::Store)
+}
+
 fn read_identity(path: &Path) -> Result<AuthorityIdentity, IssuerError> {
     let metadata = std::fs::metadata(path).map_err(|_| IssuerError::AuthorityFile)?;
     if !is_bounded_authority_file(&metadata) {

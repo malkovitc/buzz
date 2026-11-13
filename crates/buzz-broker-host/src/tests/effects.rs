@@ -208,6 +208,16 @@ async fn message_effect_admission_survives_restart_and_blocks_fence_until_termin
     assert!(
         matches!(duplicate, EffectAdmission::Pending(event, _, true) if event.id.to_hex() == event_id)
     );
+    reopened
+        .quiesce(&fixture.identity)
+        .await
+        .expect("quiesce closes new admission while pending effect remains");
+    assert!(matches!(
+        reopened
+            .prepare_message_post(&credential, request.body(), &validated, &signer)
+            .await,
+        Ok(EffectAdmission::Pending(event, _, true)) if event.id.to_hex() == event_id
+    ));
 
     let other_agent = Keys::generate();
     std::fs::write(&key_path, other_agent.secret_key().to_secret_hex())
@@ -251,6 +261,12 @@ async fn message_effect_admission_survives_restart_and_blocks_fence_until_termin
         serde_json::to_value(&outcome).expect("response JSON")["outcome"]["eventId"],
         event_id
     );
+    assert!(matches!(
+        reopened
+            .prepare_message_post(&credential, second.body(), &second_validated, &signer)
+            .await,
+        Err(StoreError::AuthorityFenced)
+    ));
     reopened
         .fence(&fixture.identity)
         .await
@@ -718,6 +734,7 @@ async fn v1_migration_refuses_corrupt_authority_without_upgrading_schema() {
         .execute(&pool)
         .await
         .expect("simulate v1 schema");
+    simulate_v2_schema(&pool).await;
     sqlx::query("PRAGMA user_version = 1")
         .execute(&pool)
         .await
@@ -768,6 +785,7 @@ async fn v1_migration_keeps_issued_authority_and_adds_effect_journal() {
         .execute(&pool)
         .await
         .expect("simulate v1 schema");
+    simulate_v2_schema(&pool).await;
     sqlx::query("PRAGMA user_version = 1")
         .execute(&pool)
         .await
@@ -798,7 +816,7 @@ async fn v1_migration_keeps_issued_authority_and_adds_effect_journal() {
         .fetch_one(&pool)
         .await
         .expect("schema version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let journal_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'broker_effects')",
     )
