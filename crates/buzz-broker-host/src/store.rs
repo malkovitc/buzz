@@ -14,6 +14,7 @@ use sqlx::{Connection as _, Row, SqlitePool};
 
 use crate::credential::CredentialDigest;
 
+#[cfg(unix)]
 const SCHEMA_VERSION: i64 = 1;
 pub(crate) const MAX_RECEIPTS_PER_CREDENTIAL: i64 = 64;
 
@@ -68,6 +69,7 @@ impl AuthorityStore {
         Ok(store)
     }
 
+    #[cfg(unix)]
     async fn initialize(&self) -> Result<(), StoreError> {
         let current: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&self.pool)
@@ -88,6 +90,7 @@ impl AuthorityStore {
         self.validate_authority_state().await
     }
 
+    #[cfg(unix)]
     async fn create_schema(&self) -> Result<(), StoreError> {
         let mut connection = self
             .pool
@@ -251,6 +254,7 @@ impl AuthorityStore {
             .map_err(|_| StoreError::Unavailable)
     }
 
+    #[cfg(unix)]
     async fn validate_authority_state(&self) -> Result<(), StoreError> {
         let mut connection = self
             .pool
@@ -611,6 +615,7 @@ pub(crate) enum StoreError {
     InsecureFile,
     #[error("broker state is unavailable")]
     Unavailable,
+    #[cfg(unix)]
     #[error("broker state schema is unsupported")]
     UnsupportedSchema,
     #[error("broker state integrity check failed")]
