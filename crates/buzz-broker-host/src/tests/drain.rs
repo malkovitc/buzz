@@ -297,6 +297,23 @@ async fn operator_drain_reconciles_crash_after_journal_before_publish() {
         .await
         .expect("close admission");
     let publisher = RelayPublisher::new().expect("relay publisher");
+    let rotated_owner = Keys::generate();
+    let rotated_tag_path = fixture.directory.path().join("rotated-owner.auth-tag");
+    std::fs::write(
+        &rotated_tag_path,
+        buzz_sdk::nip_oa::compute_auth_tag(&rotated_owner, &agent.public_key(), "kind=9")
+            .expect("rotated owner attestation"),
+    )
+    .expect("rotated tag fixture");
+    std::fs::set_permissions(&rotated_tag_path, std::fs::Permissions::from_mode(0o600))
+        .expect("private rotated tag");
+    let rotated_signer = HostSigner::load(&key_path, &rotated_tag_path).unwrap();
+    assert!(
+        crate::drain::drain_pending(&store, &fixture.identity, &rotated_signer, &publisher)
+            .await
+            .is_err()
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 0, "wrong owner cannot drain");
     assert!(
         crate::drain::drain_pending(&store, &fixture.identity, &signer, &publisher)
             .await

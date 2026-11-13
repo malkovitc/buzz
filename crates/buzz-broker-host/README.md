@@ -67,7 +67,9 @@ queries the stored event ID, publishes the same signed event only if absent,
 and commits the outcome before releasing the lock. A relay failure leaves the
 effect pending and fencing blocked. Runtime retries and operator drain share
 the lock, so concurrent attempts cannot send a second copy after a completed
-effect or a final fence. Stop any older broker-host process before using drain
+effect or a final fence. The supplied signer must match the verified owner in
+the pending signed event, including for migrated generations whose owner was
+not stored separately. Stop any older broker-host process before using drain
 during a rolling upgrade.
 
 The relay rejects signed events whose timestamp is more than 15 minutes from

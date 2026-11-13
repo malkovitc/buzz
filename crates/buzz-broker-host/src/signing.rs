@@ -69,6 +69,17 @@ impl HostSigner {
         identity.executor_agent_pubkey.as_str() == self.keys.public_key().to_hex()
     }
 
+    pub(crate) fn matches_event_owner(&self, event: &Event) -> bool {
+        let mut owners = event.tags.iter().filter_map(|tag| {
+            let encoded = serde_json::to_string(tag).ok()?;
+            buzz_sdk::nip_oa::verify_auth_tag(&encoded, &event.pubkey).ok()
+        });
+        owners
+            .next()
+            .is_some_and(|owner| owner == self.owner_pubkey)
+            && owners.next().is_none()
+    }
+
     pub(crate) fn storage_address(&self, slug: &str) -> Result<StorageAddress, SigningError> {
         let author_pubkey = PubkeyHex::parse(self.keys.public_key().to_hex())
             .map_err(|_| SigningError::InvalidKey)?;
