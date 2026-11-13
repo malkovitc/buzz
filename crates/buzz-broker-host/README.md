@@ -45,7 +45,30 @@ message requests fail. Old `active` status receipts are invalidated at the
 transition. An already-running v2 host sees the underlying state as `fenced`
 and fails closed; the v3 host retains the scope reservation until final fence.
 
-Fence the exact identity after pending effects have resolved:
+Resolve any pending effect after quiesce:
+
+```bash
+buzz-broker-host --state /var/lib/buzz-broker/authority.db drain \
+  --authority-file /secure/input/authority.json \
+  --signing-key-file /secure/agent.key \
+  --auth-tag-file /secure/owner.auth-tag
+```
+
+Drain requires quiescing. It takes an owner-only lock for the exact credential,
+queries the stored event ID, publishes the same signed event only if absent,
+and commits the outcome before releasing the lock. A relay failure leaves the
+effect pending and fencing blocked. Runtime retries and operator drain share
+the lock, so concurrent attempts cannot send a second copy after a completed
+effect or a final fence. Stop any older broker-host process before using drain
+during a rolling upgrade.
+
+The relay rejects signed events whose timestamp is more than 15 minutes from
+its clock. If an event remained unpublished past that window, drain may never
+resolve it: the host leaves the generation quiescing and refuses fence. A later
+relay-level terminal proof is needed before this case can support automatic
+cutover. Do not force a successor generation by editing broker state.
+
+Then fence the exact identity:
 
 ```bash
 buzz-broker-host --state /var/lib/buzz-broker/authority.db fence \
@@ -94,7 +117,7 @@ origin, including when the WebSocket identity URL contains a path or query.
 
 This slice does **not** provision signer files or broker credentials into
 Desktop/Kubernetes launchers, serve the other broker actions, execute Git
-effects, drain a runtime or pending effect automatically, activate a second
+effects, drain a runtime automatically, activate a second
 runtime, or serve TLS.
 An unresolved effect currently needs an exact request retry while the relay is
 reachable; automatic background drain and two-runtime cutover remain MOBILITY

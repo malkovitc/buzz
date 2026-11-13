@@ -18,6 +18,7 @@ const GENERATION: &str = "8d86e776-0f6a-418b-b7fb-4f87be556591";
 const OTHER_GENERATION: &str = "22222222-2222-4222-8222-222222222222";
 const CHANNEL_ID: &str = "5df7dfa8-e919-43df-8efd-f1dcb8af7071";
 
+mod drain;
 mod effects;
 mod lifecycle;
 

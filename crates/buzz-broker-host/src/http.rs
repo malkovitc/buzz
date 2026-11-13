@@ -128,32 +128,45 @@ impl EffectService {
         body: &[u8],
         request: &ValidatedRequest,
     ) -> BrokerResponse {
-        let admission = match store
-            .prepare_message_post(credential, body, request, &self.signer)
-            .await
-        {
-            Ok(admission) => admission,
-            Err(StoreError::Unauthenticated) => return unauthenticated(request.request_id()),
-            Err(StoreError::AuthorityFenced) => {
-                return BrokerResponse::new(
-                    request.request_id(),
-                    BrokerResult::failed(BrokerError::new(
-                        BrokerErrorCode::Unauthorized,
-                        "authority generation is fenced",
-                    )),
-                );
+        let mut publication_guard = None;
+        let mut was_pending_before_lock = false;
+        let admission = loop {
+            match store
+                .prepare_message_post(credential, body, request, &self.signer)
+                .await
+            {
+                Ok(EffectAdmission::Pending(_, _, was_pending)) if publication_guard.is_none() => {
+                    was_pending_before_lock = was_pending;
+                    publication_guard =
+                        match store.publication_lock_for_credential(credential).await {
+                            Ok(guard) => Some(guard),
+                            Err(_) => return internal_failure(request.request_id()),
+                        };
+                }
+                Ok(admission) => break admission,
+                Err(StoreError::Unauthenticated) => return unauthenticated(request.request_id()),
+                Err(StoreError::AuthorityFenced) => {
+                    return BrokerResponse::new(
+                        request.request_id(),
+                        BrokerResult::failed(BrokerError::new(
+                            BrokerErrorCode::Unauthorized,
+                            "authority generation is fenced",
+                        )),
+                    );
+                }
+                Err(StoreError::EffectsPending) => {
+                    return BrokerResponse::new(
+                        request.request_id(),
+                        BrokerResult::failed(BrokerError::new(
+                            BrokerErrorCode::ActionFailed,
+                            "a prior effect is unresolved for this generation",
+                        )),
+                    );
+                }
+                Err(_) => return internal_failure(request.request_id()),
             }
-            Err(StoreError::EffectsPending) => {
-                return BrokerResponse::new(
-                    request.request_id(),
-                    BrokerResult::failed(BrokerError::new(
-                        BrokerErrorCode::ActionFailed,
-                        "a prior effect is unresolved for this generation",
-                    )),
-                );
-            }
-            Err(_) => return internal_failure(request.request_id()),
         };
+        let _publication_guard = publication_guard;
         match admission {
             EffectAdmission::Conflict => BrokerResponse::new(
                 request.request_id(),
@@ -163,8 +176,8 @@ impl EffectService {
                 )),
             ),
             EffectAdmission::Completed(response) => response.replayed(),
-            EffectAdmission::Pending(event, relay_url, was_pending) => {
-                let publication = if was_pending {
+            EffectAdmission::Pending(event, relay_url, _) => {
+                let publication = if was_pending_before_lock {
                     self.publisher
                         .publish_pending(&self.signer, &relay_url, &event)
                         .await

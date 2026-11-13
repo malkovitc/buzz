@@ -1,4 +1,6 @@
 mod credential;
+#[cfg(unix)]
+mod drain;
 mod http;
 mod issuer;
 #[cfg(unix)]
@@ -50,6 +52,15 @@ enum Command {
         #[arg(long)]
         authority_file: PathBuf,
     },
+    /// Reconcile one previously admitted message effect after quiesce.
+    Drain {
+        #[arg(long)]
+        authority_file: PathBuf,
+        #[arg(long)]
+        signing_key_file: PathBuf,
+        #[arg(long)]
+        auth_tag_file: PathBuf,
+    },
     /// Serve the broker action endpoint on loopback.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
@@ -85,6 +96,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buzz_sdk::broker::AuthorityState::Quiescing => println!("quiescing"),
                 buzz_sdk::broker::AuthorityState::Fenced => println!("fenced"),
                 buzz_sdk::broker::AuthorityState::Active => unreachable!("quiesce closes intake"),
+            }
+        }
+        Command::Drain {
+            authority_file,
+            signing_key_file,
+            auth_tag_file,
+        } => {
+            #[cfg(unix)]
+            {
+                let identity = issuer::read_identity(&authority_file)?;
+                let signer = signing::HostSigner::load(&signing_key_file, &auth_tag_file)?;
+                let publisher = publisher::RelayPublisher::new()?;
+                let drained = drain::drain_pending(&store, &identity, &signer, &publisher).await?;
+                println!(
+                    "{}",
+                    if drained {
+                        "drained"
+                    } else {
+                        "no pending effect"
+                    }
+                );
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (authority_file, signing_key_file, auth_tag_file);
+                return Err("effect drain is unsupported on this platform".into());
             }
         }
         Command::Serve {

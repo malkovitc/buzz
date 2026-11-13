@@ -1,6 +1,74 @@
 use super::*;
 
 impl AuthorityStore {
+    pub(crate) async fn fence(&self, identity: &AuthorityIdentity) -> Result<(), StoreError> {
+        let identity = identity
+            .validated()
+            .map_err(|_| StoreError::InvalidIdentity)?;
+        let authority_json = canonical_identity(&identity)?;
+        #[cfg(unix)]
+        let _publication_guard = self.publication_lock_for_identity(&identity).await?;
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let mut transaction = connection
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        require_canonical_authority_state(&mut transaction).await?;
+        let row =
+            sqlx::query("SELECT state, quiescing FROM broker_authorities WHERE authority_json = ?")
+                .bind(&authority_json)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM broker_effects
+                WHERE credential_hash = (
+                    SELECT credential_hash FROM broker_authorities WHERE authority_json = ?
+                ) AND response_json IS NULL
+            )",
+        )
+        .bind(&authority_json)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+        if pending {
+            return Err(StoreError::EffectsPending);
+        }
+        let state = row
+            .map(|row| {
+                let state: String = row.try_get("state").map_err(|_| StoreError::Integrity)?;
+                let quiescing: i64 = row
+                    .try_get("quiescing")
+                    .map_err(|_| StoreError::Integrity)?;
+                parse_state(&state, quiescing)
+            })
+            .transpose()?
+            .ok_or(StoreError::AuthorityNotFound)?;
+        match state {
+            AuthorityState::Fenced => {}
+            AuthorityState::Active | AuthorityState::Quiescing => {
+                sqlx::query(
+                    "UPDATE broker_authorities SET state = 'fenced', quiescing = 0
+                     WHERE authority_json = ? AND (state = 'active' OR quiescing = 1)",
+                )
+                .bind(&authority_json)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+            }
+        }
+        invalidate_authority_receipts(&mut transaction, &authority_json).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| StoreError::Unavailable)
+    }
+
     #[cfg(unix)]
     pub(super) async fn migrate_schema_v3(&self) -> Result<(), StoreError> {
         let mut connection = self
