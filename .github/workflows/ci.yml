@@ -42,6 +42,20 @@ jobs:
           token: ''
           predicate-quantifier: some-with-excludes
           filters: |
+            contracts:
+              - '.github/**'
+              - 'scripts/**'
+              - 'desktop/**'
+              - 'mobile/**'
+              - '**/Cargo.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/config.toml'
+              - 'renovate.json'
+              - '.gitignore'
+              - 'justfile'
+              - 'Justfile'
             rust:
               - 'crates/**'
               - '!crates/buzz-broker-host/**'
@@ -101,20 +115,26 @@ jobs:
               - 'scripts/test-mobile-worktree-overrides.sh'
               - '.github/workflows/mobile-release-candidate.yml'
       - name: Release workflow source contract
+        if: github.ref == 'refs/heads/release' || steps.filter.outputs.contracts == 'true'
         run: scripts/test-release-ref-contract.sh
       - name: Desktop release candidate contract
+        if: github.ref == 'refs/heads/release' || steps.filter.outputs.contracts == 'true'
         run: scripts/test-desktop-release-candidate.sh
       - name: OSS desktop promotion contract
+        if: github.ref == 'refs/heads/release' || steps.filter.outputs.contracts == 'true'
         run: |
           scripts/test-oss-desktop-promotion.sh
           scripts/test-oss-desktop-promotion-behavior.sh
       - name: Mobile release contract
+        if: github.ref == 'refs/heads/release' || steps.filter.outputs.contracts == 'true'
         run: |
           scripts/test-mobile-release-contract.sh
           scripts/test-mobile-release-candidate-publisher.sh
       - name: Mobile worktree identity contract
+        if: github.ref == 'refs/heads/release' || steps.filter.outputs.contracts == 'true'
         run: scripts/test-mobile-worktree-overrides.sh
       - name: Rust cache contract
+        if: github.ref == 'refs/heads/release' || steps.filter.outputs.contracts == 'true'
         run: |
           scripts/test-rust-cache-contract.sh
           scripts/test-rust-cache-contract-regressions.sh
