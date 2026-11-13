@@ -117,9 +117,8 @@ origin, including when the WebSocket identity URL contains a path or query.
 
 This slice does **not** provision signer files or broker credentials into
 Desktop/Kubernetes launchers, serve the other broker actions, execute Git
-effects, drain a runtime automatically, activate a second
-runtime, or serve TLS.
-An unresolved effect currently needs an exact request retry while the relay is
-reachable; automatic background drain and two-runtime cutover remain MOBILITY
-3B3. Voice 2 remains blocked until the host boundary is adopted by its launch
-and Huddle paths and revalidated end to end.
+effects, drain a runtime automatically, or serve TLS. An unresolved effect
+needs an exact request retry or operator drain while the relay is reachable.
+End-to-end launcher cutover remains MOBILITY 3B3. Voice 2 remains blocked until
+the host boundary is adopted by its launch and Huddle paths and revalidated end
+to end.
