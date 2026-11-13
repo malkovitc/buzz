@@ -1,0 +1,36 @@
+name: Managed Agent Runtime Smoke
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/managed-agent-smoke.yml
+      - Dockerfile.broker-host
+      - deploy/managed-agent/compose.yml
+      - deploy/managed-agent/agent-entrypoint.sh
+      - deploy/managed-agent/test-runtime.py
+      - crates/buzz-broker-host/examples/managed_agent_fixture.rs
+  workflow_dispatch:
+
+concurrency:
+  group: managed-agent-smoke-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  smoke:
+    name: Synthetic Compose handoff
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: managed-agent-smoke
+      - name: Build broker image
+        run: docker build -f Dockerfile.broker-host -t buzz-broker-host:smoke .
+      - name: Pull keyless ACP image
+        run: docker pull ghcr.io/malkovitc/buzz-sprig@sha256:9f350ff80feeaf0ebfbccc603b18e6b75871ff54482c26c6ba9351ff9981c5ab
+      - name: Synthetic authority and Compose handoff
+        run: python3 deploy/managed-agent/test-runtime.py

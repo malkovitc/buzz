@@ -18,6 +18,20 @@ docker run --rm buzz-broker-host:canary --state /tmp/authority.db --help
 bash deploy/managed-agent/test-compose.sh
 ```
 
+On Linux, the manual runtime smoke creates synthetic signer files, an empty
+relay, and a disposable Compose project, then proves ACP polling and
+quiesce/fence. It never connects to the production relay:
+
+```bash
+BUZZ_BROKER_HOST_IMAGE=buzz-broker-host:canary \
+BUZZ_SPRIG_IMAGE=buzz-sprig:canary \
+python3 deploy/managed-agent/test-runtime.py
+```
+
+The same smoke runs in the path-scoped **Managed Agent Runtime Smoke** GitHub
+workflow for launcher changes and can also be dispatched manually. It builds
+an image and a second Rust binary, so unrelated PRs do not run it.
+
 On a Linux host, prepare distinct bind paths owned by UID/GID 1000:
 
 ```bash
