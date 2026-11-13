@@ -20,7 +20,6 @@ on:
       - 'desktop/src-tauri/src/mesh_llm/**'
       - 'scripts/ci-mesh-lifecycle-smoke.sh'
       - 'scripts/start-relay-for-tests.sh'
-      - '.github/workflows/mesh-lifecycle.yml'
   pull_request:
     paths:
       - 'crates/buzz-relay/examples/mesh_*.rs'
@@ -31,7 +30,6 @@ on:
       - 'desktop/src-tauri/src/mesh_llm/**'
       - 'scripts/ci-mesh-lifecycle-smoke.sh'
       - 'scripts/start-relay-for-tests.sh'
-      - '.github/workflows/mesh-lifecycle.yml'
   workflow_dispatch:
 
 concurrency:
