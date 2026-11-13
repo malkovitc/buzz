@@ -15,6 +15,7 @@ path = "src/main.rs"
 axum = { workspace = true }
 base64 = { workspace = true }
 buzz-sdk = { workspace = true }
+buzz-core = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 hex = { workspace = true }
 nostr = { workspace = true }

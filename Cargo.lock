@@ -992,6 +992,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "buzz-broker-client",
+ "buzz-core",
  "buzz-sdk",
  "clap",
  "hex",

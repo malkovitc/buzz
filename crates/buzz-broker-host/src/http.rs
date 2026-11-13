@@ -5,7 +5,7 @@ use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
 #[cfg(unix)]
-use buzz_sdk::broker::{Action, ValidatedRequest};
+use buzz_sdk::broker::{Action, ActionArgs, ValidatedRequest};
 use buzz_sdk::broker::{
     BrokerError, BrokerErrorCode, BrokerRequest, BrokerResponse, BrokerResult, BROKER_ACTION_PATH,
 };
@@ -101,6 +101,23 @@ async fn action(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         Ok(credential) => credential,
         Err(()) => return broker_response(unauthenticated(request.request_id())),
     };
+    #[cfg(unix)]
+    if let (ActionArgs::StorageAddress(args), Some(effects)) = (request.args(), &state.effects) {
+        let address = match effects.signer.storage_address(&args.slug) {
+            Ok(address) => address,
+            Err(_) => return broker_response(internal_failure(request.request_id())),
+        };
+        let response = match state
+            .store
+            .execute_with_address(&credential, &body, &request, address)
+            .await
+        {
+            Ok(response) => response,
+            Err(StoreError::Unauthenticated) => unauthenticated(request.request_id()),
+            Err(_) => internal_failure(request.request_id()),
+        };
+        return broker_response(response);
+    }
     #[cfg(unix)]
     if request.action() == Action::MessagePost {
         if let Some(effects) = &state.effects {

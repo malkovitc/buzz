@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use buzz_sdk::broker::{
     Action, ActionOutcome, AuthorityIdentity, AuthorityState, BrokerError, BrokerResponse,
-    BrokerResult, ManagedAcpAuthority, ValidatedRequest,
+    BrokerResult, ManagedAcpAuthority, StorageAddress, ValidatedRequest,
 };
 #[cfg(unix)]
 use buzz_sdk::broker::{ActionArgs, EventPublished};
@@ -371,6 +371,29 @@ impl AuthorityStore {
         request_bytes: &[u8],
         request: &ValidatedRequest,
     ) -> Result<BrokerResponse, StoreError> {
+        self.execute_inner(credential, request_bytes, request, None)
+            .await
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn execute_with_address(
+        &self,
+        credential: &CredentialDigest,
+        request_bytes: &[u8],
+        request: &ValidatedRequest,
+        address: StorageAddress,
+    ) -> Result<BrokerResponse, StoreError> {
+        self.execute_inner(credential, request_bytes, request, Some(address))
+            .await
+    }
+
+    async fn execute_inner(
+        &self,
+        credential: &CredentialDigest,
+        request_bytes: &[u8],
+        request: &ValidatedRequest,
+        address: Option<StorageAddress>,
+    ) -> Result<BrokerResponse, StoreError> {
         let request_digest: [u8; 32] = Sha256::digest(request_bytes).into();
         let mut connection = self
             .pool
@@ -401,7 +424,30 @@ impl AuthorityStore {
         )
         .await?
         {
-            ReceiptMatch::Replay(response) => return Ok((*response).replayed()),
+            ReceiptMatch::Replay(response) => {
+                if request.action() == Action::StorageAddress {
+                    if let BrokerResult::Succeeded {
+                        outcome: ActionOutcome::StorageAddress(stored),
+                    } = &response.result
+                    {
+                        let still_authorized = authority.state == AuthorityState::Active
+                            && address.as_ref().is_some_and(|current| {
+                                current == stored
+                                    && current.author_pubkey
+                                        == authority.identity.executor_agent_pubkey
+                            });
+                        if !still_authorized {
+                            return Ok(BrokerResponse::new(
+                                request.request_id(),
+                                BrokerResult::failed(BrokerError::unauthorized(
+                                    "verified signer or owner changed for this generation",
+                                )),
+                            ));
+                        }
+                    }
+                }
+                return Ok((*response).replayed());
+            }
             ReceiptMatch::Conflict => return Ok(conflict_response(request.request_id())),
             ReceiptMatch::Missing => {}
         }
@@ -413,8 +459,22 @@ impl AuthorityStore {
                     state: authority.state,
                 }))
             }
+            Action::StorageAddress => match address {
+                Some(address)
+                    if authority.state == AuthorityState::Active
+                        && address.author_pubkey == authority.identity.executor_agent_pubkey =>
+                {
+                    BrokerResult::succeeded(ActionOutcome::StorageAddress(address))
+                }
+                Some(_) => BrokerResult::failed(BrokerError::unauthorized(
+                    "authority generation is not active or signer does not match executor",
+                )),
+                None => BrokerResult::failed(BrokerError::unsupported(
+                    "storage.address requires a configured host signer",
+                )),
+            },
             _ => BrokerResult::failed(BrokerError::unsupported(
-                "this host currently serves authority.status only",
+                "this host does not serve the requested action",
             )),
         };
         let response = BrokerResponse::new(request.request_id(), result);

@@ -2,8 +2,8 @@
 
 `buzz-broker-host` is the host-owned durable authority boundary for managed ACP
 runtimes. It always serves `authority.status`. With a host-owned signing key and
-verified owner attestation, it also serves `message.post`. Other broker actions
-remain unsupported.
+verified owner attestation, it also serves `storage.address` and `message.post`.
+Other broker actions remain unsupported.
 
 The host stores canonical authority identities, lifecycle state, credential
 hashes, and bounded request receipts in SQLite. It never stores or prints the
@@ -112,6 +112,20 @@ read-only/unsupported receipts per credential independently of this journal.
 An exact retry first queries the stored event ID and only republishes it if
 the relay confirms it is absent. HTTP endpoints are derived from the relay
 origin, including when the WebSocket identity URL contains a path or query.
+
+`storage.address` derives the NIP-AE record address from the host-held agent
+key and the verified owner pubkey. It returns only the agent pubkey, event kind,
+and keyed `d` tag for the requested slug. The bearer must name an active
+generation whose executor matches the signer; quiescing invalidates previous
+address receipts. An exact retry also checks the current signer and derived
+address before replaying a receipt, so a restarted host without the signer or
+with a different verified owner cannot return an old address. Denied requests
+also retain their exact-retry receipt. The host does not persist an owner binding
+for the generation: a fresh request ID with a different valid owner attestation
+can derive a different address while the generation remains active. Keep the
+owner attestation stable for one generation; quiesce, drain, and fence before
+issuing a successor with another owner. This action does not fetch or decrypt
+a memory record.
 
 ## Deliberate boundary
 
