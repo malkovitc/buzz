@@ -1,12 +1,18 @@
 //! Synthetic identities for the opt-in container smoke. Never use these for production.
 
+#[cfg(unix)]
 use std::fs::{self, OpenOptions};
+#[cfg(unix)]
 use std::io::Write as _;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+#[cfg(unix)]
 use std::path::Path;
 
+#[cfg(unix)]
 use nostr::Keys;
 
+#[cfg(unix)]
 fn private_file(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -18,6 +24,7 @@ fn private_file(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+#[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     let root = args
@@ -55,4 +62,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     private_file(&root.join("authority.json"), &authority.to_string())?;
     private_file(&root.join("owner.pubkey"), &owner.public_key().to_hex())?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("managed-agent fixture generation requires Unix");
 }

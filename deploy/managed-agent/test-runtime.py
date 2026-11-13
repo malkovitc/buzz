@@ -67,7 +67,7 @@ def chown_fixture(path, uid, gid):
 def wait_for_runtime(compose):
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
-        if agent_is_running(compose) and EmptyRelay.queries > 0:
+        if agent_is_running(compose) and EmptyRelay.queries >= 2:
             return
         time.sleep(0.5)
     raise RuntimeError(f"ACP did not poll the synthetic relay (queries={EmptyRelay.queries})")
@@ -103,6 +103,11 @@ def main():
         (root / "override.yml").write_text(
             "services:\n  broker-host:\n    extra_hosts:\n"
             "      - host.docker.internal:host-gateway\n"
+            "  agent:\n    environment:\n"
+            "      BUZZ_AGENT_PROVIDER: openai\n"
+            "      OPENAI_COMPAT_API_KEY: synthetic-smoke-only\n"
+            "      OPENAI_COMPAT_MODEL: smoke\n"
+            "      OPENAI_COMPAT_BASE_URL: http://127.0.0.1:1\n"
         )
         provisioned = False
         started = False

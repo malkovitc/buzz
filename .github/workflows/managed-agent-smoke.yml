@@ -5,7 +5,9 @@ on:
     paths:
       - .github/workflows/managed-agent-smoke.yml
       - Dockerfile.broker-host
-      - deploy/managed-agent/**
+      - deploy/managed-agent/compose.yml
+      - deploy/managed-agent/agent-entrypoint.sh
+      - deploy/managed-agent/test-runtime.py
       - crates/buzz-broker-host/examples/managed_agent_fixture.rs
   workflow_dispatch:
 
