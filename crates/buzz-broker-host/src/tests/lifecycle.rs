@@ -1,6 +1,59 @@
 use super::*;
 
 #[tokio::test]
+async fn v3_migration_preserves_receipts_and_adds_read_owner_column() {
+    let fixture = Fixture::new();
+    let store = AuthorityStore::open(&fixture.state)
+        .await
+        .expect("create schema");
+    let bearer = fixture.issue(&store).await;
+    let credential = crate::credential::CredentialDigest::from_bearer(&bearer).unwrap();
+    let request = status_request("v3-receipt");
+    let validated = serde_json::from_slice::<BrokerRequest>(request.body())
+        .unwrap()
+        .validated()
+        .unwrap();
+    store
+        .execute(&credential, request.body(), &validated)
+        .await
+        .expect("persist old receipt");
+    drop(store);
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(&fixture.state),
+    )
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE broker_receipts DROP COLUMN owner_pubkey")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA user_version = 3")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let reopened = AuthorityStore::open(&fixture.state)
+        .await
+        .expect("migrate v3");
+    let replay = reopened
+        .execute(&credential, request.body(), &validated)
+        .await
+        .expect("old receipt replays");
+    assert!(replay.replayed);
+    let inspect = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(&fixture.state),
+    )
+    .await
+    .unwrap();
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&inspect)
+        .await
+        .unwrap();
+    assert_eq!(version, 4);
+    inspect.close().await;
+}
+
+#[tokio::test]
 async fn quiesce_closes_admission_and_survives_restart_before_fence() {
     use buzz_sdk::broker::{AuthorityState, ManagedAcpAuthority};
 
@@ -159,7 +212,7 @@ async fn v2_migration_keeps_existing_authority_and_adds_quiescing_state() {
         .fetch_one(&pool)
         .await
         .expect("schema version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     pool.close().await;
 }
 

@@ -1,6 +1,39 @@
 use super::*;
 
 impl AuthorityStore {
+    #[cfg(unix)]
+    pub(super) async fn migrate_schema_v4(&self) -> Result<(), StoreError> {
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let mut transaction = connection
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if current != 3 {
+            return Ok(());
+        }
+        require_canonical_authority_state(&mut transaction).await?;
+        sqlx::query("ALTER TABLE broker_receipts ADD COLUMN owner_pubkey TEXT")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        sqlx::query("PRAGMA user_version = 4")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| StoreError::Unavailable)
+    }
+
     pub(crate) async fn fence(&self, identity: &AuthorityIdentity) -> Result<(), StoreError> {
         let identity = identity
             .validated()

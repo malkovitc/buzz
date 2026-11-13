@@ -21,6 +21,8 @@ const CHANNEL_ID: &str = "5df7dfa8-e919-43df-8efd-f1dcb8af7071";
 mod drain;
 mod effects;
 mod lifecycle;
+mod read;
+mod receipts;
 mod storage;
 
 struct Fixture {
@@ -89,6 +91,10 @@ fn write_identity(path: &Path, identity: &AuthorityIdentity) {
 }
 
 async fn simulate_v2_schema(pool: &sqlx::SqlitePool) {
+    sqlx::query("ALTER TABLE broker_receipts DROP COLUMN owner_pubkey")
+        .execute(pool)
+        .await
+        .expect("remove v4 receipt binding");
     sqlx::query("DROP INDEX one_unfenced_generation_per_scope")
         .execute(pool)
         .await

@@ -816,7 +816,7 @@ async fn v1_migration_keeps_issued_authority_and_adds_effect_journal() {
         .fetch_one(&pool)
         .await
         .expect("schema version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let journal_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'broker_effects')",
     )
