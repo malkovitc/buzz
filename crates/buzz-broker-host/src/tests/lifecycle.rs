@@ -1,7 +1,61 @@
 use super::*;
 
 #[tokio::test]
-async fn v3_migration_preserves_receipts_and_adds_read_owner_column() {
+async fn v4_migration_quiesces_unbound_generation_and_clears_receipts() {
+    use buzz_sdk::broker::AuthorityState;
+
+    let fixture = Fixture::new();
+    let store = AuthorityStore::open(&fixture.state).await.unwrap();
+    let bearer = fixture.issue(&store).await;
+    let credential = crate::credential::CredentialDigest::from_bearer(&bearer).unwrap();
+    let request = status_request("before-v5-migration");
+    let validated = serde_json::from_slice::<BrokerRequest>(request.body())
+        .unwrap()
+        .validated()
+        .unwrap();
+    store
+        .execute(&credential, request.body(), &validated)
+        .await
+        .unwrap();
+    drop(store);
+
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(&fixture.state),
+    )
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE broker_authorities DROP COLUMN owner_pubkey")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA user_version = 4")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let migrated = AuthorityStore::open(&fixture.state).await.unwrap();
+    let response = migrated
+        .execute(&credential, request.body(), &validated)
+        .await
+        .unwrap();
+    assert!(!response.replayed);
+    assert!(matches!(
+        response.result,
+        BrokerResult::Succeeded {
+            outcome: buzz_sdk::broker::ActionOutcome::AuthorityStatus(
+                buzz_sdk::broker::ManagedAcpAuthority {
+                    state: AuthorityState::Quiescing,
+                    ..
+                }
+            )
+        }
+    ));
+    migrated.fence(&fixture.identity).await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_migration_quiesces_authority_and_clears_old_receipts() {
     let fixture = Fixture::new();
     let store = AuthorityStore::open(&fixture.state)
         .await
@@ -27,6 +81,10 @@ async fn v3_migration_preserves_receipts_and_adds_read_owner_column() {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("ALTER TABLE broker_authorities DROP COLUMN owner_pubkey")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("PRAGMA user_version = 3")
         .execute(&pool)
         .await
@@ -39,7 +97,7 @@ async fn v3_migration_preserves_receipts_and_adds_read_owner_column() {
         .execute(&credential, request.body(), &validated)
         .await
         .expect("old receipt replays");
-    assert!(replay.replayed);
+    assert!(!replay.replayed, "migration clears stale active receipts");
     let inspect = sqlx::SqlitePool::connect_with(
         sqlx::sqlite::SqliteConnectOptions::new().filename(&fixture.state),
     )
@@ -49,7 +107,7 @@ async fn v3_migration_preserves_receipts_and_adds_read_owner_column() {
         .fetch_one(&inspect)
         .await
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     inspect.close().await;
 }
 
@@ -212,7 +270,7 @@ async fn v2_migration_keeps_existing_authority_and_adds_quiescing_state() {
         .fetch_one(&pool)
         .await
         .expect("schema version");
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     pool.close().await;
 }
 

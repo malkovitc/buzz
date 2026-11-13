@@ -317,6 +317,19 @@ async fn channel_query_uses_host_nip98_and_returns_verified_channel_event() {
         !rotated.replayed,
         "read page cannot replay to another owner"
     );
+    let rotated_fresh = BrokerRequest::new(
+        "channel-read-rotated-fresh",
+        ActionArgs::ChannelRead(args.clone()),
+    )
+    .and_then(BrokerRequest::prepare)
+    .unwrap();
+    let (_, rotated_fresh_body) = send(&rotated_url, &bearer, rotated_fresh.body()).await;
+    let rotated_fresh_response: BrokerResponse =
+        serde_json::from_slice(&rotated_fresh_body).unwrap();
+    assert!(
+        matches!(rotated_fresh_response.result, BrokerResult::Failed { ref error }
+        if error.code == BrokerErrorCode::Unauthorized)
+    );
     server.abort();
     let (_, retry_body) = send(&host_url, &bearer, request.body()).await;
     let retry: BrokerResponse = serde_json::from_slice(&retry_body).unwrap();

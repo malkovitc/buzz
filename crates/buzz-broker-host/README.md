@@ -13,6 +13,14 @@ other platforms until equivalent ownership and ACL checks exist. The database
 path must be absolute. The HTTP listener is loopback-only, so a colocated
 runtime can use plaintext without publishing its bearer.
 
+Schema v5 binds the first successful signer-backed action to the verified owner
+for the entire generation. Later `storage.address`, `channel.read`, and
+`message.post` requests with another owner are rejected. Upgrading a v1-v4
+database quiesces every previously active generation and clears its old
+read-only receipts because earlier schemas could not prove which owner had
+used it. Drain and fence those generations, then issue successors. Stop older
+host processes before upgrading.
+
 ## Issue and fence
 
 Prepare a strict `AuthorityIdentity` JSON file using the same shape as
@@ -120,12 +128,10 @@ generation whose executor matches the signer; quiescing invalidates previous
 address receipts. An exact retry also checks the current signer and derived
 address before replaying a receipt, so a restarted host without the signer or
 with a different verified owner cannot return an old address. Denied requests
-also retain their exact-retry receipt. The host does not persist an owner binding
-for the generation: a fresh request ID with a different valid owner attestation
-can derive a different address while the generation remains active. Keep the
-owner attestation stable for one generation; quiesce, drain, and fence before
-issuing a successor with another owner. This action does not fetch or decrypt
-a memory record.
+also retain their exact-retry receipt. The first successful signer-backed
+action durably binds the owner, so even a fresh request ID cannot derive an
+address for another owner. Change owners through a successor generation after
+quiesce, drain, and fence. This action does not fetch or decrypt a memory record.
 
 `channel.read` makes a host-signed NIP-98 `POST /query` request to the community
 relay. Relay membership and channel-access policy remain authoritative. The host
@@ -140,9 +146,8 @@ oldest entries are evicted first, including across credentials. An exact retry
 after eviction queries the relay again and needs it to be available. Successful
 read receipts persist
 their verified owner and cannot replay after owner rotation. Denied receipts
-retain the normal exact-retry contract. A fresh request under another valid
-owner attestation can still read under that new owner's relay permissions; the
-generation-level owner binding remains an operator policy.
+retain the normal exact-retry contract. Fresh reads under another owner are
+rejected once the generation is bound.
 
 ## Deliberate boundary
 

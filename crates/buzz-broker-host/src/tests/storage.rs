@@ -1,6 +1,6 @@
 use super::*;
 
-use buzz_sdk::broker::{ActionOutcome, PubkeyHex, StorageAddressArgs};
+use buzz_sdk::broker::{ActionOutcome, MessagePostArgs, PubkeyHex, StorageAddressArgs};
 use nostr::Keys;
 use std::os::unix::fs::PermissionsExt as _;
 
@@ -185,6 +185,54 @@ async fn storage_address_uses_verified_owner_and_host_key_only_while_active() {
         !rotated.replayed,
         "old owner address cannot replay after rotation"
     );
+    let fresh_rotated_request = BrokerRequest::new(
+        "address-rotated-fresh",
+        ActionArgs::StorageAddress(StorageAddressArgs {
+            slug: "core".into(),
+        }),
+    )
+    .and_then(BrokerRequest::prepare)
+    .expect("fresh rotated request");
+    let (_, fresh_rotated_body) = send(&rotated_url, &bearer, fresh_rotated_request.body()).await;
+    let fresh_rotated: BrokerResponse =
+        serde_json::from_slice(&fresh_rotated_body).expect("fresh rotated owner response");
+    assert!(matches!(
+        fresh_rotated.result,
+        BrokerResult::Failed { ref error } if error.code == BrokerErrorCode::Unauthorized
+    ));
+    let rotated_read = BrokerRequest::new(
+        "read-rotated-fresh",
+        ActionArgs::ChannelRead(ChannelReadArgs {
+            channel_id: CHANNEL_ID.into(),
+            ..ChannelReadArgs::default()
+        }),
+    )
+    .and_then(BrokerRequest::prepare)
+    .expect("rotated read request");
+    let (_, rotated_read_body) = send(&rotated_url, &bearer, rotated_read.body()).await;
+    let rotated_read_response: BrokerResponse =
+        serde_json::from_slice(&rotated_read_body).expect("rotated read response");
+    assert!(matches!(
+        rotated_read_response.result,
+        BrokerResult::Failed { ref error } if error.code == BrokerErrorCode::Unauthorized
+    ));
+    let rotated_post = BrokerRequest::new(
+        "post-rotated-fresh",
+        ActionArgs::MessagePost(MessagePostArgs {
+            channel_id: CHANNEL_ID.into(),
+            content: "must not publish".into(),
+            mentions: Vec::new(),
+        }),
+    )
+    .and_then(BrokerRequest::prepare)
+    .expect("rotated post request");
+    let (_, rotated_post_body) = send(&rotated_url, &bearer, rotated_post.body()).await;
+    let rotated_post_response: BrokerResponse =
+        serde_json::from_slice(&rotated_post_body).expect("rotated post response");
+    assert!(matches!(
+        rotated_post_response.result,
+        BrokerResult::Failed { ref error } if error.code == BrokerErrorCode::Unauthorized
+    ));
 
     store
         .quiesce(&fixture.identity)
