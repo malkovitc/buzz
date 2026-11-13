@@ -171,7 +171,13 @@ async fn action(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         };
         let response = match state
             .store
-            .execute_with_address(&credential, &body, &request, address)
+            .execute_with_address(
+                &credential,
+                &body,
+                &request,
+                address,
+                effects.signer.owner_hex(),
+            )
             .await
         {
             Ok(response) => response,
@@ -230,6 +236,15 @@ impl EffectService {
                         BrokerResult::failed(BrokerError::new(
                             BrokerErrorCode::Unauthorized,
                             "authority generation is fenced",
+                        )),
+                    );
+                }
+                Err(StoreError::OwnerMismatch) => {
+                    return BrokerResponse::new(
+                        request.request_id(),
+                        BrokerResult::failed(BrokerError::new(
+                            BrokerErrorCode::Unauthorized,
+                            "authority generation belongs to another verified owner",
                         )),
                     );
                 }

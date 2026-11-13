@@ -14,7 +14,7 @@ pub(crate) async fn drain_pending(
     let Some(pending) = store.pending_message_post(identity).await? else {
         return Ok(false);
     };
-    if !signer.matches_executor(identity) {
+    if !signer.matches_executor(identity) || !signer.matches_event_owner(&pending.event) {
         return Err(StoreError::InvalidIdentity.into());
     }
     publisher

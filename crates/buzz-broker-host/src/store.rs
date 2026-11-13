@@ -27,7 +27,7 @@ mod effect_lock;
 mod lifecycle;
 
 #[cfg(unix)]
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 #[cfg(unix)]
 const EFFECTS_TABLE_SQL: &str = "CREATE TABLE broker_effects (
     credential_hash BLOB NOT NULL,
@@ -61,6 +61,7 @@ struct AuthorityScope<'a> {
 struct StoredAuthority {
     identity: AuthorityIdentity,
     state: AuthorityState,
+    owner_pubkey: Option<String>,
 }
 
 enum ReceiptMatch {
@@ -124,6 +125,7 @@ impl AuthorityStore {
                 1 => self.migrate_schema_v2().await?,
                 2 => self.migrate_schema_v3().await?,
                 3 => self.migrate_schema_v4().await?,
+                4 => self.migrate_schema_v5().await?,
                 SCHEMA_VERSION => break,
                 _ => return Err(StoreError::UnsupportedSchema),
             }
@@ -165,6 +167,7 @@ impl AuthorityStore {
                 generation TEXT NOT NULL,
                 state TEXT NOT NULL CHECK(state IN ('active', 'fenced')),
                 quiescing INTEGER NOT NULL DEFAULT 0 CHECK(quiescing IN (0, 1)),
+                owner_pubkey TEXT CHECK(owner_pubkey IS NULL OR length(owner_pubkey) = 64),
                 UNIQUE(authority_scope, generation)
             ) STRICT",
         )
@@ -198,7 +201,59 @@ impl AuthorityStore {
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
-        sqlx::query("PRAGMA user_version = 4")
+        sqlx::query("PRAGMA user_version = 5")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| StoreError::Unavailable)
+    }
+
+    #[cfg(unix)]
+    async fn migrate_schema_v5(&self) -> Result<(), StoreError> {
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let mut transaction = connection
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if current != 4 {
+            return Ok(());
+        }
+        sqlx::query(
+            "ALTER TABLE broker_authorities ADD COLUMN owner_pubkey TEXT
+             CHECK(owner_pubkey IS NULL OR length(owner_pubkey) = 64)",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+        // Prior schemas did not bind the owner. Even if receipts were evicted,
+        // an active generation might already have used another owner.
+        sqlx::query(
+            "UPDATE broker_authorities SET state = 'fenced', quiescing = 1
+             WHERE state = 'active' AND quiescing = 0",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+        sqlx::query(
+            "DELETE FROM broker_receipts WHERE credential_hash IN (
+                SELECT credential_hash FROM broker_authorities WHERE quiescing = 1
+            )",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+        sqlx::query("PRAGMA user_version = 5")
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
@@ -322,6 +377,18 @@ impl AuthorityStore {
             .await
             .map_err(|_| StoreError::Unavailable)?;
         require_canonical_authority_state(&mut transaction).await?;
+        let owners: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT owner_pubkey FROM broker_authorities")
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+        if owners
+            .iter()
+            .flatten()
+            .any(|owner| invalid_owner_pubkey(owner))
+        {
+            return Err(StoreError::Integrity);
+        }
         transaction
             .commit()
             .await
@@ -394,9 +461,16 @@ impl AuthorityStore {
         request_bytes: &[u8],
         request: &ValidatedRequest,
         address: StorageAddress,
+        owner_pubkey: String,
     ) -> Result<BrokerResponse, StoreError> {
-        self.execute_inner(credential, request_bytes, request, Some(address), None)
-            .await
+        self.execute_inner(
+            credential,
+            request_bytes,
+            request,
+            Some((address, owner_pubkey)),
+            None,
+        )
+        .await
     }
 
     #[cfg(unix)]
@@ -455,6 +529,7 @@ impl AuthorityStore {
         }
         if authority.state != AuthorityState::Active
             || !signer.matches_executor(&authority.identity)
+            || !owner_matches(&authority, &signer.owner_hex())
         {
             return Ok(ChannelReadAdmission::Denied);
         }
@@ -505,7 +580,7 @@ impl AuthorityStore {
         credential: &CredentialDigest,
         request_bytes: &[u8],
         request: &ValidatedRequest,
-        address: Option<StorageAddress>,
+        address: Option<(StorageAddress, String)>,
         read_page: Option<(Option<MessagePage>, String, String)>,
     ) -> Result<BrokerResponse, StoreError> {
         let request_digest: [u8; 32] = Sha256::digest(request_bytes).into();
@@ -547,10 +622,11 @@ impl AuthorityStore {
                     } = &response.result
                     {
                         let still_authorized = authority.state == AuthorityState::Active
-                            && address.as_ref().is_some_and(|current| {
+                            && address.as_ref().is_some_and(|(current, owner)| {
                                 current == stored
                                     && current.author_pubkey
                                         == authority.identity.executor_agent_pubkey
+                                    && owner_matches(&authority, owner)
                             });
                         if !still_authorized {
                             return Ok(BrokerResponse::new(
@@ -567,7 +643,10 @@ impl AuthorityStore {
                     && (authority.state != AuthorityState::Active
                         || read_page.as_ref().is_none_or(|(_, signer, _)| {
                             signer != authority.identity.executor_agent_pubkey.as_str()
-                        }))
+                        })
+                        || read_owner
+                            .as_deref()
+                            .is_none_or(|owner| !owner_matches(&authority, owner)))
                 {
                     return Ok(BrokerResponse::new(
                         request.request_id(),
@@ -597,12 +676,13 @@ impl AuthorityStore {
                     state: authority.state,
                 }))
             }
-            Action::StorageAddress => match address {
-                Some(address)
+            Action::StorageAddress => match address.as_ref() {
+                Some((address, owner))
                     if authority.state == AuthorityState::Active
-                        && address.author_pubkey == authority.identity.executor_agent_pubkey =>
+                        && address.author_pubkey == authority.identity.executor_agent_pubkey
+                        && owner_matches(&authority, owner) =>
                 {
-                    BrokerResult::succeeded(ActionOutcome::StorageAddress(address))
+                    BrokerResult::succeeded(ActionOutcome::StorageAddress(address.clone()))
                 }
                 Some(_) => BrokerResult::failed(BrokerError::unauthorized(
                     "authority generation is not active or signer does not match executor",
@@ -614,7 +694,10 @@ impl AuthorityStore {
             Action::ChannelRead => match read_page {
                 Some((Some(page), signer_pubkey, _))
                     if authority.state == AuthorityState::Active
-                        && signer_pubkey == authority.identity.executor_agent_pubkey.as_str() =>
+                        && signer_pubkey == authority.identity.executor_agent_pubkey.as_str()
+                        && read_owner
+                            .as_deref()
+                            .is_some_and(|owner| owner_matches(&authority, owner)) =>
                 {
                     BrokerResult::succeeded(ActionOutcome::ChannelRead(page))
                 }
@@ -629,6 +712,15 @@ impl AuthorityStore {
                 "this host does not serve the requested action",
             )),
         };
+        if matches!(result, BrokerResult::Succeeded { .. }) {
+            if let Some(owner) = address
+                .as_ref()
+                .map(|(_, owner)| owner)
+                .or(read_owner.as_ref())
+            {
+                bind_owner(&mut transaction, credential, owner).await?;
+            }
+        }
         let response = BrokerResponse::new(request.request_id(), result);
         let response_json = serde_json::to_string(&response).map_err(|_| StoreError::Integrity)?;
         sqlx::query(
@@ -685,6 +777,9 @@ impl AuthorityStore {
             .await
             .map_err(|_| StoreError::Unavailable)?;
         let authority = load_authority(&mut transaction, credential).await?;
+        if !owner_matches(&authority, &signer.owner_hex()) {
+            return Err(StoreError::OwnerMismatch);
+        }
 
         let existing = sqlx::query(
             "SELECT request_digest, event_json, response_json FROM broker_effects
@@ -756,6 +851,7 @@ impl AuthorityStore {
             .sign_message(&authority.identity, args)
             .map_err(|_| StoreError::InvalidIdentity)?;
         let event_json = serde_json::to_string(&event).map_err(|_| StoreError::Integrity)?;
+        bind_owner(&mut transaction, credential, &signer.owner_hex()).await?;
         sqlx::query(
             "INSERT INTO broker_effects
              (credential_hash, request_id, request_digest, action, event_json)
@@ -982,7 +1078,7 @@ async fn load_authority(
     credential: &CredentialDigest,
 ) -> Result<StoredAuthority, StoreError> {
     let row = sqlx::query(
-        "SELECT authority_json, authority_scope, generation, state, quiescing
+        "SELECT authority_json, authority_scope, generation, state, quiescing, owner_pubkey
          FROM broker_authorities WHERE credential_hash = ?",
     )
     .bind(credential.as_bytes())
@@ -1004,10 +1100,52 @@ async fn load_authority(
         .try_get("generation")
         .map_err(|_| StoreError::Integrity)?;
     let identity = decode_canonical_identity(&authority_json, &stored_scope, &stored_generation)?;
+    let owner_pubkey: Option<String> = row
+        .try_get("owner_pubkey")
+        .map_err(|_| StoreError::Integrity)?;
+    if owner_pubkey.as_deref().is_some_and(invalid_owner_pubkey) {
+        return Err(StoreError::Integrity);
+    }
     Ok(StoredAuthority {
         identity,
         state: parse_state(&state, quiescing)?,
+        owner_pubkey,
     })
+}
+
+fn owner_matches(authority: &StoredAuthority, owner: &str) -> bool {
+    authority
+        .owner_pubkey
+        .as_deref()
+        .is_none_or(|bound| bound == owner)
+}
+
+fn invalid_owner_pubkey(owner: &str) -> bool {
+    owner.len() != 64
+        || !owner
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+async fn bind_owner(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    credential: &CredentialDigest,
+    owner: &str,
+) -> Result<(), StoreError> {
+    let result = sqlx::query(
+        "UPDATE broker_authorities SET owner_pubkey = ?
+         WHERE credential_hash = ? AND (owner_pubkey IS NULL OR owner_pubkey = ?)",
+    )
+    .bind(owner)
+    .bind(credential.as_bytes())
+    .bind(owner)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| StoreError::Unavailable)?;
+    if result.rows_affected() != 1 {
+        return Err(StoreError::OwnerMismatch);
+    }
+    Ok(())
 }
 
 async fn load_receipt(
@@ -1222,6 +1360,8 @@ pub(crate) enum StoreError {
     #[error("authority generation is fenced")]
     #[cfg(unix)]
     AuthorityFenced,
+    #[error("authority generation belongs to another verified owner")]
+    OwnerMismatch,
     #[error("authority has unresolved effects")]
     EffectsPending,
     #[error("authority must be quiescing before effects can drain")]

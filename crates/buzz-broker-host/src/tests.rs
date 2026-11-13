@@ -110,6 +110,10 @@ async fn simulate_v2_schema(pool: &sqlx::SqlitePool) {
         .execute(pool)
         .await
         .expect("remove v3 lifecycle column");
+    sqlx::query("ALTER TABLE broker_authorities DROP COLUMN owner_pubkey")
+        .execute(pool)
+        .await
+        .expect("remove v5 generation owner column");
     sqlx::query("PRAGMA user_version = 2")
         .execute(pool)
         .await
