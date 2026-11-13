@@ -1,12 +1,13 @@
 use std::path::Path;
 
-use buzz_sdk::broker::{AuthorityIdentity, MessagePostArgs, PubkeyHex};
-use nostr::{Event, EventBuilder, JsonUtil as _, Keys, Kind, Tag};
+use buzz_sdk::broker::{AuthorityIdentity, MessagePostArgs, PubkeyHex, StorageAddress};
+use nostr::{Event, EventBuilder, JsonUtil as _, Keys, Kind, PublicKey, Tag};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 pub(crate) struct HostSigner {
     keys: Keys,
+    owner_pubkey: PublicKey,
     auth_tag: Tag,
     auth_tag_json: String,
 }
@@ -20,12 +21,13 @@ impl HostSigner {
         );
         let keys = Keys::parse(key.trim()).map_err(|_| SigningError::InvalidKey)?;
         let tag = std::fs::read_to_string(tag_path).map_err(|_| SigningError::Unreadable)?;
-        buzz_sdk::nip_oa::verify_auth_tag(tag.trim(), &keys.public_key())
+        let owner_pubkey = buzz_sdk::nip_oa::verify_auth_tag(tag.trim(), &keys.public_key())
             .map_err(|_| SigningError::InvalidAttestation)?;
         let auth_tag = buzz_sdk::nip_oa::parse_auth_tag(tag.trim())
             .map_err(|_| SigningError::InvalidAttestation)?;
         Ok(Self {
             keys,
+            owner_pubkey,
             auth_tag,
             auth_tag_json: tag.trim().to_owned(),
         })
@@ -37,6 +39,17 @@ impl HostSigner {
 
     pub(crate) fn matches_executor(&self, identity: &AuthorityIdentity) -> bool {
         identity.executor_agent_pubkey.as_str() == self.keys.public_key().to_hex()
+    }
+
+    pub(crate) fn storage_address(&self, slug: &str) -> Result<StorageAddress, SigningError> {
+        let author_pubkey = PubkeyHex::parse(self.keys.public_key().to_hex())
+            .map_err(|_| SigningError::InvalidKey)?;
+        let key = buzz_core::engram::conversation_key(self.keys.secret_key(), &self.owner_pubkey);
+        Ok(StorageAddress {
+            author_pubkey,
+            kind: buzz_core::kind::KIND_AGENT_ENGRAM,
+            d_tag: buzz_core::engram::d_tag(&key, slug),
+        })
     }
 
     pub(crate) fn nip98_authorization(

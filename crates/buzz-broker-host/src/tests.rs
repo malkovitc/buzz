@@ -21,6 +21,7 @@ const CHANNEL_ID: &str = "5df7dfa8-e919-43df-8efd-f1dcb8af7071";
 mod drain;
 mod effects;
 mod lifecycle;
+mod storage;
 
 struct Fixture {
     directory: TempDir,
