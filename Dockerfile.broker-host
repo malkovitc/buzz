@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.7
+# Build the broker separately from the untrusted ACP image. The final image
+# contains no agent runtime or signer material.
+FROM rust:1.95-alpine3.22@sha256:064dfc925d68d1a63f4fd2871bd7dc6e6ea56692989a487185855d62885d90aa AS builder
+
+RUN apk add --no-cache \
+      build-base \
+      cmake \
+      git \
+      musl-dev \
+      openssl-dev \
+      openssl-libs-static \
+      perl \
+      pkgconf \
+      protoc
+WORKDIR /build
+COPY . .
+RUN cargo build --locked --profile sprig -p buzz-broker-host \
+    && strip target/sprig/buzz-broker-host
+
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+RUN apk add --no-cache ca-certificates curl \
+    && adduser -D -u 1000 -h /home/broker broker
+COPY --from=builder --chmod=0755 /build/target/sprig/buzz-broker-host /usr/local/bin/buzz-broker-host
+USER broker
+ENTRYPOINT ["/usr/local/bin/buzz-broker-host"]
