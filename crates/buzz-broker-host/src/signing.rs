@@ -37,6 +37,34 @@ impl HostSigner {
         &self.auth_tag_json
     }
 
+    pub(crate) fn pubkey_hex(&self) -> String {
+        self.keys.public_key().to_hex()
+    }
+
+    pub(crate) fn owner_hex(&self) -> String {
+        self.owner_pubkey.to_hex()
+    }
+
+    pub(crate) fn cursor_mac(&self, payload: &[u8]) -> [u8; 16] {
+        let key = Zeroizing::new(self.keys.secret_key().to_secret_hex());
+        let mut inner_pad = Zeroizing::new([0x36_u8; 64]);
+        let mut outer_pad = Zeroizing::new([0x5c_u8; 64]);
+        for (index, byte) in key.as_bytes().iter().enumerate() {
+            inner_pad[index] ^= byte;
+            outer_pad[index] ^= byte;
+        }
+        let mut inner = Sha256::new();
+        inner.update(*inner_pad);
+        inner.update(payload);
+        let mut outer = Sha256::new();
+        outer.update(*outer_pad);
+        outer.update(inner.finalize());
+        let digest = outer.finalize();
+        let mut mac = [0_u8; 16];
+        mac.copy_from_slice(&digest[..16]);
+        mac
+    }
+
     pub(crate) fn matches_executor(&self, identity: &AuthorityIdentity) -> bool {
         identity.executor_agent_pubkey.as_str() == self.keys.public_key().to_hex()
     }

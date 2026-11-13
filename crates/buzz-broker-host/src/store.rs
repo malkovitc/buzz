@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use buzz_sdk::broker::{
     Action, ActionOutcome, AuthorityIdentity, AuthorityState, BrokerError, BrokerResponse,
-    BrokerResult, ManagedAcpAuthority, StorageAddress, ValidatedRequest,
+    BrokerResult, ManagedAcpAuthority, MessagePage, StorageAddress, ValidatedRequest,
 };
 #[cfg(unix)]
 use buzz_sdk::broker::{ActionArgs, EventPublished};
@@ -27,7 +27,7 @@ mod effect_lock;
 mod lifecycle;
 
 #[cfg(unix)]
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 #[cfg(unix)]
 const EFFECTS_TABLE_SQL: &str = "CREATE TABLE broker_effects (
     credential_hash BLOB NOT NULL,
@@ -40,6 +40,8 @@ const EFFECTS_TABLE_SQL: &str = "CREATE TABLE broker_effects (
     FOREIGN KEY (credential_hash) REFERENCES broker_authorities(credential_hash)
 ) STRICT";
 pub(crate) const MAX_RECEIPTS_PER_CREDENTIAL: i64 = 64;
+const MAX_RECEIPT_BYTES_PER_CREDENTIAL: i64 = 32 * 1024 * 1024;
+const MAX_TOTAL_RECEIPT_BYTES: i64 = 128 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct AuthorityStore {
@@ -65,6 +67,7 @@ enum ReceiptMatch {
     Missing,
     Replay(Box<BrokerResponse>),
     Conflict,
+    OwnerChanged,
 }
 
 #[cfg(unix)]
@@ -72,6 +75,13 @@ pub(crate) enum EffectAdmission {
     Pending(nostr::Event, String, bool),
     Completed(BrokerResponse),
     Conflict,
+}
+
+#[cfg(unix)]
+pub(crate) enum ChannelReadAdmission {
+    Replay(BrokerResponse),
+    Query(String),
+    Denied,
 }
 
 impl AuthorityStore {
@@ -113,6 +123,7 @@ impl AuthorityStore {
                 0 => self.create_schema().await?,
                 1 => self.migrate_schema_v2().await?,
                 2 => self.migrate_schema_v3().await?,
+                3 => self.migrate_schema_v4().await?,
                 SCHEMA_VERSION => break,
                 _ => return Err(StoreError::UnsupportedSchema),
             }
@@ -175,6 +186,7 @@ impl AuthorityStore {
                 request_id TEXT NOT NULL,
                 request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
                 response_json TEXT NOT NULL,
+                owner_pubkey TEXT,
                 UNIQUE (credential_hash, request_id),
                 FOREIGN KEY (credential_hash) REFERENCES broker_authorities(credential_hash)
             ) STRICT",
@@ -186,7 +198,7 @@ impl AuthorityStore {
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
-        sqlx::query("PRAGMA user_version = 3")
+        sqlx::query("PRAGMA user_version = 4")
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
@@ -371,7 +383,7 @@ impl AuthorityStore {
         request_bytes: &[u8],
         request: &ValidatedRequest,
     ) -> Result<BrokerResponse, StoreError> {
-        self.execute_inner(credential, request_bytes, request, None)
+        self.execute_inner(credential, request_bytes, request, None, None)
             .await
     }
 
@@ -383,8 +395,109 @@ impl AuthorityStore {
         request: &ValidatedRequest,
         address: StorageAddress,
     ) -> Result<BrokerResponse, StoreError> {
-        self.execute_inner(credential, request_bytes, request, Some(address))
+        self.execute_inner(credential, request_bytes, request, Some(address), None)
             .await
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn prepare_channel_read(
+        &self,
+        credential: &CredentialDigest,
+        request_bytes: &[u8],
+        request: &ValidatedRequest,
+        signer: &HostSigner,
+    ) -> Result<ChannelReadAdmission, StoreError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let authority = load_authority(&mut transaction, credential).await?;
+        let request_digest: [u8; 32] = Sha256::digest(request_bytes).into();
+        let effect_id_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM broker_effects WHERE credential_hash = ? AND request_id = ?)",
+        )
+        .bind(credential.as_bytes())
+        .bind(request.request_id())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+        if effect_id_exists {
+            return Ok(ChannelReadAdmission::Replay(conflict_response(
+                request.request_id(),
+            )));
+        }
+        match load_receipt(
+            &mut transaction,
+            credential,
+            request.request_id(),
+            &request_digest,
+            Some(&signer.owner_hex()),
+        )
+        .await?
+        {
+            ReceiptMatch::Conflict => {
+                return Ok(ChannelReadAdmission::Replay(conflict_response(
+                    request.request_id(),
+                )))
+            }
+            ReceiptMatch::OwnerChanged => return Ok(ChannelReadAdmission::Denied),
+            ReceiptMatch::Replay(response) => {
+                if matches!(response.result, BrokerResult::Succeeded { .. })
+                    && (authority.state != AuthorityState::Active
+                        || !signer.matches_executor(&authority.identity))
+                {
+                    return Ok(ChannelReadAdmission::Denied);
+                }
+                return Ok(ChannelReadAdmission::Replay((*response).replayed()));
+            }
+            ReceiptMatch::Missing => {}
+        }
+        if authority.state != AuthorityState::Active
+            || !signer.matches_executor(&authority.identity)
+        {
+            return Ok(ChannelReadAdmission::Denied);
+        }
+        Ok(ChannelReadAdmission::Query(
+            authority.identity.community_relay_url,
+        ))
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn execute_with_read_page(
+        &self,
+        credential: &CredentialDigest,
+        request_bytes: &[u8],
+        request: &ValidatedRequest,
+        page: MessagePage,
+        signer: &HostSigner,
+    ) -> Result<BrokerResponse, StoreError> {
+        self.execute_inner(
+            credential,
+            request_bytes,
+            request,
+            None,
+            Some((Some(page), signer.pubkey_hex(), signer.owner_hex())),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn execute_read_denial(
+        &self,
+        credential: &CredentialDigest,
+        request_bytes: &[u8],
+        request: &ValidatedRequest,
+        signer: &HostSigner,
+    ) -> Result<BrokerResponse, StoreError> {
+        self.execute_inner(
+            credential,
+            request_bytes,
+            request,
+            None,
+            Some((None, signer.pubkey_hex(), signer.owner_hex())),
+        )
+        .await
     }
 
     async fn execute_inner(
@@ -393,8 +506,10 @@ impl AuthorityStore {
         request_bytes: &[u8],
         request: &ValidatedRequest,
         address: Option<StorageAddress>,
+        read_page: Option<(Option<MessagePage>, String, String)>,
     ) -> Result<BrokerResponse, StoreError> {
         let request_digest: [u8; 32] = Sha256::digest(request_bytes).into();
+        let read_owner = read_page.as_ref().map(|(_, _, owner)| owner.clone());
         let mut connection = self
             .pool
             .acquire()
@@ -421,6 +536,7 @@ impl AuthorityStore {
             credential,
             request.request_id(),
             &request_digest,
+            read_owner.as_deref(),
         )
         .await?
         {
@@ -446,9 +562,31 @@ impl AuthorityStore {
                         }
                     }
                 }
+                if request.action() == Action::ChannelRead
+                    && matches!(response.result, BrokerResult::Succeeded { .. })
+                    && (authority.state != AuthorityState::Active
+                        || read_page.as_ref().is_none_or(|(_, signer, _)| {
+                            signer != authority.identity.executor_agent_pubkey.as_str()
+                        }))
+                {
+                    return Ok(BrokerResponse::new(
+                        request.request_id(),
+                        BrokerResult::failed(BrokerError::unauthorized(
+                            "active authority and matching host signer are required",
+                        )),
+                    ));
+                }
                 return Ok((*response).replayed());
             }
             ReceiptMatch::Conflict => return Ok(conflict_response(request.request_id())),
+            ReceiptMatch::OwnerChanged => {
+                return Ok(BrokerResponse::new(
+                    request.request_id(),
+                    BrokerResult::failed(BrokerError::unauthorized(
+                        "read receipt belongs to another verified owner",
+                    )),
+                ));
+            }
             ReceiptMatch::Missing => {}
         }
 
@@ -473,6 +611,20 @@ impl AuthorityStore {
                     "storage.address requires a configured host signer",
                 )),
             },
+            Action::ChannelRead => match read_page {
+                Some((Some(page), signer_pubkey, _))
+                    if authority.state == AuthorityState::Active
+                        && signer_pubkey == authority.identity.executor_agent_pubkey.as_str() =>
+                {
+                    BrokerResult::succeeded(ActionOutcome::ChannelRead(page))
+                }
+                Some(_) => BrokerResult::failed(BrokerError::unauthorized(
+                    "authority generation is not active or signer does not match executor",
+                )),
+                None => BrokerResult::failed(BrokerError::unsupported(
+                    "channel.read requires a configured host signer",
+                )),
+            },
             _ => BrokerResult::failed(BrokerError::unsupported(
                 "this host does not serve the requested action",
             )),
@@ -481,13 +633,25 @@ impl AuthorityStore {
         let response_json = serde_json::to_string(&response).map_err(|_| StoreError::Integrity)?;
         sqlx::query(
             "INSERT INTO broker_receipts
-             (credential_hash, request_id, request_digest, response_json)
-             VALUES (?, ?, ?, ?)",
+             (credential_hash, request_id, request_digest, response_json, owner_pubkey)
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(credential.as_bytes())
         .bind(request.request_id())
         .bind(request_digest.as_slice())
         .bind(response_json)
+        .bind(
+            if matches!(
+                response.result,
+                BrokerResult::Succeeded {
+                    outcome: ActionOutcome::ChannelRead(_)
+                }
+            ) {
+                read_owner.as_deref()
+            } else {
+                None
+            },
+        )
         .execute(&mut *transaction)
         .await
         .map_err(|_| StoreError::Conflict)?;
@@ -717,6 +881,23 @@ async fn prune_receipts(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     credential: &CredentialDigest,
 ) -> Result<(), StoreError> {
+    prune_receipts_with_limits(
+        transaction,
+        credential,
+        MAX_RECEIPTS_PER_CREDENTIAL,
+        MAX_RECEIPT_BYTES_PER_CREDENTIAL,
+        MAX_TOTAL_RECEIPT_BYTES,
+    )
+    .await
+}
+
+pub(crate) async fn prune_receipts_with_limits(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    credential: &CredentialDigest,
+    max_count: i64,
+    max_credential_bytes: i64,
+    max_total_bytes: i64,
+) -> Result<(), StoreError> {
     sqlx::query(
         "DELETE FROM broker_receipts
          WHERE credential_hash = ?
@@ -729,7 +910,38 @@ async fn prune_receipts(
     )
     .bind(credential.as_bytes())
     .bind(credential.as_bytes())
-    .bind(MAX_RECEIPTS_PER_CREDENTIAL)
+    .bind(max_count)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| StoreError::Unavailable)?;
+    sqlx::query(
+        "DELETE FROM broker_receipts WHERE receipt_sequence IN (
+            SELECT receipt_sequence FROM (
+                SELECT receipt_sequence,
+                    SUM(LENGTH(CAST(response_json AS BLOB))) OVER (
+                        ORDER BY receipt_sequence DESC ROWS UNBOUNDED PRECEDING
+                    ) AS running_bytes
+                FROM broker_receipts WHERE credential_hash = ?
+            ) WHERE running_bytes > ?
+        )",
+    )
+    .bind(credential.as_bytes())
+    .bind(max_credential_bytes)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| StoreError::Unavailable)?;
+    sqlx::query(
+        "DELETE FROM broker_receipts WHERE receipt_sequence IN (
+            SELECT receipt_sequence FROM (
+                SELECT receipt_sequence,
+                    SUM(LENGTH(CAST(response_json AS BLOB))) OVER (
+                        ORDER BY receipt_sequence DESC ROWS UNBOUNDED PRECEDING
+                    ) AS running_bytes
+                FROM broker_receipts
+            ) WHERE running_bytes > ?
+        )",
+    )
+    .bind(max_total_bytes)
     .execute(&mut **transaction)
     .await
     .map_err(|_| StoreError::Unavailable)?;
@@ -803,9 +1015,10 @@ async fn load_receipt(
     credential: &CredentialDigest,
     request_id: &str,
     request_digest: &[u8; 32],
+    expected_owner: Option<&str>,
 ) -> Result<ReceiptMatch, StoreError> {
     let row = sqlx::query(
-        "SELECT request_digest, response_json FROM broker_receipts
+        "SELECT request_digest, response_json, owner_pubkey FROM broker_receipts
          WHERE credential_hash = ? AND request_id = ?",
     )
     .bind(credential.as_bytes())
@@ -825,7 +1038,21 @@ async fn load_receipt(
     let response_json: String = row
         .try_get("response_json")
         .map_err(|_| StoreError::Integrity)?;
-    let response = serde_json::from_str(&response_json).map_err(|_| StoreError::Integrity)?;
+    let response: BrokerResponse =
+        serde_json::from_str(&response_json).map_err(|_| StoreError::Integrity)?;
+    if matches!(
+        response.result,
+        BrokerResult::Succeeded {
+            outcome: ActionOutcome::ChannelRead(_)
+        }
+    ) {
+        let stored_owner: Option<String> = row
+            .try_get("owner_pubkey")
+            .map_err(|_| StoreError::Integrity)?;
+        if stored_owner.as_deref() != expected_owner {
+            return Ok(ReceiptMatch::OwnerChanged);
+        }
+    }
     Ok(ReceiptMatch::Replay(Box::new(response)))
 }
 

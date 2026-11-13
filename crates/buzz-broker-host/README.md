@@ -2,7 +2,7 @@
 
 `buzz-broker-host` is the host-owned durable authority boundary for managed ACP
 runtimes. It always serves `authority.status`. With a host-owned signing key and
-verified owner attestation, it also serves `storage.address` and `message.post`.
+verified owner attestation, it also serves `storage.address`, `channel.read`, and `message.post`.
 Other broker actions remain unsupported.
 
 The host stores canonical authority identities, lifecycle state, credential
@@ -126,6 +126,23 @@ can derive a different address while the generation remains active. Keep the
 owner attestation stable for one generation; quiesce, drain, and fence before
 issuing a successor with another owner. This action does not fetch or decrypt
 a memory record.
+
+`channel.read` makes a host-signed NIP-98 `POST /query` request to the community
+relay. Relay membership and channel-access policy remain authoritative. The host
+accepts only signed events matching the requested channel, kind, optional root,
+and optional agent mention. Each relay page is capped at 16 events and 16 MiB;
+callers may lower their page limit if a large result exceeds this cap. A full page returns an opaque,
+MAC-protected cursor bound to the filter, relay, signer, and verified owner; the
+next request sends the relay's exact `(until, before_id)` boundary. Exact retries
+replay the stored page during a relay outage while retained. Receipts are bounded
+to 64 entries and 32 MiB per credential, with a 128 MiB table-wide budget; the
+oldest entries are evicted first, including across credentials. An exact retry
+after eviction queries the relay again and needs it to be available. Successful
+read receipts persist
+their verified owner and cannot replay after owner rotation. Denied receipts
+retain the normal exact-retry contract. A fresh request under another valid
+owner attestation can still read under that new owner's relay permissions; the
+generation-level owner binding remains an operator policy.
 
 ## Deliberate boundary
 

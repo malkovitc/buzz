@@ -14,12 +14,12 @@ use std::sync::Arc;
 
 use crate::credential::CredentialDigest;
 #[cfg(unix)]
-use crate::publisher::RelayPublisher;
+use crate::publisher::{PublishError, RelayPublisher};
 #[cfg(unix)]
 use crate::signing::HostSigner;
-#[cfg(unix)]
-use crate::store::EffectAdmission;
 use crate::store::{AuthorityStore, StoreError};
+#[cfg(unix)]
+use crate::store::{ChannelReadAdmission, EffectAdmission};
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
@@ -101,6 +101,68 @@ async fn action(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         Ok(credential) => credential,
         Err(()) => return broker_response(unauthenticated(request.request_id())),
     };
+    #[cfg(unix)]
+    if let (ActionArgs::ChannelRead(args), Some(effects)) = (request.args(), &state.effects) {
+        let relay_url = match state
+            .store
+            .prepare_channel_read(&credential, &body, &request, &effects.signer)
+            .await
+        {
+            Ok(ChannelReadAdmission::Replay(response)) => return broker_response(response),
+            Ok(ChannelReadAdmission::Query(url)) => url,
+            Ok(ChannelReadAdmission::Denied) => {
+                let response = match state
+                    .store
+                    .execute_read_denial(&credential, &body, &request, &effects.signer)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(StoreError::Unauthenticated) => unauthenticated(request.request_id()),
+                    Err(_) => internal_failure(request.request_id()),
+                };
+                return broker_response(response);
+            }
+            Err(StoreError::Unauthenticated) => {
+                return broker_response(unauthenticated(request.request_id()))
+            }
+            Err(_) => return broker_response(internal_failure(request.request_id())),
+        };
+        let page = match effects
+            .publisher
+            .query_channel(&effects.signer, &relay_url, args)
+            .await
+        {
+            Ok(page) => page,
+            Err(PublishError::InvalidCursor) => {
+                return broker_response(BrokerResponse::new(
+                    request.request_id(),
+                    BrokerResult::failed(BrokerError::new(
+                        BrokerErrorCode::InvalidRequest,
+                        "channel cursor is invalid for this scope",
+                    )),
+                ));
+            }
+            Err(_) => {
+                return broker_response(BrokerResponse::new(
+                    request.request_id(),
+                    BrokerResult::failed(BrokerError::new(
+                        BrokerErrorCode::ActionFailed,
+                        "relay channel query failed",
+                    )),
+                ))
+            }
+        };
+        let response = match state
+            .store
+            .execute_with_read_page(&credential, &body, &request, page, &effects.signer)
+            .await
+        {
+            Ok(response) => response,
+            Err(StoreError::Unauthenticated) => unauthenticated(request.request_id()),
+            Err(_) => internal_failure(request.request_id()),
+        };
+        return broker_response(response);
+    }
     #[cfg(unix)]
     if let (ActionArgs::StorageAddress(args), Some(effects)) = (request.args(), &state.effects) {
         let address = match effects.signer.storage_address(&args.slug) {
