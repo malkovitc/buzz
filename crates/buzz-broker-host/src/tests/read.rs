@@ -24,7 +24,7 @@ async fn channel_query_uses_host_nip98_and_returns_verified_channel_event() {
     let signer = HostSigner::load(&key_path, &tag_path).expect("verified signer");
     let mut identity = fixture.identity.clone();
     identity.executor_agent_pubkey = PubkeyHex::parse(agent.public_key().to_hex()).unwrap();
-    let message = signer
+    let signed_message = signer
         .sign_message(
             &identity,
             &MessagePostArgs {
@@ -34,17 +34,23 @@ async fn channel_query_uses_host_nip98_and_returns_verified_channel_event() {
             },
         )
         .expect("signed channel event");
+    let candidate = EventBuilder::new(Kind::Custom(9), "same-timestamp page")
+        .tags([
+            Tag::parse(["h", CHANNEL_ID]).unwrap(),
+            buzz_sdk::nip_oa::parse_auth_tag(&auth_tag).unwrap(),
+        ])
+        .custom_created_at(signed_message.created_at)
+        .sign_with_keys(&agent)
+        .unwrap();
+    assert_ne!(signed_message.id, candidate.id);
+    // Cursor order is by event ID within a timestamp; sort the fixtures
+    // instead of hoping one of a bounded set hashes above a random ID.
+    let (message, second_message) = if signed_message.id.to_hex() < candidate.id.to_hex() {
+        (signed_message, candidate)
+    } else {
+        (candidate, signed_message)
+    };
     let expected_id = message.id;
-    let second_message = (0..100)
-        .map(|index| {
-            EventBuilder::new(Kind::Custom(9), format!("second page {index}"))
-                .tags([Tag::parse(["h", CHANNEL_ID]).unwrap()])
-                .custom_created_at(message.created_at)
-                .sign_with_keys(&agent)
-                .unwrap()
-        })
-        .find(|event| event.id.to_hex() > expected_id.to_hex())
-        .expect("same-timestamp successor event");
     let second_id = second_message.id;
     let expected_tag = auth_tag.clone();
     let app = Router::new().route(
