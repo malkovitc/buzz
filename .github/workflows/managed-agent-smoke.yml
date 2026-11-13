@@ -11,6 +11,10 @@ on:
       - crates/buzz-broker-host/examples/managed_agent_fixture.rs
   workflow_dispatch:
 
+concurrency:
+  group: managed-agent-smoke-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   smoke:
     name: Synthetic Compose handoff

@@ -91,10 +91,10 @@ def main():
         raise SystemExit("test-runtime.py requires Linux bind-mount UID semantics")
     with tempfile.TemporaryDirectory(prefix="buzz-managed-agent-smoke-") as tmp:
         root = Path(tmp)
-        http = http.server.ThreadingHTTPServer(("0.0.0.0", 0), EmptyRelay)
-        relay_thread = threading.Thread(target=http.serve_forever, daemon=True)
+        relay_server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), EmptyRelay)
+        relay_thread = threading.Thread(target=relay_server.serve_forever, daemon=True)
         relay_thread.start()
-        relay_url = f"ws://host.docker.internal:{http.server_port}"
+        relay_url = f"ws://host.docker.internal:{relay_server.server_port}"
         compose = [
             "docker", "compose", "-p", f"buzz-smoke-{os.getpid()}",
             "-f", str(COMPOSE), "-f", str(root / "override.yml"),
@@ -162,8 +162,8 @@ def main():
                 subprocess.run([*compose, "down", "--remove-orphans"], cwd=ROOT, check=False)
             if provisioned:
                 chown_fixture(root, os.getuid(), os.getgid())
-            http.shutdown()
-            http.server_close()
+            relay_server.shutdown()
+            relay_server.server_close()
 
 
 if __name__ == "__main__":
