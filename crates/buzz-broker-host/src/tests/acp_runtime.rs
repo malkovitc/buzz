@@ -160,12 +160,13 @@ async fn actual_keyless_acp_reads_posts_and_loses_authority_after_fence() {
         "runtime is live before quiesce"
     );
     store.quiesce(&identity).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), child.wait())
+    let exit = tokio::time::timeout(Duration::from_secs(10), child.wait())
         .await
         .expect("quiesced runtime stops promptly")
         .expect("runtime wait");
+    assert!(exit.success(), "runtime exits cleanly after authority loss");
     store.fence(&identity).await.unwrap();
-    let cli_status = tokio::process::Command::new(cli_bin)
+    let cli_output = tokio::process::Command::new(cli_bin)
         .args([
             "messages",
             "send",
@@ -180,11 +181,18 @@ async fn actual_keyless_acp_reads_posts_and_loses_authority_after_fence() {
         .env("BUZZ_MANAGED_ACP_AUTHORITY", &authority_json)
         .env_remove("BUZZ_PRIVATE_KEY")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .await
         .unwrap();
-    assert!(!cli_status.success(), "fenced credential cannot publish");
+    assert!(
+        !cli_output.status.success(),
+        "fenced credential cannot publish"
+    );
+    let cli_error: serde_json::Value = serde_json::from_slice(&cli_output.stderr).unwrap();
+    assert_eq!(
+        cli_error["message"],
+        "managed ACP broker action: managed ACP generation is not active"
+    );
     assert!(post_rx.try_recv().is_err(), "no post after fence");
     host_task.abort();
     relay_task.abort();
