@@ -21,7 +21,7 @@ name: Docker image
 #   - push tags relay-v*.*.* → :{version} + :{major}.{minor} + :{major}
 #                              + matching :debug-* tags
 #                              (+ :latest/:debug-latest for stable releases)
-#   - pull_request           → build only (no push), cache stays warm
+#   - pull_request           → build only (no push or cache export)
 #   - workflow_dispatch      → manual relay-tag rescue at the tag itself
 #
 # Why workflow_dispatch carries a version input:
@@ -53,6 +53,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "crates/**"
+      - "!crates/buzz-broker-host/**"
       - "web/**"
       - "package.json"
       - "pnpm-lock.yaml"
