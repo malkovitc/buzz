@@ -14,9 +14,7 @@ const PARENT: &str = "11111111-1111-4111-8111-111111111111";
 #[tokio::test]
 async fn blocked_broker_audio_send_exits_when_publisher_is_cancelled() {
     let mut blocked = Box::pin(futures_util::sink::unfold((), |(), _: WsMsg| async move {
-        std::future::pending::<Result<(), std::io::Error>>()
-            .await
-            .map(|()| ())
+        std::future::pending::<Result<(), std::io::Error>>().await
     }));
     let cancel = tokio_util::sync::CancellationToken::new();
     let send = send_tts_ws_message(&mut blocked, WsMsg::Binary(vec![1].into()), &cancel);
