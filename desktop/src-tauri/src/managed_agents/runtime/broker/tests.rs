@@ -153,8 +153,22 @@ fn real_host_launch_stop_restart_and_serve_failure_rollback() {
         BrokerHost::launch(&base, &binary, &record, &key, &owner, "desktop-test", &log).unwrap();
     let first_generation = first.authority_json.clone();
     let first_credential = first.credential.as_str().to_owned();
+    let media = first.host.media_snapshot().unwrap();
+    assert_eq!(media.authority_json, first_generation);
+    assert!(media.url.starts_with("http://127.0.0.1:"));
+    assert_eq!(media.credential.as_str(), first_credential);
     assert!(pair_dir.join("current.json").exists());
     first.host.stop().unwrap();
+    assert!(first.host.media_snapshot().is_err());
+    let registered_after_stop = std::cell::Cell::new(false);
+    assert!(first
+        .host
+        .with_current_media(&first_generation, || registered_after_stop.set(true))
+        .is_err());
+    assert!(
+        !registered_after_stop.get(),
+        "stale broker cannot register media"
+    );
     assert!(!pair_dir.join("current.json").exists());
     assert!(!first.host.generation_dir.exists());
 

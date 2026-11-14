@@ -71,6 +71,8 @@ pub(crate) struct TtsAudioPublisher {
     cancel: CancellationToken,
     epoch: Arc<AtomicU64>,
     speaker_generation: Arc<AtomicU64>,
+    #[cfg(unix)]
+    broker_binding: Option<(String, String, String, u64)>,
 }
 
 impl TtsAudioPublisher {
@@ -80,7 +82,26 @@ impl TtsAudioPublisher {
             cancel,
             epoch: Arc::new(AtomicU64::new(0)),
             speaker_generation: Arc::new(AtomicU64::new(0)),
+            #[cfg(unix)]
+            broker_binding: None,
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_broker_binding(
+        mut self,
+        authority: &str,
+        channel: &str,
+        parent: &str,
+        huddle_generation: u64,
+    ) -> Self {
+        self.broker_binding = Some((
+            authority.to_owned(),
+            channel.to_owned(),
+            parent.to_owned(),
+            huddle_generation,
+        ));
+        self
     }
 
     pub(crate) fn version_state(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
@@ -118,7 +139,13 @@ impl TtsAudioPublisher {
         self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
+        self.cancel.cancel();
+    }
+}
+
+impl Drop for TtsAudioPublisher {
+    fn drop(&mut self) {
         self.cancel.cancel();
     }
 }
@@ -131,6 +158,30 @@ pub(super) struct TtsBroadcasters {
 }
 
 impl TtsBroadcasters {
+    #[cfg(unix)]
+    pub(super) fn contains_for_binding(
+        &self,
+        speaker_pubkey: &str,
+        authority: &str,
+        channel: &str,
+        parent: &str,
+        huddle_generation: u64,
+    ) -> bool {
+        self.publishers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&speaker_pubkey.to_ascii_lowercase())
+            .is_some_and(|publisher| {
+                !publisher.is_closed()
+                    && publisher.broker_binding.as_ref().is_some_and(|binding| {
+                        binding.0 == authority
+                            && binding.1 == channel
+                            && binding.2 == parent
+                            && binding.3 == huddle_generation
+                    })
+            })
+    }
+
     pub(super) fn contains(&self, speaker_pubkey: &str) -> bool {
         self.publishers
             .lock()
@@ -219,6 +270,57 @@ impl TtsBroadcasters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn publisher_identity_is_bound_to_exact_broker_generation() {
+        let broadcasters = TtsBroadcasters::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let publisher = TtsAudioPublisher::new(tx, CancellationToken::new()).with_broker_binding(
+            "generation-one",
+            "channel-one",
+            "parent-one",
+            7,
+        );
+        broadcasters.register("aa", publisher, 0);
+        assert!(broadcasters.contains_for_binding(
+            "aa",
+            "generation-one",
+            "channel-one",
+            "parent-one",
+            7
+        ));
+        assert!(!broadcasters.contains_for_binding(
+            "aa",
+            "generation-two",
+            "channel-one",
+            "parent-one",
+            7
+        ));
+        assert!(!broadcasters.contains_for_binding(
+            "aa",
+            "generation-one",
+            "channel-two",
+            "parent-one",
+            7
+        ));
+        assert!(!broadcasters.contains_for_binding(
+            "aa",
+            "generation-one",
+            "channel-one",
+            "parent-one",
+            8
+        ));
+    }
+
+    #[test]
+    fn discarded_unregistered_publisher_cancels_its_socket_task() {
+        let (tx, _rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let publisher = TtsAudioPublisher::new(tx, cancel.clone());
+        drop(publisher);
+        assert!(cancel.is_cancelled());
+    }
 
     #[test]
     fn publisher_lifetime_tracks_local_synthesis_without_replacement_gaps() {

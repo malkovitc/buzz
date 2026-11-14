@@ -4,6 +4,35 @@ use super::{
 };
 use crate::huddle::HuddlePhase;
 
+#[test]
+fn selected_broker_publisher_failure_does_not_allow_queueing() {
+    use super::should_queue_agent_tts;
+    assert!(!should_queue_agent_tts(true, &Ok(false)));
+    assert!(!should_queue_agent_tts(true, &Err("broker stopped".into())));
+    assert!(should_queue_agent_tts(true, &Ok(true)));
+    assert!(should_queue_agent_tts(false, &Ok(false)));
+}
+
+#[test]
+fn selected_broker_speaker_cannot_fall_back_to_direct_signing() {
+    use super::{classify_agent_tts_publisher, AgentTtsPublisherMode};
+
+    let selected = "aa".repeat(32);
+    let other = "bb".repeat(32);
+    assert_eq!(
+        classify_agent_tts_publisher(Some(&selected), &selected, false),
+        Err("selected broker speaker has no active broker generation".to_string())
+    );
+    assert_eq!(
+        classify_agent_tts_publisher(Some(&selected), &selected, true),
+        Ok(AgentTtsPublisherMode::Broker)
+    );
+    assert_eq!(
+        classify_agent_tts_publisher(Some(&selected), &other, false),
+        Ok(AgentTtsPublisherMode::Direct)
+    );
+}
+
 #[tokio::test]
 async fn assistant_plain_text_routes_unchanged_into_voice_pipeline_boundary() {
     let (sender, receiver) = std::sync::mpsc::channel();

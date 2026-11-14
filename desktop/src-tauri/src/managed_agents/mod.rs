@@ -33,6 +33,8 @@ mod repos;
 mod restore;
 pub mod retention;
 mod runtime;
+#[cfg(unix)]
+pub(crate) use runtime::BrokerMediaSnapshot;
 mod runtime_commands;
 mod runtime_types;
 pub(crate) mod snapshot_avatar;

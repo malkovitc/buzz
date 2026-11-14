@@ -15,6 +15,7 @@ type RelaySocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub(crate) struct AudioRelay {
     pub(crate) sink: SplitSink<RelaySocket, Message>,
     pub(crate) stream: SplitStream<RelaySocket>,
+    pub(crate) peer_index: u8,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,16 +89,18 @@ impl AudioRelay {
         if joined["type"] == "error" || joined["type"] == "upgrade_required" {
             return Err(AudioRelayError::Rejected);
         }
-        if joined["type"] != "joined"
-            || joined["broker_audio_local_only"] != true
-            || joined["peer_index"]
-                .as_u64()
-                .and_then(|value| u8::try_from(value).ok())
-                .is_none()
-        {
+        if joined["type"] != "joined" || joined["broker_audio_local_only"] != true {
             return Err(AudioRelayError::Protocol);
         }
-        Ok(Self { sink, stream })
+        let peer_index = joined["peer_index"]
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or(AudioRelayError::Protocol)?;
+        Ok(Self {
+            sink,
+            stream,
+            peer_index,
+        })
     }
 }
 

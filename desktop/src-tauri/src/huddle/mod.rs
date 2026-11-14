@@ -814,6 +814,7 @@ pub async fn speak_agent_message(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let speaker_pubkey = speaker_pubkey.to_ascii_lowercase();
     eprintln!("buzz-desktop: tts stage=invoke status=started route_id={route_id}");
     // Truncate oversized messages — agents shouldn't monologue in a voice huddle.
     // Use char count (not byte length) to avoid panicking on multi-byte UTF-8.
@@ -900,7 +901,15 @@ pub async fn speak_agent_message(
         );
         return Err("Agent text to speech is enabled but its audio pipeline is unavailable".into());
     };
-    match agent_tts_publisher::ensure(&app, &state, &pipeline, &speaker_pubkey).await {
+    let broker_selected = agent_tts_routing::is_broker_selected_agent(&speaker_pubkey);
+    let publisher = agent_tts_publisher::ensure(&app, &state, &pipeline, &speaker_pubkey).await;
+    if !agent_tts_routing::should_queue_agent_tts(broker_selected, &publisher) {
+        pipeline.cancel_speaker(&speaker_pubkey);
+        return Err(publisher
+            .err()
+            .unwrap_or_else(|| "selected broker publisher is unavailable".into()));
+    }
+    match publisher {
         Ok(true) => eprintln!(
             "buzz-desktop: tts broadcast status=ready route_id={route_id}"
         ),
@@ -911,8 +920,22 @@ pub async fn speak_agent_message(
             "buzz-desktop: tts broadcast status=unavailable reason=publisher_setup_failed route_id={route_id} error={error}"
         ),
     }
-    let sender = pipeline.text_sender();
-    let speaker_generation = sender.speaker_generation(&speaker_pubkey);
+    let (sender, speaker_generation) = {
+        let huddle = state.huddle()?;
+        if !agent_voice::agent_tts_enabled(&huddle, &speaker_pubkey) {
+            return Ok(());
+        }
+        if !huddle
+            .tts_pipeline
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &pipeline))
+        {
+            return Err("Huddle changed before agent speech was queued".into());
+        }
+        let sender = pipeline.text_sender();
+        let generation = sender.speaker_generation(&speaker_pubkey);
+        (sender, generation)
+    };
     enqueue_agent_tts_text(route_id, text, move |route_id, text| {
         sender
             .send(

@@ -174,6 +174,12 @@ pub(crate) struct BrokerHost {
     closed: bool,
 }
 
+pub(crate) struct BrokerMediaSnapshot {
+    pub(crate) url: String,
+    pub(crate) credential: Zeroizing<String>,
+    pub(crate) authority_json: String,
+}
+
 impl std::fmt::Debug for BrokerHost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -187,6 +193,60 @@ impl std::fmt::Debug for BrokerHost {
 }
 
 impl BrokerHost {
+    pub(crate) fn with_current_media<R>(
+        &mut self,
+        expected_authority: &str,
+        register: impl FnOnce() -> R,
+    ) -> Result<R, String> {
+        let current = self.media_snapshot()?;
+        if current.authority_json != expected_authority {
+            return Err("broker generation changed during media setup".into());
+        }
+        Ok(register())
+    }
+
+    pub(crate) fn media_snapshot(&mut self) -> Result<BrokerMediaSnapshot, String> {
+        if self.closed || self.fenced || !self.issued {
+            return Err("broker generation is not active for media".into());
+        }
+        if self
+            .child
+            .as_mut()
+            .ok_or("broker host is not running")?
+            .try_wait()
+            .map_err(|_| "cannot inspect broker host")?
+            .is_some()
+        {
+            return Err("broker host is not running".into());
+        }
+        if std::fs::read(&self.current).map_err(|_| "cannot read broker current authority")?
+            != self.authority_json.as_bytes()
+        {
+            return Err("broker generation is no longer current".into());
+        }
+        let credential = Zeroizing::new(
+            std::fs::read_to_string(self.generation_dir.join("credential"))
+                .map_err(|_| "cannot read broker media credential")?,
+        );
+        if credential.is_empty() || credential.trim() != credential.as_str() {
+            return Err("broker media credential is malformed".into());
+        }
+        let address: std::net::SocketAddr =
+            std::fs::read_to_string(self.generation_dir.join("listen.addr"))
+                .map_err(|_| "cannot read broker media listener")?
+                .trim()
+                .parse()
+                .map_err(|_| "broker media listener is malformed")?;
+        if !address.ip().is_loopback() || address.port() == 0 {
+            return Err("broker media listener is not loopback".into());
+        }
+        Ok(BrokerMediaSnapshot {
+            url: format!("http://{address}"),
+            credential,
+            authority_json: self.authority_json.clone(),
+        })
+    }
+
     pub(super) fn launch(
         base_dir: &Path,
         binary: &Path,
