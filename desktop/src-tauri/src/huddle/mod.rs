@@ -24,6 +24,8 @@
 //!    and drops them outside the lock (thread joins can block ~200ms).
 
 mod agent_tts_publisher;
+#[cfg(all(test, unix))]
+pub(crate) use agent_tts_publisher::test_with_current_broker_media;
 mod agent_tts_routing;
 pub mod agent_voice;
 pub mod agents;

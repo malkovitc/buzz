@@ -135,6 +135,16 @@ impl TtsAudioPublisher {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_publish_pcm(&self, samples_24k: Vec<f32>) {
+        self.publish(0, samples_24k);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_wait_closed(&self) {
+        self.tx.closed().await;
+    }
+
     fn cancel_pending(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
     }

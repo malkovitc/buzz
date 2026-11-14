@@ -870,5 +870,8 @@ pub(super) fn apply_broker_child_env(
         .env("BUZZ_MANAGED_ACP_AUTHORITY", authority_json);
 }
 
+#[cfg(all(test, unix))]
+#[path = "broker/local_media_proof.rs"]
+mod local_media_proof;
 #[cfg(test)]
 mod tests;
