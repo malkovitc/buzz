@@ -33,6 +33,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect the durable state of one exact authority without changing it.
+    Inspect {
+        #[arg(long)]
+        authority_file: PathBuf,
+    },
     /// Issue one exact active authority and write its bearer to a new mode-0600 file.
     Issue {
         /// JSON file containing one strict AuthorityIdentity.
@@ -67,6 +72,12 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: SocketAddr,
+        /// New owner-only file receiving the actual loopback address (supports port 0).
+        #[arg(long)]
+        listen_output: Option<PathBuf>,
+        /// Stop serving when the launching Desktop closes its stdin pipe.
+        #[arg(long)]
+        exit_on_stdin_eof: bool,
         /// Owner-only file containing the agent signing key for host-owned effects.
         #[arg(long)]
         signing_key_file: Option<PathBuf>,
@@ -81,6 +92,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let store = AuthorityStore::open(&cli.state).await?;
     match cli.command {
+        Command::Inspect { authority_file } => {
+            let identity = issuer::read_identity(&authority_file)?;
+            match store.inspect(&identity).await? {
+                None => println!("missing"),
+                Some(buzz_sdk::broker::AuthorityState::Active) => println!("active"),
+                Some(buzz_sdk::broker::AuthorityState::Quiescing) => println!("quiescing"),
+                Some(buzz_sdk::broker::AuthorityState::Fenced) => println!("fenced"),
+            }
+        }
         Command::Issue {
             authority_file,
             credential_output,
@@ -128,29 +148,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Serve {
             bind,
+            listen_output,
+            exit_on_stdin_eof,
             signing_key_file,
             auth_tag_file,
         } => {
             if !bind.ip().is_loopback() {
                 return Err(http::HostError::NonLoopback.into());
             }
-            let listener = tokio::net::TcpListener::bind(bind).await?;
-            eprintln!("broker authority host listening on loopback");
             #[cfg(unix)]
-            match (signing_key_file, auth_tag_file) {
-                (Some(key), Some(tag)) => {
-                    let signer = signing::HostSigner::load(&key, &tag)?;
-                    http::serve_with_effects(listener, store, signer).await?;
-                }
-                (None, None) => http::serve(listener, store).await?,
+            let signer = match (signing_key_file, auth_tag_file) {
+                (Some(key), Some(tag)) => Some(signing::HostSigner::load(&key, &tag)?),
+                (None, None) => None,
                 _ => return Err("both signer files are required for host-owned effects".into()),
+            };
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            if let Some(path) = listen_output.as_deref() {
+                write_listen_output(path, listener.local_addr()?)?;
             }
-            #[cfg(not(unix))]
-            {
-                let _ = (signing_key_file, auth_tag_file);
-                http::serve(listener, store).await?;
+            eprintln!("broker authority host listening on loopback");
+            let service = async move {
+                #[cfg(unix)]
+                match signer {
+                    Some(signer) => http::serve_with_effects(listener, store, signer).await?,
+                    None => http::serve(listener, store).await?,
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (signing_key_file, auth_tag_file);
+                    http::serve(listener, store).await?;
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
+            };
+            if exit_on_stdin_eof {
+                tokio::select! {
+                    result = service => result?,
+                    result = wait_for_stdin_eof() => result?,
+                }
+            } else {
+                service.await?;
             }
         }
     }
     Ok(())
+}
+
+async fn wait_for_stdin_eof() -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut byte = [0_u8; 1];
+    let received = tokio::io::stdin().read(&mut byte).await?;
+    if received == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "broker parent pipe must remain empty",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn write_listen_output(path: &std::path::Path, address: SocketAddr) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing output directory"))?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !path.is_absolute()
+        || !metadata.is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::other("insecure listener output directory"));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    writeln!(file, "{address}")?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_listen_output(_path: &std::path::Path, _address: SocketAddr) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "listener output is unsupported on this platform",
+    ))
 }

@@ -373,6 +373,7 @@ pub async fn restore_managed_agents_on_launch(
         .map_err(|error| error.to_string())?;
 
     let mut successfully_spawned: Vec<(String, String)> = Vec::new();
+    let mut discarded_close_errors = Vec::new();
 
     for (pubkey, outcome) in spawn_results {
         match outcome {
@@ -381,6 +382,11 @@ pub async fn restore_managed_agents_on_launch(
             SpawnOutcome::Skipped => continue,
             SpawnOutcome::Spawned(key, mut process) => {
                 let Ok(record) = find_managed_agent_mut(&mut records, &pubkey) else {
+                    if let Err(error) = close_discarded_spawn(&mut process) {
+                        // The broker marker stays durable for the next exact
+                        // pair reconciliation, even though the record vanished.
+                        discarded_close_errors.push(format!("{pubkey}: {error}"));
+                    }
                     continue;
                 };
                 let now = util::now_iso();
@@ -391,6 +397,13 @@ pub async fn restore_managed_agents_on_launch(
                     started_at: now.clone(),
                 };
                 if let Err(error) = super::write_agent_runtime_receipt(app, &receipt) {
+                    if let Err(close_error) = process.close_broker() {
+                        runtimes.insert(key, super::ManagedAgentPairRuntime::starting(*process));
+                        record.updated_at = now;
+                        record.last_error =
+                            Some(format!("{error}; broker close failed: {close_error}"));
+                        continue;
+                    }
                     let _ = super::terminate_process(process.child.id());
                     let _ = process.child.wait();
                     record.updated_at = now;
@@ -479,7 +492,41 @@ pub async fn restore_managed_agents_on_launch(
         });
     }
 
-    Ok(())
+    if discarded_close_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to close discarded broker generation: {}",
+            discarded_close_errors.join("; ")
+        ))
+    }
+}
+
+pub(crate) fn close_discarded_spawn(
+    process: &mut super::ManagedAgentProcess,
+) -> Result<(), String> {
+    let close_result = process.close_broker();
+    let teardown_result = (|| -> Result<(), String> {
+        let kill_error = if !matches!(process.child.try_wait(), Ok(Some(_)))
+            && super::terminate_process(process.child.id()).is_err()
+        {
+            process.child.kill().err()
+        } else {
+            None
+        };
+        process.child.wait().map_err(|error| match kill_error {
+            Some(kill_error) => {
+                format!("cannot kill discarded ACP child: {kill_error}; cannot reap child: {error}")
+            }
+            None => format!("cannot reap discarded ACP child: {error}"),
+        })?;
+        Ok(())
+    })();
+    match (close_result, teardown_result) {
+        (Err(close_error), Err(teardown_error)) => Err(format!("{close_error}; {teardown_error}")),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 fn profile_reconcile_completed(outcome: crate::commands::ProfileReconcileOutcome) -> bool {

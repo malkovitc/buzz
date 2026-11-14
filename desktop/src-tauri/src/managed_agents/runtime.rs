@@ -16,7 +16,14 @@ use crate::{
 };
 
 use super::claude_config::{apply_claude_model_env, apply_effort_env};
+#[cfg(unix)]
+mod broker;
+mod identity_env;
 mod path;
+#[cfg(unix)]
+pub(crate) use broker::reconcile_pair as reconcile_broker_pair;
+#[cfg(unix)]
+pub(crate) use broker::BrokerHost;
 pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::{compose_path_entries, should_skip_claude_executable, should_use_inherited};
 
@@ -399,11 +406,8 @@ pub(crate) fn configure_runtime_cli(
 }
 
 /// Spawn an agent process without holding any locks on records or runtimes.
-/// Returns the child process and log path on success. The caller is responsible
-/// for updating `ManagedAgentRecord` fields and inserting into the runtimes map.
-///
-/// `owner_hex`: the workspace owner's pubkey, used as a fallback for legacy
-/// records that have no NIP-OA `auth_tag`. See `build_respond_to_env`.
+/// The caller registers the child and updates the record. `owner_hex` also
+/// supplies the fallback owner for legacy records without an NIP-OA tag.
 pub fn spawn_agent_child(
     app: &AppHandle,
     record: &ManagedAgentRecord,
@@ -414,40 +418,22 @@ pub fn spawn_agent_child(
         return Err(error);
     }
     let runtime_key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), relay_url)?;
-    // Resolve the effective harness (agent command) from the linked persona, so
-    // persona harness edits propagate on the next spawn; an explicit per-agent
-    // override wins. `agent_args` and `mcp_command` are pure derivations of the
-    // command, so we recompute them from the effective value rather than the
-    // frozen record snapshot. Mirrors the model resolution below.
+    // Resolve the live persona command; an explicit agent override wins.
+    // Args and MCP command derive from that result, not the frozen snapshot.
     let personas = super::load_personas(app).unwrap_or_default();
     let teams = super::load_teams(app).unwrap_or_default();
-    // Load global config once; used for runtime_metadata_env_vars (model/provider fallback)
-    // and for the env-var merge at spawn time.
+    // Global config supplies model/provider fallback and the env layer.
     let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
 
-    // Resolve model/provider/prompt ONCE, here, at the shared spawn boundary —
-    // the single source both the env writes below and the spawn-config snapshot
-    // read from. Previously prompt was read from the record's own (possibly
-    // stale, Phase-A-snapshot) bytes while model/provider were resolved live
-    // from `personas`; a definition edit landing between a caller's snapshot
-    // apply and this spawn could hand a fresh model/provider to a stale
-    // prompt. This also folds in orphan refusal via `require_resolved`: every
-    // caller (interactive start, launch restore, `start_managed_agent_process`)
-    // inherits it — no caller can bypass this by reaching `spawn_agent_child`
-    // directly. Checked before any side effect (log marker, log file, process
-    // spawn) so a refused spawn leaves no trace.
+    // Resolve model/provider/prompt once for both process env and spawn stamp.
+    // `require_resolved` refuses orphaned definitions before any side effect.
     let effective_cfg = crate::managed_agents::effective_config::resolve_effective_config(
         record, &personas, &global,
     )
     .require_resolved()?;
 
-    // Single typed resolver: validates runtime id (dangling harness → Err), resolves
-    // command, args (instance wins over definition default), and the full env layer stack.
-    // This is the sole path for harness-definition lookup — spawn, snapshot,
-    // summary, and model probes all consume this descriptor rather than
-    // assembling values inline.
-    // Like the orphan refusal above, this runs before any side effect so a refused
-    // spawn leaves no trace.
+    // One typed descriptor resolves harness, args, and all env layers. A bad
+    // runtime id fails before logs or processes are created.
     let descriptor =
         crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
             .map_err(|e| {
@@ -457,6 +443,12 @@ pub fn spawn_agent_child(
                     crate::managed_agents::user_facing_harness_error(&e)
                 )
             })?;
+    #[cfg(unix)]
+    let broker_selected = broker::selected_for_spawn(record, owner_hex, &descriptor.env)?;
+    #[cfg(unix)]
+    let direct_auth = !broker_selected;
+    #[cfg(not(unix))]
+    let direct_auth = true;
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
     let lazy_pool = super::agent_env::managed_agent_uses_lazy_pool(&descriptor.env);
@@ -498,15 +490,10 @@ pub fn spawn_agent_child(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| effective_command.clone());
 
-    // The caller supplies the explicit canonical pair relay. This is the only
-    // relay this child may connect to, regardless of the record/workspace default.
+    // The caller's canonical pair relay is the only relay for this child.
     let effective_relay_url = runtime_key.relay_url.clone();
 
-    // Augment PATH for DMG launches so child processes can find:
-    //   - bundled CLI via ~/.local/bin symlink
-    //   - nvm-managed node/npm (nvm initializes only in interactive shells)
-    //   - bundled sidecars (buzz, buzz-acp, etc.) via exe parent (Contents/MacOS/)
-    //   - runtimes (node, python, etc.) via login shell PATH
+    // DMG children need bundled sidecars, managed Node, and login-shell PATH.
     let nvm_bin = dirs::home_dir()
         .as_deref()
         .and_then(super::find_nvm_default_bin);
@@ -530,8 +517,6 @@ pub fn spawn_agent_child(
         command.env("PATH", path);
     }
     command.env("RUST_LOG", child_rust_log_filter());
-    command.env("BUZZ_PRIVATE_KEY", &record.private_key_nsec);
-    command.env("BUZZ_RELAY_URL", &effective_relay_url);
     command.env("BUZZ_ACP_AGENT_COMMAND", &resolved_agent_command);
     command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
     match &resolved_mcp_command {
@@ -755,11 +740,7 @@ pub fn spawn_agent_child(
     command.env_remove("BUZZ_ACP_API_TOKEN");
     command.env_remove("BUZZ_API_TOKEN");
 
-    if let Some(ref auth_tag) = record.auth_tag {
-        command.env("BUZZ_AUTH_TAG", auth_tag);
-    } else {
-        command.env_remove("BUZZ_AUTH_TAG");
-    }
+    identity_env::apply_direct_identity(&mut command, record, &effective_relay_url, direct_auth);
 
     // Inbound author gate: who is this agent allowed to respond to?
     // Validation is strict here — a malformed allowlist on disk fails before
@@ -775,31 +756,7 @@ pub fn spawn_agent_child(
 
     command.env("BUZZ_ACP_RELAY_OBSERVER", "true");
 
-    // Git credential helper: NIP-98 auth for Buzz relay git via git-credential-nostr.
-    // Ephemeral GIT_CONFIG_COUNT env vars scoped to relay HTTP URL; NOSTR_PRIVATE_KEY mirrors BUZZ_PRIVATE_KEY.
-    if let Some(cred_helper) = resolve_command("git-credential-nostr") {
-        let relay_http_url = crate::relay::relay_http_base_url(&effective_relay_url);
-
-        command.env("NOSTR_PRIVATE_KEY", &record.private_key_nsec);
-        command.env("GIT_TERMINAL_PROMPT", "0");
-        command.env("GIT_CONFIG_COUNT", "2");
-        command.env(
-            "GIT_CONFIG_KEY_0",
-            format!("credential.{relay_http_url}/git.helper"),
-        );
-        let helper = cred_helper.to_string_lossy().replace('\\', "/");
-        command.env("GIT_CONFIG_VALUE_0", helper);
-        command.env(
-            "GIT_CONFIG_KEY_1",
-            format!("credential.{relay_http_url}/git.useHttpPath"),
-        );
-        command.env("GIT_CONFIG_VALUE_1", "true");
-    } else {
-        eprintln!(
-            "buzz-desktop: git-credential-nostr not found — agent {} will not have automatic Buzz git auth",
-            record.name,
-        );
-    }
+    identity_env::apply_git_credential(&mut command, record, &effective_relay_url, direct_auth);
 
     // User env (descriptor.env): fully-layered floor→runtime→definition→global→persona→agent,
     // reserved-key filtered. Written last so user-explicit values win over Buzz-set env.
@@ -846,6 +803,17 @@ pub fn spawn_agent_child(
     command
         .env("BUZZ_MANAGED_AGENT", current_instance_id(app))
         .env("BUZZ_MANAGED_AGENT_START_NONCE", &start_nonce);
+
+    #[cfg(unix)]
+    let broker_launch = broker::prepare_child(
+        &mut command,
+        app,
+        record,
+        &runtime_key,
+        owner_hex,
+        &log_path,
+        broker_selected,
+    )?;
 
     // Stamp the effective spawn config from the values that populated the
     // `Command` above, BEFORE spawning. Re-resolving after `spawn()` would let
@@ -925,6 +893,8 @@ pub fn spawn_agent_child(
         setup_mode: spawned_setup_mode,
         adapter_availability: spawned_adapter_availability,
         start_nonce,
+        #[cfg(unix)]
+        broker_host: broker_launch.map(|launch| launch.host),
     })
 }
 
@@ -960,9 +930,13 @@ pub fn start_managed_agent_process(
             return Ok(());
         }
 
+        runtime.close_broker()?;
         runtimes.remove(&key);
         super::remove_agent_runtime_receipt(app, &key);
     }
+
+    #[cfg(unix)]
+    reconcile_broker_pair(&super::managed_agents_base_dir(app)?, &key)?;
 
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
@@ -976,6 +950,10 @@ pub fn start_managed_agent_process(
         started_at: now.clone(),
     };
     if let Err(error) = super::write_agent_runtime_receipt(app, &receipt) {
+        if let Err(close_error) = process.close_broker() {
+            runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(process));
+            return Err(format!("{error}; broker close failed: {close_error}"));
+        }
         let _ = terminate_process(process.child.id());
         let _ = process.child.wait();
         return Err(error);
@@ -990,6 +968,16 @@ pub fn start_managed_agent_process(
 
     runtimes.insert(key, ManagedAgentPairRuntime::starting(process));
     Ok(())
+}
+
+impl super::ManagedAgentProcess {
+    pub(crate) fn close_broker(&mut self) -> Result<(), String> {
+        #[cfg(unix)]
+        if let Some(host) = self.broker_host.as_mut() {
+            host.stop()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

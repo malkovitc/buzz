@@ -107,8 +107,22 @@ pub fn sync_managed_agent_processes(
         exited.push(key.clone());
     }
 
-    let exited_pubkeys: Vec<String> = exited.iter().map(|key| key.pubkey.clone()).collect();
+    let mut exited_pubkeys = Vec::new();
     for key in exited {
+        if let Some(runtime) = runtimes.get_mut(&key) {
+            if let Err(error) = runtime.close_broker() {
+                runtime.lifecycle = super::super::ManagedAgentRuntimeLifecycle::Failed;
+                runtime.error = Some(error.clone());
+                if let Some(record) = records
+                    .iter_mut()
+                    .find(|record| record.pubkey == key.pubkey)
+                {
+                    record.last_error = Some(error);
+                }
+                continue;
+            }
+        }
+        exited_pubkeys.push(key.pubkey.clone());
         runtimes.remove(&key);
     }
 

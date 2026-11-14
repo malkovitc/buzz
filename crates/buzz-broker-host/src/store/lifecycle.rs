@@ -1,6 +1,30 @@
 use super::*;
 
 impl AuthorityStore {
+    pub(crate) async fn inspect(
+        &self,
+        identity: &AuthorityIdentity,
+    ) -> Result<Option<AuthorityState>, StoreError> {
+        let identity = identity
+            .validated()
+            .map_err(|_| StoreError::InvalidIdentity)?;
+        let authority_json = canonical_identity(&identity)?;
+        let row =
+            sqlx::query("SELECT state, quiescing FROM broker_authorities WHERE authority_json = ?")
+                .bind(authority_json)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+        row.map(|row| {
+            let state: String = row.try_get("state").map_err(|_| StoreError::Integrity)?;
+            let quiescing: i64 = row
+                .try_get("quiescing")
+                .map_err(|_| StoreError::Integrity)?;
+            parse_state(&state, quiescing)
+        })
+        .transpose()
+    }
+
     #[cfg(unix)]
     pub(super) async fn migrate_schema_v4(&self) -> Result<(), StoreError> {
         let mut connection = self

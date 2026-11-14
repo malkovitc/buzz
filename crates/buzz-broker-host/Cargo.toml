@@ -27,7 +27,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite"] }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
 tokio-tungstenite = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }

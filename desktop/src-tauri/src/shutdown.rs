@@ -169,6 +169,9 @@ pub(crate) fn shutdown_managed_agents(app: &tauri::AppHandle) -> Result<(), Stri
         // marker, instead of falling through to the orphan sweep's 200ms
         // grace below.
         for key in managed_agents::managed_agent_runtime_keys(&runtimes, &record.pubkey) {
+            if let Some(runtime) = runtimes.get_mut(&key) {
+                runtime.close_broker()?;
+            }
             let runtime = runtimes.remove(&key);
             let Some(pid) = runtime
                 .as_ref()
