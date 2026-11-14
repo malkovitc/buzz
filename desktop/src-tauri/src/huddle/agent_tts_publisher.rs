@@ -44,6 +44,16 @@ fn with_current_broker_media<R>(
     host.with_current_media(authority_json, action)
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn test_with_current_broker_media<R>(
+    state: &AppState,
+    speaker_pubkey: &str,
+    authority_json: &str,
+    action: impl FnOnce() -> R,
+) -> Result<R, String> {
+    with_current_broker_media(state, speaker_pubkey, authority_json, action)
+}
+
 pub(super) async fn ensure(
     app: &tauri::AppHandle,
     state: &AppState,
