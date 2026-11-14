@@ -540,7 +540,7 @@ fn deploy_payload_matches_the_shared_full_launch_fixture() {
 }
 
 #[test]
-fn tauri_platform_configs_bundle_kubernetes_only_on_supported_hosts() {
+fn tauri_platform_configs_bundle_unix_sidecars_only_on_supported_hosts() {
     use tauri_utils::{config::parse::read_from, platform::Target};
 
     let config_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -559,6 +559,13 @@ fn tauri_platform_configs_bundle_kubernetes_only_on_supported_hosts() {
         assert_eq!(
             has_kubernetes, expected,
             "unexpected Kubernetes externalBin for {target}; merged {paths:?}"
+        );
+        let has_broker_host = external_bins
+            .iter()
+            .any(|value| value == "binaries/buzz-broker-host");
+        assert_eq!(
+            has_broker_host, expected,
+            "unexpected broker host externalBin for {target}; merged {paths:?}"
         );
     }
 }
