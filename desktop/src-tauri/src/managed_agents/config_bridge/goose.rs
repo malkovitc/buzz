@@ -93,9 +93,7 @@ fn nested_provider_fields(
     active_provider: &str,
 ) -> Option<NestedProviderFields> {
     let providers = map.get("providers").and_then(|v| v.as_mapping())?;
-    let entry = providers
-        .get(serde_yaml::Value::String(active_provider.to_owned()))?
-        .as_mapping()?;
+    let entry = providers.get(active_provider)?.as_mapping()?;
 
     let model = mapping_string(entry, "model");
     let host = mapping_string(entry, "host");
@@ -114,17 +112,14 @@ fn parse_extensions(
     extensions
         .iter()
         .filter_map(|(k, v)| {
-            let name = k.as_str()?.to_string();
+            let name = k.to_string();
             let kind = v
                 .as_mapping()
                 .and_then(|m| mapping_string(m, "type"))
                 .unwrap_or_else(|| "unknown".to_string());
             let enabled = v
                 .as_mapping()
-                .and_then(|m| {
-                    m.get(serde_yaml::Value::String("enabled".to_owned()))
-                        .and_then(|v| v.as_bool())
-                })
+                .and_then(|m| m.get("enabled").and_then(|v| v.as_bool()))
                 .unwrap_or(true);
             Some(ExtensionEntry {
                 name,
@@ -147,7 +142,7 @@ fn yaml_string(
 }
 
 fn mapping_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    map.get(serde_yaml::Value::String(key.to_owned()))
+    map.get(key)
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
