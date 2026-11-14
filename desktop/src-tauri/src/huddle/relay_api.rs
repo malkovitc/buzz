@@ -19,6 +19,10 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::relay::query_relay;
 
+#[cfg(all(test, unix))]
+#[path = "relay_api_broker_tests.rs"]
+mod broker_tests;
+
 /// Maximum number of agents that can be invited to a single huddle.
 pub(crate) const MAX_HUDDLE_AGENTS: usize = 20;
 
@@ -331,6 +335,175 @@ pub(crate) async fn connect_tts_audio_publisher(
     )
     .await?;
 
+    Ok(spawn_tts_audio_publisher(
+        ws_tx,
+        ws_rx,
+        peer_index,
+        local_tts_publishers,
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) async fn connect_broker_tts_audio_publisher(
+    snapshot: &crate::managed_agents::BrokerMediaSnapshot,
+    owner: &nostr::Keys,
+    channel_id: &str,
+    parent_channel_id: &str,
+    huddle_generation: u64,
+    local_tts_publishers: super::tts::LocalTtsPublishers,
+) -> Result<super::tts::TtsAudioPublisher, String> {
+    let (ws_tx, ws_rx, peer_index) = connect_broker_tts_audio_socket(
+        snapshot,
+        owner,
+        channel_id,
+        parent_channel_id,
+        huddle_generation,
+    )
+    .await?;
+    Ok(
+        spawn_tts_audio_publisher(ws_tx, ws_rx, peer_index, local_tts_publishers)
+            .with_broker_binding(
+                &snapshot.authority_json,
+                channel_id,
+                parent_channel_id,
+                huddle_generation,
+            ),
+    )
+}
+
+#[cfg(unix)]
+async fn connect_broker_tts_audio_socket(
+    snapshot: &crate::managed_agents::BrokerMediaSnapshot,
+    owner: &nostr::Keys,
+    channel_id: &str,
+    parent_channel_id: &str,
+    huddle_generation: u64,
+) -> Result<(WsSink, WsReceiver, u8), String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let root = reqwest::Url::parse(&snapshot.url).map_err(|_| "invalid broker listener URL")?;
+    let loopback = root
+        .host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback());
+    if root.scheme() != "http" || !loopback {
+        return Err("broker media listener is not loopback HTTP".into());
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(HANDSHAKE_TIMEOUT)
+        .build()
+        .map_err(|_| "cannot create broker media client")?;
+    let challenge: serde_json::Value = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        client
+            .post(
+                root.join("/v1/huddle/challenge")
+                    .map_err(|_| "invalid broker challenge URL")?,
+            )
+            .bearer_auth(snapshot.credential.as_str())
+            .send(),
+    )
+    .await
+    .map_err(|_| "broker challenge timed out")?
+    .map_err(|_| "broker challenge failed")?
+    .error_for_status()
+    .map_err(|_| "broker challenge was denied")?
+    .json()
+    .await
+    .map_err(|_| "broker challenge response is invalid")?;
+    let nonce = challenge["nonce"]
+        .as_str()
+        .filter(|nonce| !nonce.is_empty() && nonce.len() <= 128)
+        .ok_or("broker challenge nonce is invalid")?;
+    let authority: serde_json::Value = serde_json::from_str(&snapshot.authority_json)
+        .map_err(|_| "broker media authority is invalid")?;
+    let target = serde_json::json!({
+        "authority": authority,
+        "channelId": channel_id,
+        "parentChannelId": parent_channel_id,
+        "huddleGeneration": huddle_generation,
+    });
+    let challenge_tag =
+        nostr::Tag::parse(["challenge", nonce]).map_err(|_| "broker challenge tag is invalid")?;
+    let owner_event = nostr::EventBuilder::new(nostr::Kind::Custom(27236), target.to_string())
+        .tags([challenge_tag])
+        .sign_with_keys(owner)
+        .map_err(|_| "cannot sign broker owner grant")?;
+    let grant: serde_json::Value = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        client
+            .post(
+                root.join("/v1/huddle/grant")
+                    .map_err(|_| "invalid broker grant URL")?,
+            )
+            .bearer_auth(snapshot.credential.as_str())
+            .json(&serde_json::json!({"ownerEvent": owner_event}))
+            .send(),
+    )
+    .await
+    .map_err(|_| "broker grant timed out")?
+    .map_err(|_| "broker grant failed")?
+    .error_for_status()
+    .map_err(|_| "broker grant was denied")?
+    .json()
+    .await
+    .map_err(|_| "broker grant response is invalid")?;
+    let grant_id = grant["grantId"]
+        .as_str()
+        .filter(|id| Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == *id))
+        .ok_or("broker grant ID is invalid")?;
+    let mut ws_url = root;
+    ws_url
+        .set_scheme("ws")
+        .map_err(|_| "invalid broker audio URL")?;
+    ws_url.set_path("/v1/huddle/audio");
+    ws_url.query_pairs_mut().append_pair("grantId", grant_id);
+    let mut request = ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|_| "invalid broker audio WebSocket request")?;
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", snapshot.credential.as_str())
+            .parse()
+            .map_err(|_| "invalid broker media credential")?,
+    );
+    let (socket, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_async(request))
+        .await
+        .map_err(|_| "broker audio handshake timed out")?
+        .map_err(|_| "broker audio handshake failed")?;
+    let (sink, mut stream) = socket.split();
+    let joined = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| "broker audio join timed out")?
+        .ok_or("broker audio closed before join")?
+        .map_err(|_| "broker audio join failed")?;
+    let WsMsg::Text(joined) = joined else {
+        return Err("broker audio join is invalid".into());
+    };
+    let joined: serde_json::Value =
+        serde_json::from_str(&joined).map_err(|_| "broker audio join is invalid")?;
+    if joined["type"] != "joined"
+        || joined["channelId"] != channel_id
+        || joined["huddleGeneration"] != huddle_generation
+    {
+        return Err("broker audio joined a different Huddle".into());
+    }
+    let peer_index = joined["peerIndex"]
+        .as_u64()
+        .and_then(|index| u8::try_from(index).ok())
+        .ok_or("broker audio peer index is invalid")?;
+    Ok((sink, stream, peer_index))
+}
+
+fn spawn_tts_audio_publisher(
+    ws_tx: WsSink,
+    ws_rx: WsReceiver,
+    peer_index: u8,
+    local_tts_publishers: super::tts::LocalTtsPublishers,
+) -> super::tts::TtsAudioPublisher {
     let cancel = CancellationToken::new();
     let publisher_cancel = cancel.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(TTS_BROADCAST_QUEUE_DEPTH);
@@ -353,7 +526,23 @@ pub(crate) async fn connect_tts_audio_publisher(
         }
         publisher_cancel.cancel();
     });
-    Ok(publisher)
+    publisher
+}
+
+async fn send_tts_ws_message<S>(
+    sender: &mut S,
+    message: WsMsg,
+    cancel: &CancellationToken,
+) -> Result<(), String>
+where
+    S: futures_util::Sink<WsMsg> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("tts audio send cancelled".into()),
+        result = sender.send(message) => result.map_err(|error| format!("tts audio send: {error}")),
+    }
 }
 
 async fn run_tts_audio_publisher(
@@ -415,18 +604,14 @@ async fn run_tts_audio_publisher(
                 let mut payload = Vec::with_capacity(V2_HEADER_LEN + encoded_len);
                 payload.extend_from_slice(&header);
                 payload.extend_from_slice(&encoded[..encoded_len]);
-                ws_tx
-                    .send(WsMsg::Binary(payload.into()))
-                    .await
-                    .map_err(|error| format!("tts audio send: {error}"))?;
+                send_tts_ws_message(&mut ws_tx, WsMsg::Binary(payload.into()), &cancel).await?;
                 sequence = sequence.wrapping_add(1);
                 timestamp_48k = timestamp_48k.wrapping_add(super::jitter::FRAME_TIMESTAMP_DELTA);
             }
             message = ws_rx.next() => {
                 match message {
                     Some(Ok(WsMsg::Ping(data))) => {
-                        ws_tx.send(WsMsg::Pong(data)).await
-                            .map_err(|error| format!("tts audio pong: {error}"))?;
+                        send_tts_ws_message(&mut ws_tx, WsMsg::Pong(data), &cancel).await?;
                     }
                     Some(Ok(WsMsg::Close(_))) | None => break,
                     Some(Err(error)) => return Err(format!("tts audio receive: {error}")),
@@ -444,7 +629,13 @@ async fn run_tts_audio_publisher(
             }
         }
     }
-    let _ = ws_tx.send(WsMsg::Close(None)).await;
+    if !cancel.is_cancelled() {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            ws_tx.send(WsMsg::Close(None)),
+        )
+        .await;
+    }
     Ok(())
 }
 

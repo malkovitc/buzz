@@ -5,6 +5,24 @@ impl TtsPipeline {
         self.broadcasters.contains(speaker_pubkey)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn has_broker_audio_publisher(
+        &self,
+        speaker_pubkey: &str,
+        authority: &str,
+        channel: &str,
+        parent: &str,
+        huddle_generation: u64,
+    ) -> bool {
+        self.broadcasters.contains_for_binding(
+            speaker_pubkey,
+            authority,
+            channel,
+            parent,
+            huddle_generation,
+        )
+    }
+
     pub(crate) fn register_audio_publisher(
         &self,
         speaker_pubkey: &str,

@@ -57,6 +57,7 @@ pub(crate) async fn run(
         "type": "joined",
         "channelId": target.channel_id,
         "huddleGeneration": target.huddle_generation,
+        "peerIndex": relay.peer_index,
     });
     let joined_sent = client
         .send(ClientMessage::Text(joined.to_string().into()))

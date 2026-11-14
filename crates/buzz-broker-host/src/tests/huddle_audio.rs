@@ -205,6 +205,11 @@ async fn huddle_audio_consumes_owner_grant_and_closes_before_fence() {
         serde_json::from_str::<serde_json::Value>(&joined).unwrap()["type"],
         "joined"
     );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&joined).unwrap()["peerIndex"],
+        1,
+        "Desktop needs the relay peer index for local TTS echo suppression"
+    );
     client
         .send(tokio_tungstenite::tungstenite::Message::Binary(
             vec![0, 1, 0, 0, 3, 192, 0, 0, 0xF8].into(),

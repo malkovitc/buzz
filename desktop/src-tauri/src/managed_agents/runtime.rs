@@ -23,7 +23,7 @@ mod path;
 #[cfg(unix)]
 pub(crate) use broker::reconcile_pair as reconcile_broker_pair;
 #[cfg(unix)]
-pub(crate) use broker::BrokerHost;
+pub(crate) use broker::{BrokerHost, BrokerMediaSnapshot};
 pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::{compose_path_entries, should_skip_claude_executable, should_use_inherited};
 
