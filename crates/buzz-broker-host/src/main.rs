@@ -2,6 +2,8 @@ mod credential;
 #[cfg(unix)]
 mod drain;
 mod http;
+#[cfg(unix)]
+mod huddle;
 mod issuer;
 #[cfg(unix)]
 mod publisher;

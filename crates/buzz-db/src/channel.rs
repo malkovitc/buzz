@@ -1866,6 +1866,50 @@ pub async fn get_member_role(
     Ok(row.map(|r| r.try_get("role")).transpose()?)
 }
 
+/// Writer-backed authorization fence for one broker-owned Huddle frame.
+/// The member and channel row locks stay held while the relay enqueues the
+/// frame, so a role downgrade, removal, or channel archive cannot commit
+/// between the role read and the enqueue.
+pub struct BotMediaFrameGuard {
+    tx: Transaction<'static, Postgres>,
+}
+
+impl BotMediaFrameGuard {
+    /// Release the role lock after the synchronous media enqueue.
+    pub async fn commit(self) -> Result<()> {
+        self.tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// Check current bot membership on the writer and hold both rows through one frame enqueue.
+pub async fn lock_bot_media_frame(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+) -> Result<Option<BotMediaFrameGuard>> {
+    let mut tx = pool.begin().await?;
+    let authorized: Option<i32> = sqlx::query_scalar(
+        "SELECT 1::int FROM channel_members cm
+         JOIN channels c ON c.community_id = cm.community_id AND c.id = cm.channel_id
+         WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.pubkey = $3
+           AND cm.role = 'bot' AND cm.removed_at IS NULL
+           AND c.deleted_at IS NULL AND c.archived_at IS NULL
+         FOR SHARE OF cm, c",
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .bind(pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if authorized.is_none() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    Ok(Some(BotMediaFrameGuard { tx }))
+}
+
 /// Archive ephemeral channels whose TTL deadline has passed.
 ///
 /// Returns the `(community_id, host, channel_id)` list that was archived. Idempotent — the
@@ -1911,13 +1955,94 @@ mod tests {
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
 
     async fn setup_pool() -> PgPool {
-        PgPool::connect(TEST_DB_URL)
+        let database_url =
+            std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string());
+        PgPool::connect(&database_url)
             .await
             .expect("connect to test DB")
     }
 
     fn random_pubkey() -> Vec<u8> {
         Keys::generate().public_key().to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn broker_media_role_lock_fences_downgrade_and_archive() {
+        let pool = setup_pool().await;
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        let owner = random_pubkey();
+        let bot = random_pubkey();
+        let channel = create_test_channel(
+            &pool,
+            community_id,
+            "broker-role-lock",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .expect("create channel");
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) VALUES ($1, $2, $3, 'bot')",
+        )
+        .bind(community_id)
+        .bind(channel.id)
+        .bind(&bot)
+        .execute(&pool)
+        .await
+        .expect("add bot");
+
+        let guard = lock_bot_media_frame(&pool, community, channel.id, &bot)
+            .await
+            .expect("read role")
+            .expect("bot can send");
+        let update_pool = pool.clone();
+        let update_bot = bot.clone();
+        let mut downgrade = tokio::spawn(async move {
+            sqlx::query("UPDATE channel_members SET role = 'member' WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3")
+                .bind(community_id)
+                .bind(channel.id)
+                .bind(update_bot)
+                .execute(&update_pool)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut downgrade)
+                .await
+                .is_err(),
+            "role downgrade must wait for the frame boundary"
+        );
+        guard.commit().await.expect("release frame lock");
+        downgrade.await.expect("downgrade task").expect("downgrade");
+        assert!(
+            lock_bot_media_frame(&pool, community, channel.id, &bot)
+                .await
+                .expect("read downgraded role")
+                .is_none(),
+            "subsequent frame must be denied"
+        );
+
+        sqlx::query("UPDATE channel_members SET role = 'bot' WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3")
+            .bind(community_id)
+            .bind(channel.id)
+            .bind(&bot)
+            .execute(&pool)
+            .await
+            .expect("restore role");
+        archive_channel(&pool, community, channel.id)
+            .await
+            .expect("archive channel");
+        assert!(
+            lock_bot_media_frame(&pool, community, channel.id, &bot)
+                .await
+                .expect("read archived channel")
+                .is_none(),
+            "archived channel must deny media"
+        );
     }
 
     async fn make_test_community(pool: &PgPool) -> Uuid {

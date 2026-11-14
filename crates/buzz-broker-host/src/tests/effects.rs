@@ -261,6 +261,7 @@ async fn message_effect_admission_survives_restart_and_blocks_fence_until_termin
         .execute(&pool)
         .await
         .unwrap();
+    remove_audio_schema(&pool).await;
     sqlx::query("PRAGMA user_version = 5")
         .execute(&pool)
         .await
@@ -885,7 +886,7 @@ async fn v1_migration_keeps_issued_authority_and_adds_effect_journal() {
         .fetch_one(&pool)
         .await
         .expect("schema version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let journal_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'broker_effects')",
     )

@@ -72,6 +72,24 @@ impl AuthorityStore {
         if pending {
             return Err(StoreError::EffectsPending);
         }
+        #[cfg(unix)]
+        {
+            let audio_pending: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM broker_audio_sessions
+                    WHERE credential_hash = (
+                        SELECT credential_hash FROM broker_authorities WHERE authority_json = ?
+                    ) AND state = 'active'
+                )",
+            )
+            .bind(&authority_json)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+            if audio_pending {
+                return Err(StoreError::EffectsPending);
+            }
+        }
         let state = row
             .map(|row| {
                 let state: String = row.try_get("state").map_err(|_| StoreError::Integrity)?;
@@ -195,6 +213,15 @@ impl AuthorityStore {
             .commit()
             .await
             .map_err(|_| StoreError::Unavailable)?;
+        #[cfg(unix)]
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.has_active_audio_sessions(&identity).await? {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Ok::<(), StoreError>(())
+        })
+        .await
+        .map_err(|_| StoreError::EffectsPending)??;
         Ok(if current == AuthorityState::Fenced {
             AuthorityState::Fenced
         } else {

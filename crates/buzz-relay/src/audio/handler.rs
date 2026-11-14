@@ -23,9 +23,9 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use nostr::{EventBuilder, Kind, Tag};
+use nostr::{Event, EventBuilder, Kind, Tag};
 use serde::Deserialize;
-use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -38,7 +38,10 @@ use buzz_core::StoredEvent;
 use buzz_pubsub::EventTopic;
 
 use crate::audio::room::PeerCtrl;
-use crate::state::{run_registered_community_connection, AppState, CommunityConnectionControl};
+use crate::state::{
+    run_registered_community_connection, AppState, BrokerAudioInvalidation,
+    CommunityConnectionControl,
+};
 
 /// Maximum binary frame size: 4 KB is generous for a single Opus packet.
 const MAX_AUDIO_FRAME_BYTES: usize = 4096;
@@ -137,6 +140,19 @@ struct AuthMsg {
     protocol_version: u8,
 }
 
+fn broker_audio_requested(event: &Event) -> Result<bool, ()> {
+    let tags: Vec<_> = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind().to_string() == "broker_audio")
+        .collect();
+    match tags.as_slice() {
+        [] => Ok(false),
+        [tag] if tag.as_slice() == ["broker_audio", "local_v1"] => Ok(true),
+        _ => Err(()),
+    }
+}
+
 fn default_protocol_version() -> u8 {
     1
 }
@@ -218,6 +234,20 @@ async fn handle_active_audio_connection(
         }
     };
 
+    let broker_audio = match broker_audio_requested(&auth_msg.event) {
+        Ok(requested) => requested,
+        Err(()) => {
+            let _ = ws_send
+                .send(WsMessage::Text(
+                    serde_json::json!({"type":"error","code":"invalid_broker_audio_marker"})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            return;
+        }
+    };
+
     // Extract NIP-OA auth tag before verify_auth_event consumes the event.
     let auth_tag_json = crate::handlers::auth::extract_auth_tag_json(&auth_msg.event);
 
@@ -289,6 +319,17 @@ async fn handle_active_audio_connection(
             return;
         }
     };
+
+    if broker_audio && state.mesh().is_some() {
+        let _ = ws_send
+            .send(WsMessage::Text(
+                serde_json::json!({"type":"error","code":"broker_audio_requires_local_relay"})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        return;
+    }
 
     // Huddle cross-pod routing (mesh) OR single-pod guardrail.
     //
@@ -509,6 +550,28 @@ async fn handle_active_audio_connection(
         }
     }
 
+    let broker_invalidations = broker_audio.then(|| state.subscribe_broker_audio_invalidation());
+    let broker_join_guard = if broker_audio {
+        match state
+            .db
+            .lock_bot_media_frame(tenant.community(), channel_id, &pubkey_bytes)
+            .await
+        {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) | Err(_) => {
+                let _ = ws_send
+                    .send(WsMessage::Text(
+                        serde_json::json!({"type":"error","code":"bot_role_required"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let admission = if let Some(session) = remote_session.as_ref() {
         room.add_peer_at_index(pubkey_hex.clone(), requested_version, session.peer_index())
             .map(|(id, _mirror_epoch, audio, ctrl, revision)| {
@@ -580,6 +643,13 @@ async fn handle_active_audio_connection(
                 return;
             }
         };
+
+    if let Some(guard) = broker_join_guard {
+        if guard.commit().await.is_err() {
+            room.remove_peer(peer_id);
+            return;
+        }
+    }
 
     info!(
         channel_id = %channel_id,
@@ -667,6 +737,7 @@ async fn handle_active_audio_connection(
 
     let joined_msg = serde_json::json!({
         "type": "joined",
+        "broker_audio_local_only": broker_audio && state.mesh().is_none() && state.config.huddle_audio_available,
         "revision": roster_revision,
         "pubkey": pubkey_hex,
         "peer_index": peer_index,
@@ -844,6 +915,13 @@ async fn handle_active_audio_connection(
         Arc::clone(&missed_pongs),
         cancel.clone(),
         remote_session.as_mut(),
+        broker_invalidations.map(|invalidations| BrokerAudioPermission {
+            state: Arc::clone(&state),
+            community_id: tenant.community(),
+            channel_id,
+            pubkey: pubkey_bytes.clone(),
+            invalidations,
+        }),
     )
     .await;
 
@@ -1034,6 +1112,14 @@ fn remote_rejection_ws_error(reason: &crate::audio::join::RegisterRejection) -> 
 /// via `remote_session`. Argument count reflects the pre-existing connection
 /// wiring plus the one mesh session; a param struct would obscure more than it
 /// clarifies at this single call site.
+struct BrokerAudioPermission {
+    state: Arc<AppState>,
+    community_id: buzz_core::CommunityId,
+    channel_id: Uuid,
+    pubkey: Vec<u8>,
+    invalidations: broadcast::Receiver<BrokerAudioInvalidation>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn recv_loop(
     mut ws_recv: futures_util::stream::SplitStream<WebSocket>,
@@ -1044,6 +1130,7 @@ async fn recv_loop(
     missed_pongs: Arc<AtomicU8>,
     cancel: CancellationToken,
     mut remote_session: Option<&mut crate::audio::join::RemoteHuddleSession>,
+    mut broker_permission: Option<BrokerAudioPermission>,
 ) {
     use crate::audio::wire::{FrameHeader, V2_HEADER_LEN};
 
@@ -1051,6 +1138,21 @@ async fn recv_loop(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            invalidation = async {
+                match broker_permission.as_mut() {
+                    Some(permission) => permission.invalidations.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match invalidation {
+                    Ok(change) if broker_permission.as_ref().is_some_and(|permission| {
+                        change.affects(permission.community_id, permission.channel_id, &permission.pubkey)
+                    }) => break,
+                    Ok(_) => continue,
+                    // A lagged receiver cannot prove it did not miss a revoke.
+                    Err(_) => break,
+                }
+            }
             msg = ws_recv.next() => {
                 match msg {
                     Some(Ok(WsMessage::Binary(data))) => {
@@ -1109,6 +1211,23 @@ async fn recv_loop(
                         // fan-out authority); the owner-side room fans it back
                         // to every participant, including our co-located peers.
                         // Owner/local path fans out through the local room.
+                        if let Some(permission) = &broker_permission {
+                            let guard = permission.state.db.lock_bot_media_frame(
+                                permission.community_id,
+                                permission.channel_id,
+                                &permission.pubkey,
+                            ).await;
+                            let Ok(Some(guard)) = guard else {
+                                cancel.cancel();
+                                break;
+                            };
+                            room.broadcast_frame(peer_id, data);
+                            if guard.commit().await.is_err() {
+                                cancel.cancel();
+                                break;
+                            }
+                            continue;
+                        }
                         match remote_session.as_deref_mut() {
                             Some(session) => session.forward_media(&data),
                             None => room.broadcast_frame(peer_id, data),

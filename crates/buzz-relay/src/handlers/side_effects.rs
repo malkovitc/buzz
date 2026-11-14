@@ -1635,6 +1635,7 @@ async fn handle_edit_metadata(
                                 .db
                                 .archive_channel(tenant.community(), channel_id)
                                 .await?;
+                            state.invalidate_broker_audio_channel(tenant.community(), channel_id);
                             emit_system_message(
                                 tenant,
                                 state,

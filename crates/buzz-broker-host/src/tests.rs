@@ -21,6 +21,9 @@ const CHANNEL_ID: &str = "5df7dfa8-e919-43df-8efd-f1dcb8af7071";
 mod acp_runtime;
 mod drain;
 mod effects;
+mod huddle_audio;
+mod huddle_grant;
+mod huddle_lifecycle;
 mod lifecycle;
 mod read;
 mod receipts;
@@ -93,6 +96,7 @@ fn write_identity(path: &Path, identity: &AuthorityIdentity) {
 }
 
 async fn simulate_v2_schema(pool: &sqlx::SqlitePool) {
+    remove_audio_schema(pool).await;
     sqlx::query("ALTER TABLE broker_receipts DROP COLUMN owner_pubkey")
         .execute(pool)
         .await
@@ -120,6 +124,13 @@ async fn simulate_v2_schema(pool: &sqlx::SqlitePool) {
         .execute(pool)
         .await
         .expect("v2 schema version");
+}
+
+async fn remove_audio_schema(pool: &sqlx::SqlitePool) {
+    sqlx::query("DROP TABLE IF EXISTS broker_audio_sessions")
+        .execute(pool)
+        .await
+        .expect("remove v7 audio schema from legacy fixture");
 }
 
 async fn spawn_host(store: AuthorityStore) -> (String, tokio::task::JoinHandle<()>) {

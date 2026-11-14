@@ -21,13 +21,26 @@ use crate::credential::CredentialDigest;
 use crate::signing::HostSigner;
 
 #[cfg(unix)]
+mod audio;
+#[cfg(unix)]
 mod drain;
 #[cfg(unix)]
 mod effect_lock;
 mod lifecycle;
 
 #[cfg(unix)]
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+#[cfg(unix)]
+const AUDIO_SESSIONS_TABLE_SQL: &str = "CREATE TABLE broker_audio_sessions (
+    credential_hash BLOB NOT NULL,
+    session_id TEXT NOT NULL CHECK(length(session_id) = 36),
+    state TEXT NOT NULL CHECK(state IN ('active', 'closed')),
+    PRIMARY KEY (credential_hash, session_id),
+    FOREIGN KEY (credential_hash) REFERENCES broker_authorities(credential_hash)
+) STRICT";
+#[cfg(unix)]
+const AUDIO_ACTIVE_INDEX_SQL: &str = "CREATE UNIQUE INDEX one_active_audio_session_per_credential
+    ON broker_audio_sessions(credential_hash) WHERE state = 'active'";
 #[cfg(unix)]
 const EFFECTS_TABLE_SQL: &str = "CREATE TABLE broker_effects (
     credential_hash BLOB NOT NULL,
@@ -87,6 +100,44 @@ pub(crate) enum ChannelReadAdmission {
 }
 
 impl AuthorityStore {
+    #[cfg(unix)]
+    pub(crate) async fn require_active_local_owner(
+        &self,
+        credential: &CredentialDigest,
+        signer: &HostSigner,
+    ) -> Result<Option<AuthorityIdentity>, StoreError> {
+        use buzz_sdk::broker::RuntimeLocationKind;
+
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let mut transaction = connection
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let authority = match load_authority(&mut transaction, credential).await {
+            Ok(authority) => authority,
+            Err(StoreError::Unauthenticated) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let owner = signer.owner_hex();
+        if authority.state != AuthorityState::Active
+            || authority.identity.location.kind != RuntimeLocationKind::Local
+            || !signer.matches_executor(&authority.identity)
+            || !owner_matches(&authority, &owner)
+        {
+            return Ok(None);
+        }
+        bind_owner(&mut transaction, credential, &owner).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(Some(authority.identity))
+    }
+
     #[cfg(not(unix))]
     pub(crate) async fn open(_path: &Path) -> Result<Self, StoreError> {
         Err(StoreError::UnsupportedPlatform)
@@ -128,6 +179,7 @@ impl AuthorityStore {
                 3 => self.migrate_schema_v4().await?,
                 4 => self.migrate_schema_v5().await?,
                 5 => self.migrate_schema_v6().await?,
+                6 => self.migrate_schema_v7().await?,
                 SCHEMA_VERSION => break,
                 _ => return Err(StoreError::UnsupportedSchema),
             }
@@ -140,7 +192,8 @@ impl AuthorityStore {
             return Err(StoreError::Integrity);
         }
         self.validate_authority_state().await?;
-        self.validate_effect_state().await
+        self.validate_effect_state().await?;
+        self.validate_audio_state().await
     }
 
     #[cfg(unix)]
@@ -203,7 +256,15 @@ impl AuthorityStore {
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
-        sqlx::query("PRAGMA user_version = 6")
+        sqlx::query(AUDIO_SESSIONS_TABLE_SQL)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        sqlx::query(AUDIO_ACTIVE_INDEX_SQL)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        sqlx::query("PRAGMA user_version = 7")
             .execute(&mut *transaction)
             .await
             .map_err(|_| StoreError::Unavailable)?;
