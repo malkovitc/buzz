@@ -48,6 +48,12 @@ fn stop_managed_agent_pair(
     };
     let result = (|| -> Result<(), String> {
         #[cfg(unix)]
+        if let Some(host) = runtime.broker_host.as_mut() {
+            // Quiesce and fence the exact generation before the harness can be
+            // replaced. A failed drain keeps this runtime tracked for retry.
+            host.stop()?;
+        }
+        #[cfg(unix)]
         terminate_process(runtime.child.id())?;
         #[cfg(windows)]
         match runtime.job.take() {
@@ -139,6 +145,8 @@ pub fn stop_managed_agent_workspace_pair(
         Some(pair_key) => {
             // No tracked pair here — a pubkey-wide cache clear would disturb
             // live pairs in other communities, so stay pair-scoped.
+            #[cfg(unix)]
+            super::reconcile_broker_pair(&super::super::managed_agents_base_dir(app)?, &pair_key)?;
             stop_legacy_scalar_pid(app, record)?;
             state.clear_agent_session_cache(&pair_key);
         }
@@ -157,6 +165,10 @@ pub fn stop_managed_agent_process(
 ) -> Result<(), String> {
     let keys = managed_agent_runtime_keys(runtimes, &record.pubkey);
     if keys.is_empty() {
+        #[cfg(unix)]
+        if let Some(pair_key) = super::workspace_pair_key(app, record) {
+            super::reconcile_broker_pair(&super::super::managed_agents_base_dir(app)?, &pair_key)?;
+        }
         return stop_legacy_scalar_pid(app, record);
     }
 

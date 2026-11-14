@@ -113,6 +113,39 @@ owner signature against the key and only signs `message.post` or `message.reply`
 matches the authority's executor pubkey. Omitting both signer flags keeps the
 status-only host mode.
 
+For a Desktop-owned sidecar, `serve --bind 127.0.0.1:0 --listen-output
+/private/listen.addr --exit-on-stdin-eof` publishes the selected loopback
+address into a new mode-0600 file in an owner-only directory. The host exits
+when Desktop closes its stdin pipe, including after an abrupt Desktop exit.
+An existing listener-output path is never overwritten.
+
+## Local Desktop canary
+
+Set `BUZZ_DESKTOP_BROKER_AGENT_PUBKEY` in the **Desktop process environment**
+to one exact 64-hex managed-agent pubkey. The selected record must use the
+local `buzz-acp` harness, have a valid NIP-OA owner attestation, use effective
+owner-only access, and have `BUZZ_ACP_CHANNELS` saved as a comma-separated
+list of channel UUIDs. A missing prerequisite refuses the selected launch.
+Other managed agents continue through the existing direct launcher.
+Packaged Desktop loads `buzz-broker-host` beside its own executable; it never
+selects a host from the workspace or `PATH`. A development build may use an
+absolute `BUZZ_DESKTOP_BROKER_HOST_DEV_PATH` to select its locally built host.
+
+Desktop keeps the broker SQLite state under its agent data directory, issues
+a fresh generation bearer, and starts a signer-backed broker host before it
+starts the selected ACP child. The child receives `BUZZ_AGENT_MODE=broker`,
+the broker URL, bearer, relay identity, and exact authority JSON. Desktop
+removes `BUZZ_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`, legacy key aliases, direct
+relay auth, and the Nostr git credential helper from that child's environment.
+Stop and restart quiesce, drain, and fence the old generation before a new
+one can issue. A failed drain retains the authority marker and blocks a
+successor until the pending effect is reconciled.
+
+This canary changes the ACP launcher only. Desktop Huddle TTS still uses the
+legacy direct signer path, and same-user local filesystem access is not an
+isolation boundary for arbitrary agent code. The later VOICE 2 media cutover
+must route audio through the broker and remove that remaining Desktop key copy.
+
 `message.post` and `message.reply` admission and the signed event are committed to a separate,
 non-evicting SQLite effect journal under the same generation lock as fencing.
 The host submits that exact event to the authority's relay and records success

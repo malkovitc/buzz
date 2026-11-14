@@ -15,6 +15,16 @@ use crate::app_state::AppState;
 
 const STATUS_EVENT: &str = "managed-agent-runtime-status";
 
+pub(crate) fn close_tracked_broker(
+    runtimes: &mut std::collections::HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+    key: &ManagedAgentRuntimeKey,
+) -> Result<(), String> {
+    if let Some(runtime) = runtimes.get_mut(key) {
+        runtime.close_broker()?;
+    }
+    Ok(())
+}
+
 fn status_for(
     app: &AppHandle,
     record: &super::ManagedAgentRecord,
@@ -172,6 +182,7 @@ pub async fn list_managed_agent_runtimes(
         let records_changed = !exited_keys.is_empty();
         let mut statuses = Vec::new();
         for key in exited_keys {
+            close_tracked_broker(&mut runtimes, &key)?;
             runtimes.remove(&key);
             super::remove_agent_runtime_receipt(&app, &key);
             state.clear_agent_session_cache(&key);
@@ -279,7 +290,10 @@ fn start_pair(
         let status = status_for(&app, record, &key, runtimes.get(&key), None);
         return Ok(status);
     }
+    close_tracked_broker(&mut runtimes, &key)?;
     runtimes.remove(&key);
+    #[cfg(unix)]
+    super::runtime::reconcile_broker_pair(&super::managed_agents_base_dir(&app)?, &key)?;
     terminate_untracked_pair_runtime(&app, &key)?;
 
     let owner = state
@@ -296,6 +310,10 @@ fn start_pair(
         started_at: now.clone(),
     };
     if let Err(error) = write_agent_runtime_receipt(&app, &receipt) {
+        if let Err(close_error) = process.close_broker() {
+            runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(process));
+            return Err(format!("{error}; broker close failed: {close_error}"));
+        }
         let _ = terminate_process(process.child.id());
         let _ = process.child.wait();
         return Err(error);
@@ -335,6 +353,7 @@ pub fn stop_managed_agent_runtime(
         .managed_agent_processes
         .lock()
         .map_err(|e| e.to_string())?;
+    close_tracked_broker(&mut runtimes, &key)?;
     if let Some(mut runtime) = runtimes.remove(&key) {
         let stop_result = if process_is_running(runtime.child.id()) {
             terminate_process(runtime.child.id())
@@ -356,6 +375,8 @@ pub fn stop_managed_agent_runtime(
             }
         }
     } else {
+        #[cfg(unix)]
+        super::runtime::reconcile_broker_pair(&super::managed_agents_base_dir(&app)?, &key)?;
         // No runtime is tracked at this key, but a valid prior-session
         // receipt may still point at a live child (e.g. the crash-recovery
         // window for a non-auto-start agent). Terminate that orphan before

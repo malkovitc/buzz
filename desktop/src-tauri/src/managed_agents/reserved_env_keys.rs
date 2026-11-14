@@ -33,6 +33,13 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     "BUZZ_API_TOKEN",
     "BUZZ_ACP_PRIVATE_KEY",
     "BUZZ_ACP_API_TOKEN",
+    // Desktop-owned broker canary authority. User env must not switch the
+    // selected child back to direct mode or replace its exact bearer/scope.
+    "BUZZ_AGENT_MODE",
+    "BUZZ_BROKER_URL",
+    "BUZZ_BROKER_CREDENTIAL",
+    "BUZZ_BROKER_RELAY_URL",
+    "BUZZ_MANAGED_ACP_AUTHORITY",
     // Relay URL: overriding would let a malicious config redirect the
     // agent to an attacker-controlled relay.
     "BUZZ_RELAY_URL",
