@@ -472,7 +472,8 @@ fn validate_managed_node_zip_entries(
     for i in 0..archive.len() {
         let name = archive
             .name_for_index(i)
-            .ok_or_else(|| format!("Node.js zip entry {i}: missing name"))?;
+            .ok_or_else(|| format!("Node.js zip entry {i}: missing name"))?
+            .map_err(|e| format!("Node.js zip entry {i}: {e}"))?;
 
         // Absolute-path checks (platform-neutral).
         if name.starts_with('/') || name.starts_with('\\') {
@@ -507,10 +508,10 @@ fn extract_managed_node_zip(
         let outpath = match entry.enclosed_name() {
             Some(p) => dest_dir.join(p),
             None => {
-                return Err(format!(
-                    "Node.js zip contains unsafe path: {}",
-                    entry.name()
-                ))
+                let name = entry
+                    .name()
+                    .map_err(|e| format!("Node.js zip entry {i}: {e}"))?;
+                return Err(format!("Node.js zip contains unsafe path: {}", name));
             }
         };
         if entry.is_dir() {
