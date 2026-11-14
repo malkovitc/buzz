@@ -414,7 +414,7 @@ fn advisory_check_skill_names(
             None => continue,
         };
 
-        if let Some(name_val) = mapping.get(serde_yaml::Value::String("name".into())) {
+        if let Some(name_val) = mapping.get("name") {
             if let Some(name_str) = name_val.as_str() {
                 if let Some(dir_name) = skill_dir.file_name().and_then(|n| n.to_str()) {
                     if name_str != dir_name {

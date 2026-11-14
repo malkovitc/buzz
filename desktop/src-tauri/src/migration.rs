@@ -1126,7 +1126,7 @@ fn rewrite_legacy_persona_md_runtime(content: &str) -> Option<String> {
     let (frontmatter, body) = buzz_persona_pkg::persona::split_frontmatter(content).ok()?;
     let mut value = serde_yaml::from_str::<serde_yaml::Value>(frontmatter).ok()?;
     let mapping = value.as_mapping_mut()?;
-    let runtime = mapping.get_mut(serde_yaml::Value::String("runtime".to_string()))?;
+    let runtime = mapping.get_mut("runtime")?;
     if runtime.as_str()? != "sprout-agent" {
         return None;
     }
