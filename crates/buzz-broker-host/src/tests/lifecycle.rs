@@ -28,6 +28,7 @@ async fn v4_migration_quiesces_unbound_generation_and_clears_receipts() {
         .execute(&pool)
         .await
         .unwrap();
+    remove_audio_schema(&pool).await;
     sqlx::query("PRAGMA user_version = 4")
         .execute(&pool)
         .await
@@ -85,6 +86,7 @@ async fn v3_migration_quiesces_authority_and_clears_old_receipts() {
         .execute(&pool)
         .await
         .unwrap();
+    remove_audio_schema(&pool).await;
     sqlx::query("PRAGMA user_version = 3")
         .execute(&pool)
         .await
@@ -107,7 +109,7 @@ async fn v3_migration_quiesces_authority_and_clears_old_receipts() {
         .fetch_one(&inspect)
         .await
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     inspect.close().await;
 }
 
@@ -270,7 +272,7 @@ async fn v2_migration_keeps_existing_authority_and_adds_quiescing_state() {
         .fetch_one(&pool)
         .await
         .expect("schema version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     pool.close().await;
 }
 

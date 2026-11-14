@@ -19,13 +19,13 @@ pub(crate) struct GrantRequest {
     pub(crate) owner_event: Event,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct GrantTarget {
-    authority: AuthorityIdentity,
-    channel_id: String,
-    parent_channel_id: String,
-    huddle_generation: u64,
+pub(crate) struct GrantTarget {
+    pub(crate) authority: AuthorityIdentity,
+    pub(crate) channel_id: String,
+    pub(crate) parent_channel_id: String,
+    pub(crate) huddle_generation: u64,
 }
 
 #[derive(Default)]
@@ -46,6 +46,23 @@ pub(crate) enum GrantError {
 }
 
 impl HuddleGrants {
+    pub(crate) fn take(
+        &self,
+        credential: &CredentialDigest,
+        id: &str,
+    ) -> Result<GrantTarget, GrantError> {
+        let mut cache = self.inner.lock().map_err(|_| GrantError::Unavailable)?;
+        cache.expire();
+        let Some((bound, _, _)) = cache.grants.get(id) else {
+            return Err(GrantError::Invalid);
+        };
+        if bound != credential {
+            return Err(GrantError::Invalid);
+        }
+        let (_, target, _) = cache.grants.remove(id).ok_or(GrantError::Invalid)?;
+        Ok(target)
+    }
+
     pub(crate) fn challenge(&self, credential: CredentialDigest) -> Result<String, GrantError> {
         let mut cache = self.inner.lock().map_err(|_| GrantError::Unavailable)?;
         cache.expire();

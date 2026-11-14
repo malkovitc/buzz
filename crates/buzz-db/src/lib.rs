@@ -2644,6 +2644,17 @@ impl Db {
         channel::get_member_role(&self.pool, community_id, channel_id, pubkey).await
     }
 
+    /// Hold writer row locks across one broker Huddle frame admission.
+    #[datastore_span(name = "lock_bot_media_frame", system = "postgresql")]
+    pub async fn lock_bot_media_frame(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+    ) -> Result<Option<channel::BotMediaFrameGuard>> {
+        channel::lock_bot_media_frame(&self.pool, community_id, channel_id, pubkey).await
+    }
+
     /// Archive ephemeral channels whose TTL deadline has passed.
     #[datastore_span(name = "reap_expired_ephemeral_channels", system = "postgresql")]
     pub async fn reap_expired_ephemeral_channels(

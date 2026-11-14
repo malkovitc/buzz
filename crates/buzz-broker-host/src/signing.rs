@@ -119,6 +119,23 @@ impl HostSigner {
         ))
     }
 
+    pub(crate) fn sign_huddle_auth(
+        &self,
+        relay_origin: &str,
+        challenge: &str,
+    ) -> Result<Event, SigningError> {
+        let tags = [
+            Tag::parse(["relay", relay_origin]).map_err(|_| SigningError::Sign)?,
+            Tag::parse(["challenge", challenge]).map_err(|_| SigningError::Sign)?,
+            Tag::parse(["broker_audio", "local_v1"]).map_err(|_| SigningError::Sign)?,
+            self.auth_tag.clone(),
+        ];
+        EventBuilder::new(Kind::Custom(22242), "")
+            .tags(tags)
+            .sign_with_keys(&self.keys)
+            .map_err(|_| SigningError::Sign)
+    }
+
     pub(crate) fn sign_message(
         &self,
         identity: &AuthorityIdentity,

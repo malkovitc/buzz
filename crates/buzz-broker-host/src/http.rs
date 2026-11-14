@@ -1,6 +1,10 @@
 use axum::body::{Body, Bytes};
+#[cfg(unix)]
+use axum::extract::{ws::WebSocketUpgrade, Query};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
+#[cfg(unix)]
+use axum::response::IntoResponse as _;
 use axum::response::Response;
 use axum::routing::post;
 #[cfg(unix)]
@@ -17,6 +21,8 @@ use std::sync::Arc;
 use crate::credential::CredentialDigest;
 #[cfg(unix)]
 use crate::huddle::grant::{GrantError, GrantRequest, HuddleGrants};
+#[cfg(unix)]
+use crate::huddle::session;
 #[cfg(unix)]
 use crate::publisher::{PublishError, RelayPublisher};
 #[cfg(unix)]
@@ -45,7 +51,10 @@ pub(crate) fn app_with_effects(
 ) -> Router {
     app_with_state(AppState {
         store,
-        effects: Some(Arc::new(EffectService { signer, publisher })),
+        effects: Some(Arc::new(EffectService {
+            signer: Arc::new(signer),
+            publisher,
+        })),
         grants: Arc::new(HuddleGrants::default()),
     })
 }
@@ -61,7 +70,7 @@ struct AppState {
 
 #[cfg(unix)]
 struct EffectService {
-    signer: HostSigner,
+    signer: Arc<HostSigner>,
     publisher: RelayPublisher,
 }
 
@@ -70,7 +79,8 @@ fn app_with_state(state: AppState) -> Router {
     #[cfg(unix)]
     let router = router
         .route("/v1/huddle/challenge", post(huddle_challenge))
-        .route("/v1/huddle/grant", post(huddle_grant));
+        .route("/v1/huddle/grant", post(huddle_grant))
+        .route("/v1/huddle/audio", axum::routing::get(huddle_audio));
     router
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state)
@@ -140,6 +150,44 @@ fn grant_error_status(error: GrantError) -> StatusCode {
         GrantError::Full => StatusCode::TOO_MANY_REQUESTS,
         GrantError::Unavailable => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+#[cfg(unix)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HuddleAudioQuery {
+    grant_id: String,
+}
+
+#[cfg(unix)]
+async fn huddle_audio(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HuddleAudioQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, StatusCode> {
+    let credential = credential_from_headers(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let effects = state.effects.as_ref().ok_or(StatusCode::FORBIDDEN)?;
+    let target = state
+        .grants
+        .take(&credential, &query.grant_id)
+        .map_err(grant_error_status)?;
+    let identity = state
+        .store
+        .require_active_local_owner(&credential, &effects.signer)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::FORBIDDEN)?;
+    if target.authority != identity {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let store = state.store.clone();
+    let signer = Arc::clone(&effects.signer);
+    Ok(ws
+        .max_frame_size(4096)
+        .max_message_size(4096)
+        .on_upgrade(move |socket| session::run(socket, store, signer, credential, target))
+        .into_response())
 }
 
 pub(crate) async fn serve(

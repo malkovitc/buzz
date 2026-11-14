@@ -10,7 +10,7 @@ use axum::body::Bytes;
 use axum::extract::ws::{Message as WsMessage, Utf8Bytes as WsUtf8Bytes};
 use dashmap::DashMap;
 use futures_util::future::join_all;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -35,6 +35,27 @@ use crate::connection::{ConnectionSubscriptions, RestartClose};
 use crate::subscription::SubscriptionRegistry;
 
 pub(crate) type ScopedPubkeyKey = (CommunityId, [u8; 32]);
+
+/// A local authority change that must close affected broker audio sockets.
+#[derive(Clone)]
+pub(crate) struct BrokerAudioInvalidation {
+    community_id: CommunityId,
+    channel_id: Option<Uuid>,
+    pubkey: Option<Vec<u8>>,
+}
+
+impl BrokerAudioInvalidation {
+    pub(crate) fn affects(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+    ) -> bool {
+        self.community_id == community_id
+            && self.channel_id.is_none_or(|id| id == channel_id)
+            && self.pubkey.as_deref().is_none_or(|key| key == pubkey)
+    }
+}
 
 /// Why a community-bound socket is being asked to stop.
 ///
@@ -711,6 +732,8 @@ pub struct AppState {
     pub git_pack_cache: Arc<crate::api::git::pack_cache::GitPackCache>,
     /// Audio relay room manager — tracks active huddle audio rooms.
     pub audio_rooms: Arc<AudioRoomManager>,
+    /// Local revocation signal; the writer-backed frame guard is authoritative.
+    broker_audio_invalidation_tx: broadcast::Sender<BrokerAudioInvalidation>,
     /// Set to `true` on SIGTERM — readiness probe returns 503.
     pub shutting_down: Arc<AtomicBool>,
     /// Process start time — used by `/_status` endpoint.
@@ -909,6 +932,7 @@ impl AppState {
             git_store,
             git_pack_cache,
             audio_rooms: Arc::new(AudioRoomManager::new()),
+            broker_audio_invalidation_tx: broadcast::channel(1024).0,
             shutting_down: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
             nip98_replay,
@@ -1013,6 +1037,35 @@ impl AppState {
             .invalidate(&(community_id, channel_id, pubkey.to_vec()));
         self.accessible_channels_cache
             .invalidate(&(community_id, pubkey.to_vec()));
+        let _ = self
+            .broker_audio_invalidation_tx
+            .send(BrokerAudioInvalidation {
+                community_id,
+                channel_id: Some(channel_id),
+                pubkey: Some(pubkey.to_vec()),
+            });
+    }
+
+    /// Subscribe before the first writer-backed role read to avoid a join gap.
+    pub(crate) fn subscribe_broker_audio_invalidation(
+        &self,
+    ) -> broadcast::Receiver<BrokerAudioInvalidation> {
+        self.broker_audio_invalidation_tx.subscribe()
+    }
+
+    /// Close broker audio sockets when a channel is archived or deleted.
+    pub(crate) fn invalidate_broker_audio_channel(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+    ) {
+        let _ = self
+            .broker_audio_invalidation_tx
+            .send(BrokerAudioInvalidation {
+                community_id,
+                channel_id: Some(channel_id),
+                pubkey: None,
+            });
     }
 
     /// Invalidate all users' accessible-channels cache (e.g. new open channel created).
@@ -1068,6 +1121,13 @@ impl AppState {
 
     /// Local-only channel-deleted drop. See [`invalidate_membership_local`].
     pub(crate) fn invalidate_channel_deleted_local(&self, community_id: CommunityId) {
+        let _ = self
+            .broker_audio_invalidation_tx
+            .send(BrokerAudioInvalidation {
+                community_id,
+                channel_id: None,
+                pubkey: None,
+            });
         if let Err(error) =
             self.membership_cache
                 .invalidate_entries_if(move |(entry_community, _, _), _| {
