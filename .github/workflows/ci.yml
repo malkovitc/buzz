@@ -1029,6 +1029,8 @@ jobs:
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - name: Dependency policy
         run: cargo-deny check
+      - name: Desktop dependency policy
+        run: cargo-deny --manifest-path desktop/src-tauri/Cargo.toml --workspace check --config deny.toml
 
   dead-token-guard:
     name: Dead Token Reference Guard
