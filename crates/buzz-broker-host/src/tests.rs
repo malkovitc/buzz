@@ -21,6 +21,7 @@ const CHANNEL_ID: &str = "5df7dfa8-e919-43df-8efd-f1dcb8af7071";
 mod acp_runtime;
 mod drain;
 mod effects;
+mod huddle_grant;
 mod lifecycle;
 mod read;
 mod receipts;

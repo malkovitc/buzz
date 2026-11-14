@@ -87,6 +87,44 @@ pub(crate) enum ChannelReadAdmission {
 }
 
 impl AuthorityStore {
+    #[cfg(unix)]
+    pub(crate) async fn require_active_local_owner(
+        &self,
+        credential: &CredentialDigest,
+        signer: &HostSigner,
+    ) -> Result<Option<AuthorityIdentity>, StoreError> {
+        use buzz_sdk::broker::RuntimeLocationKind;
+
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let mut transaction = connection
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let authority = match load_authority(&mut transaction, credential).await {
+            Ok(authority) => authority,
+            Err(StoreError::Unauthenticated) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let owner = signer.owner_hex();
+        if authority.state != AuthorityState::Active
+            || authority.identity.location.kind != RuntimeLocationKind::Local
+            || !signer.matches_executor(&authority.identity)
+            || !owner_matches(&authority, &owner)
+        {
+            return Ok(None);
+        }
+        bind_owner(&mut transaction, credential, &owner).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(Some(authority.identity))
+    }
+
     #[cfg(not(unix))]
     pub(crate) async fn open(_path: &Path) -> Result<Self, StoreError> {
         Err(StoreError::UnsupportedPlatform)
